@@ -39,7 +39,10 @@ jobs:
 
       - name: Compile ${{ matrix.out }}
         working-directory: packages/cli
-        run: bun build --compile --target=${{ matrix.target }} --outfile ../../dist/${{ matrix.out }} src/main.ts
+        shell: bash
+        run: |
+          mkdir -p ../../dist
+          bun build --compile --target=${{ matrix.target }} --outfile ../../dist/${{ matrix.out }} src/main.ts
 
       - name: Smoke test
         run: ./dist/${{ matrix.out }} --version
