@@ -1,0 +1,12 @@
+{
+  "name": "fling",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fling — fling text and files between your devices. Fast, end-to-end encrypted, powered by LiveKit.",
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "test:local": "bash scripts/local-e2e.sh"
+  },
+  "license": "MIT"
+}
