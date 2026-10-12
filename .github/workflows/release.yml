@@ -113,9 +113,11 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Checksums
+      - name: Flatten and checksum
         run: |
           cd dist
+          find . -mindepth 2 -type f -exec mv -t . {} +
+          find . -mindepth 1 -type d -empty -delete
           sha256sum * > checksums.txt
           cat checksums.txt
 
