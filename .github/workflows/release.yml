@@ -90,6 +90,14 @@ jobs:
         with:
           projectPath: apps/desktop
 
+      - name: Prepare portable exe (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          ls apps/desktop/src-tauri/target/release/*.exe
+          cp apps/desktop/src-tauri/target/release/fling-desktop.exe \
+             "apps/desktop/src-tauri/target/release/Fling-portable-x64.exe"
+
       - name: Upload bundles
         uses: actions/upload-artifact@v4
         with:
@@ -99,6 +107,7 @@ jobs:
             apps/desktop/src-tauri/target/release/bundle/nsis/*.exe
             apps/desktop/src-tauri/target/release/bundle/appimage/*.AppImage
             apps/desktop/src-tauri/target/release/bundle/deb/*.deb
+            apps/desktop/src-tauri/target/release/Fling-portable-x64.exe
           if-no-files-found: error
 
   release:
