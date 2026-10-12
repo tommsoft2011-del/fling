@@ -66,6 +66,16 @@ Received text is printed **and** copied to the local clipboard automatically.
 - The API secret stays on your machine; the CLI mints its own join tokens
   locally. Nothing is uploaded anywhere.
 
+## Building
+
+```bash
+bun install
+# Windows binary (run on the Linux build machine first):
+bash packages/cli/scripts/fetch-win32-binding.sh
+bun build --compile --target=bun-windows-x64 --outfile dist/fling-windows-x64.exe packages/cli/src/main.ts
+bun build --compile --target=bun-linux-x64   --outfile dist/fling-linux-x64   packages/cli/src/main.ts
+```
+
 ## Project layout
 
 ```
