@@ -8,6 +8,8 @@
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { hostname } from 'node:os';
+import { existsSync, writeFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import {
   FlingRoom,
   MAX_TEXT_BYTES,
@@ -20,7 +22,27 @@ import { NodeTransport } from '@fling/core/node';
 import { DEFAULT_SERVER_URL, configPath, loadConfig, saveConfig } from './config.js';
 import { writeClipboard } from './clipboard.js';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.3';
+
+function formatBytes(n: number): string {
+  return n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
+}
+
+/** Non-colliding save path in dir for an incoming file (name sanitized). */
+function uniqueSavePath(dir: string, name: string): string {
+  const safe = basename(name) || 'file';
+  let p = join(dir, safe);
+  if (!existsSync(p)) return p;
+  const dot = safe.lastIndexOf('.');
+  const stem = dot > 0 ? safe.slice(0, dot) : safe;
+  const ext = dot > 0 ? safe.slice(dot) : '';
+  let i = 1;
+  while (existsSync(p)) {
+    p = join(dir, `${stem} (${i})${ext}`);
+    i++;
+  }
+  return p;
+}
 
 function deviceName(): string {
   const rand = Math.floor(Math.random() * 0xffff).toString(16).padStart(4, '0');
@@ -107,10 +129,19 @@ async function connectRoom(code: string): Promise<{ room: FlingRoom; roomName: s
     onPeerJoined: (id) => onPeer(id, true),
     onPeerLeft: (id) => onPeer(id, false),
     // File transfer lands in CLI v2; for now just acknowledge.
-    onFileManifest: (m, from) => console.log(`\n<<< incoming file "${m.name}" (${m.size} bytes) from ${from} — CLI v1 cannot receive files yet\n`),
-    onFileProgress: () => {},
-    onFileComplete: () => {},
-    onFileError: (id, err) => console.error(`file ${id} error: ${err}`),
+    onFileManifest: (m, from) =>
+      console.log(`\n<<< receiving "${m.name}" (${formatBytes(m.size)}) from ${from}`),
+    onFileProgress: (_id, received, total) => {
+      const pct = total > 0 ? Math.floor((received / total) * 100) : 100;
+      output.write(`\r    ${pct}% (${formatBytes(received)}/${formatBytes(total)})`);
+    },
+    onFileComplete: (_id, m, bytes) => {
+      const p = uniqueSavePath(process.cwd(), m.name);
+      writeFileSync(p, bytes);
+      output.write('\n');
+      console.log(`<<< saved to ${p} (sha256 verified)`);
+    },
+    onFileError: (id, err) => console.error(`\nfile ${id} error: ${err}`),
   });
 
   // Wait until actually connected (or fail fast).
