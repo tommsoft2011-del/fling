@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Fling</title>
+  </head>
+  <body>
+    <div id="app">
+      <!-- setup -->
+      <div class="screen" id="setupScreen">
+        <div class="center">
+          <h1><span class="logo">Fling</span> 设置</h1>
+          <p class="sub">填一次就行，key/secret 只存在本机</p>
+          <div class="field"><label>Server URL</label><input id="cfgUrl" placeholder="wss://rtc.syncpage.app" /></div>
+          <div class="field"><label>API key</label><input id="cfgKey" placeholder="devkey_…" /></div>
+          <div class="field"><label>API secret</label><input id="cfgSecret" type="password" placeholder="secret_…" /></div>
+          <button class="primary" id="saveCfg">保存</button>
+        </div>
+      </div>
+      <!-- join -->
+      <div class="screen" id="joinScreen">
+        <div class="center">
+          <h1><span class="logo">Fling</span></h1>
+          <p class="sub">和对方输入同一个房间号即可互传</p>
+          <div class="field"><label>房间号</label><input id="roomInput" placeholder="比如 myroom123" autocomplete="off" /></div>
+          <button class="primary" id="joinBtn">加入房间</button>
+          <div class="linkrow"><button id="editCfg">修改服务器设置</button></div>
+          <div id="status"></div>
+        </div>
+      </div>
+      <!-- room -->
+      <div class="screen" id="roomScreen">
+        <header>
+          <h2 id="roomTitle">房间</h2>
+          <span id="peers"></span>
+          <button class="ghost" id="leaveBtn">离开</button>
+        </header>
+        <div id="msgList"></div>
+        <div class="composer">
+          <label class="filebtn"><button type="button">📎 文件</button><input type="file" id="fileInput" multiple /></label>
+          <input type="text" id="textInput" placeholder="输入消息回车发送…" autocomplete="off" />
+          <button id="sendBtn">发送</button>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,10 +1,14 @@
 {
   "name": "@fling/core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
-  "exports": { ".": "./src/index.ts" },
+  "exports": {
+    ".": "./src/index.ts",
+    "./node": "./src/transports/node.ts"
+  },
   "dependencies": {
     "@livekit/rtc-node": "1.1.0",
+    "@noble/hashes": "^1.8.0",
     "livekit-server-sdk": "2.19.1"
   }
 }

@@ -8,8 +8,22 @@ One shared TypeScript core (`packages/core`) drives the CLI today and the web / 
 
 Prebuilt binaries are published on the
 [Releases page](https://github.com/tommsoft2011-del/fling/releases):
-`fling-linux-x64`, `fling-linux-arm64`, `fling-windows-x64.exe`
-(each release ships a `checksums.txt` — verify with `sha256sum -c`).
+
+- CLI: `fling-linux-x64`, `fling-linux-arm64`, `fling-windows-x64.exe`
+- Desktop app (Tauri): Windows `.msi`/`.exe` installer, Linux `.AppImage`/`.deb`
+
+Each release ships a `checksums.txt` — verify with `sha256sum -c`.
+
+## Desktop app
+
+`apps/desktop` — Tauri v2 app, reuses `@fling/core` (pairing, E2E crypto,
+file protocol). The webview talks to LiveKit via `livekit-client`; the Rust
+backend only mints join tokens from your local config (the API secret never
+enters the webview) and handles file-save dialogs.
+
+- Join with any room number you invent; the peer joins with the same number.
+- Send text + multiple files; per-file progress bars, sha256 verified.
+- Received text is auto-copied to the clipboard (like the CLI).
 
 ## Setup: where to put your key & secret
 

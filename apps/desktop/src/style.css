@@ -1,0 +1,85 @@
+:root {
+  --bg: #0f1419;
+  --panel: #182028;
+  --panel2: #1f2933;
+  --line: #2a3542;
+  --text: #e6edf3;
+  --dim: #8b98a5;
+  --accent: #0d9488;
+  --accent-d: #0b7c72;
+  --warn: #d29922;
+  --danger: #f85149;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  font-size: 14px;
+}
+#app { height: 100vh; display: flex; flex-direction: column; }
+.screen { display: none; height: 100%; flex-direction: column; }
+.screen.active { display: flex; }
+
+/* ---------- setup / join cards ---------- */
+.center { margin: auto; width: 380px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 28px; }
+.center h1 { margin: 0 0 4px; font-size: 22px; }
+.center h1 .logo { color: var(--accent); }
+.center p.sub { color: var(--dim); margin: 0 0 18px; font-size: 13px; }
+.field { margin-bottom: 12px; }
+.field label { display: block; color: var(--dim); font-size: 12px; margin-bottom: 4px; }
+.field input {
+  width: 100%; padding: 9px 10px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--panel2); color: var(--text);
+  font-size: 14px; outline: none;
+}
+.field input:focus { border-color: var(--accent); }
+button {
+  cursor: pointer; border: none; border-radius: 8px;
+  background: var(--accent); color: #fff; font-size: 14px; padding: 10px 16px;
+}
+button:hover { background: var(--accent-d); }
+button.ghost { background: transparent; border: 1px solid var(--line); color: var(--text); }
+button.ghost:hover { background: var(--panel2); }
+.center button.primary { width: 100%; margin-top: 6px; }
+.linkrow { margin-top: 12px; text-align: center; }
+.linkrow button { background: none; color: var(--dim); font-size: 12px; padding: 4px; }
+#status { min-height: 18px; color: var(--warn); font-size: 12px; margin-top: 8px; text-align: center; }
+
+/* ---------- room ---------- */
+header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+}
+header h2 { margin: 0; font-size: 16px; flex: 1; }
+#peers { color: var(--dim); font-size: 12px; }
+#msgList { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+.sysmsg { align-self: center; color: var(--dim); font-size: 12px; background: var(--panel); padding: 4px 12px; border-radius: 12px; }
+.msg { max-width: 75%; display: flex; flex-direction: column; gap: 2px; }
+.msg.mine { align-self: flex-end; align-items: flex-end; }
+.msg.theirs { align-self: flex-start; }
+.msg .meta { font-size: 11px; color: var(--dim); }
+.bubble {
+  background: var(--panel2); border: 1px solid var(--line);
+  padding: 8px 12px; border-radius: 12px; word-break: break-word; line-height: 1.5;
+}
+.msg.mine .bubble { background: #0d3f3a; border-color: var(--accent-d); }
+.copybtn { align-self: flex-start; background: none; border: 1px solid var(--line); color: var(--dim); font-size: 11px; padding: 2px 8px; border-radius: 6px; }
+.filecard { background: var(--panel2); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; min-width: 240px; }
+.fname { font-weight: 600; word-break: break-all; }
+.fsize { color: var(--dim); font-size: 12px; margin: 2px 0 8px; }
+.pbar { height: 8px; background: #0b1116; border-radius: 4px; overflow: hidden; }
+.pfill { height: 100%; width: 0; background: var(--accent); border-radius: 4px; transition: width .2s; }
+.plabel { font-size: 12px; color: var(--dim); margin-top: 6px; }
+.savebtn { font-size: 12px; padding: 4px 10px; }
+.composer { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); background: var(--panel); align-items: center; }
+.composer input[type=text] {
+  flex: 1; padding: 10px 12px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--panel2); color: var(--text); font-size: 14px; outline: none;
+}
+.composer input[type=text]:focus { border-color: var(--accent); }
+#sendBtn[data-warn] { background: var(--warn); }
+.filebtn { position: relative; overflow: hidden; }
+.filebtn input[type=file] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }

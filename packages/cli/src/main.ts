@@ -16,6 +16,7 @@ import {
   normalizeCode,
   roomNameForCode,
 } from '@fling/core';
+import { NodeTransport } from '@fling/core/node';
 import { DEFAULT_SERVER_URL, configPath, loadConfig, saveConfig } from './config.js';
 import { writeClipboard } from './clipboard.js';
 
@@ -83,7 +84,7 @@ async function connectRoom(code: string): Promise<{ room: FlingRoom; roomName: s
   const roomName = await roomNameForCode(pairingCode);
   const identity = deviceName();
   const token = await mintToken(cfg.apiKey, cfg.apiSecret, roomName, identity);
-  const room = new FlingRoom(identity);
+  const room = new FlingRoom(new NodeTransport(), identity);
 
   let peerSeen = false;
   const onPeer = (id: string, joined: boolean) => {
@@ -105,6 +106,11 @@ async function connectRoom(code: string): Promise<{ room: FlingRoom; roomName: s
     },
     onPeerJoined: (id) => onPeer(id, true),
     onPeerLeft: (id) => onPeer(id, false),
+    // File transfer lands in CLI v2; for now just acknowledge.
+    onFileManifest: (m, from) => console.log(`\n<<< incoming file "${m.name}" (${m.size} bytes) from ${from} — CLI v1 cannot receive files yet\n`),
+    onFileProgress: () => {},
+    onFileComplete: () => {},
+    onFileError: (id, err) => console.error(`file ${id} error: ${err}`),
   });
 
   // Wait until actually connected (or fail fast).

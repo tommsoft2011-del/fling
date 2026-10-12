@@ -1,35 +1,47 @@
-// FlingRoom: joins a LiveKit room derived from the pairing code,
-// exchanges end-to-end encrypted messages over the data channel.
-//
-// Transport note: built on @livekit/rtc-node (Node/Bun). The web app (v3)
-// will provide the same shape via livekit-client; the message/crypto/
-// pairing logic above stays identical.
+// FlingRoom: transport-agnostic room logic.
+// Joins a LiveKit room derived from the pairing code / room number and
+// exchanges end-to-end encrypted messages + files over the data channel.
 
-import { Room, RoomEvent } from '@livekit/rtc-node';
 import { deriveRoomKey, openText, sealText } from './crypto.js';
-import { FLING_TOPIC, isFlingMessage, randomId, type FlingMessage } from './protocol.js';
+import { FileReceiver, type FileLike, buildManifest } from './files.js';
+import {
+  FLING_TOPIC,
+  isFlingMessage,
+  randomId,
+  type FileManifest,
+  type FlingMessage,
+} from './protocol.js';
+import type { FlingTransport } from './transport.js';
 
 export interface FlingRoomEvents {
   onText(text: string, from: string): void;
   onPeerJoined(identity: string): void;
   onPeerLeft(identity: string): void;
+  onFileManifest(manifest: FileManifest, from: string): void;
+  onFileProgress(id: string, receivedBytes: number, totalBytes: number): void;
+  onFileComplete(id: string, manifest: FileManifest, bytes: Uint8Array): void;
+  onFileError(id: string, error: string): void;
 }
 
 const enc = new TextEncoder();
+const dec = new TextDecoder();
 
 export class FlingRoom {
-  private room = new Room();
   private roomKey!: CryptoKey;
-  private deviceName: string;
   private events!: FlingRoomEvents;
   private helloTimer?: ReturnType<typeof setInterval>;
+  private incoming = new Map<string, { receiver: FileReceiver; from: string }>();
+  // Data channels are ordered, but decrypt+parse is async — serialize
+  // handling so a chunk can never overtake its manifest.
+  private handleQueue: Promise<void> = Promise.resolve();
 
-  constructor(deviceName: string) {
-    this.deviceName = deviceName;
-  }
+  constructor(
+    private transport: FlingTransport,
+    private deviceName: string,
+  ) {}
 
   get isConnected(): boolean {
-    return this.room.isConnected;
+    return this.transport.isConnected;
   }
 
   async connect(
@@ -41,23 +53,22 @@ export class FlingRoom {
     this.events = events;
     this.roomKey = await deriveRoomKey(pairingCode);
 
-    this.room.on(RoomEvent.DataReceived, (payload, participant, _kind, topic) => {
+    this.transport.onData((payload, from, topic) => {
       if (topic !== FLING_TOPIC) return;
-      void this.handlePayload(payload, participant?.identity ?? 'unknown');
+      this.handleQueue = this.handleQueue
+        .then(() => this.handlePayload(payload, from))
+        .catch((e) => console.error('fling: payload handling failed:', e));
     });
-    this.room.on(RoomEvent.ParticipantConnected, (p) => {
-      events.onPeerJoined(p.identity);
+    this.transport.onPeerJoined((id) => {
+      events.onPeerJoined(id);
       // Re-announce so a late joiner learns we are here.
       void this.send({ kind: 'hello', device: this.deviceName }).catch(() => {});
     });
-    this.room.on(RoomEvent.ParticipantDisconnected, (p) => {
-      events.onPeerLeft(p.identity);
-    });
+    this.transport.onPeerLeft((id) => events.onPeerLeft(id));
 
-    await this.room.connect(serverUrl, token);
+    await this.transport.connect(serverUrl, token);
     await this.send({ kind: 'hello', device: this.deviceName });
 
-    // Periodic re-announce; cheap and heals missed hellos.
     this.helloTimer = setInterval(() => {
       void this.send({ kind: 'hello', device: this.deviceName }).catch(() => {});
     }, 15_000);
@@ -67,18 +78,38 @@ export class FlingRoom {
     await this.send({ kind: 'text', id: randomId(), text });
   }
 
+  /** Send a file with progress callback (sentBytes, totalBytes). */
+  async sendFile(
+    file: FileLike,
+    onProgress?: (sentBytes: number, totalBytes: number) => void,
+  ): Promise<FileManifest> {
+    const manifest = await buildManifest(file);
+    await this.send({ kind: 'file-manifest', ...manifest });
+    let sent = 0;
+    for (let seq = 0; seq < manifest.totalChunks; seq++) {
+      const start = seq * manifest.chunkSize;
+      const bytes = await file.slice(start, Math.min(start + manifest.chunkSize, file.size));
+      await this.send({
+        kind: 'file-chunk',
+        id: manifest.id,
+        seq,
+        data: FileReceiver.encodeChunk(bytes),
+      });
+      sent += bytes.length;
+      onProgress?.(sent, file.size);
+    }
+    return manifest;
+  }
+
   private async send(msg: FlingMessage): Promise<void> {
     const sealed = await sealText(this.roomKey, JSON.stringify(msg));
-    await this.room.localParticipant.publishData(enc.encode(sealed), {
-      reliable: true,
-      topic: FLING_TOPIC,
-    });
+    await this.transport.publish(enc.encode(sealed), FLING_TOPIC);
   }
 
   private async handlePayload(payload: Uint8Array, from: string): Promise<void> {
     let plain: string;
     try {
-      plain = await openText(this.roomKey, new TextDecoder().decode(payload));
+      plain = await openText(this.roomKey, dec.decode(payload));
     } catch {
       return; // not ours (wrong key / garbage) — ignore
     }
@@ -89,20 +120,79 @@ export class FlingRoom {
       return;
     }
     if (!isFlingMessage(msg)) return;
-    if (msg.kind === 'text') this.events.onText(msg.text, from);
-    else if (msg.kind === 'hello') this.events.onPeerJoined(from);
-    else if (msg.kind === 'bye') this.events.onPeerLeft(from);
+
+    switch (msg.kind) {
+      case 'text':
+        this.events.onText(msg.text, from);
+        break;
+      case 'hello':
+        this.events.onPeerJoined(from);
+        break;
+      case 'bye':
+        this.events.onPeerLeft(from);
+        break;
+      case 'file-manifest': {
+        const manifest: FileManifest = {
+          id: msg.id,
+          name: msg.name,
+          size: msg.size,
+          sha256: msg.sha256,
+          chunkSize: msg.chunkSize,
+          totalChunks: msg.totalChunks,
+        };
+        this.incoming.set(manifest.id, { receiver: new FileReceiver(manifest), from });
+        this.events.onFileManifest(manifest, from);
+        // Empty file: complete immediately.
+        if (manifest.totalChunks === 1 && manifest.size === 0) {
+          this.finishFile(manifest.id);
+        }
+        break;
+      }
+      case 'file-chunk': {
+        const entry = this.incoming.get(msg.id);
+        if (!entry) return; // unknown / already finished
+        const { receiver } = entry;
+        let complete = false;
+        try {
+          complete = receiver.addChunk(msg.seq, msg.data);
+        } catch (e) {
+          this.events.onFileError(msg.id, (e as Error).message);
+          this.incoming.delete(msg.id);
+          return;
+        }
+        this.events.onFileProgress(msg.id, receiver.progress * receiver.totalBytes, receiver.totalBytes);
+        if (complete) this.finishFile(msg.id);
+        break;
+      }
+    }
+  }
+
+  private finishFile(id: string): void {
+    const entry = this.incoming.get(id);
+    if (!entry) return;
+    this.incoming.delete(id);
+    try {
+      const bytes = entry.receiver.assemble();
+      this.events.onFileComplete(id, entry.receiver.manifest, bytes);
+    } catch (e) {
+      this.events.onFileError(id, (e as Error).message);
+    }
+  }
+
+  /** Wait until all received payloads have been processed. */
+  flush(): Promise<void> {
+    return this.handleQueue;
   }
 
   async close(): Promise<void> {
     if (this.helloTimer) clearInterval(this.helloTimer);
     try {
-      if (this.room.isConnected) {
+      if (this.transport.isConnected) {
         await this.send({ kind: 'bye', device: this.deviceName });
       }
     } catch {
       /* best effort */
     }
-    await this.room.disconnect();
+    await this.transport.disconnect();
   }
 }
