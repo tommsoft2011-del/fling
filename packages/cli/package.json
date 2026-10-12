@@ -2,9 +2,11 @@
   "name": "@fling/cli",
   "version": "0.1.0",
   "type": "module",
-  "bin": { "fling": "src/main.ts" },
+  "bin": {
+    "fling": "src/main.ts"
+  },
   "dependencies": {
-    "@fling/core": "0.2.0",
+    "@fling/core": "0.3.0",
     "clipboardy": "^4.0.0"
   }
 }
