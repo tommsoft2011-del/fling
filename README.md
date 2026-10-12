@@ -71,9 +71,10 @@ Received text is printed **and** copied to the local clipboard automatically.
 ```bash
 bun install
 # Windows binary (run on the Linux build machine first):
-bash packages/cli/scripts/fetch-win32-binding.sh
+bash packages/cli/scripts/fetch-native-bindings.sh all
 bun build --compile --target=bun-windows-x64 --outfile dist/fling-windows-x64.exe packages/cli/src/main.ts
 bun build --compile --target=bun-linux-x64   --outfile dist/fling-linux-x64   packages/cli/src/main.ts
+bun build --compile --target=bun-linux-arm64 --outfile dist/fling-linux-arm64 packages/cli/src/main.ts
 ```
 
 ## Project layout
