@@ -6,8 +6,10 @@ One shared TypeScript core (`packages/core`) drives the CLI today and the web / 
 
 ## Download
 
-Prebuilt binaries: `dist/fling-linux-x64`, `dist/fling-windows-x64.exe`
-(or build yourself: `bun install && bun run build`, then `bun build --compile …`).
+Prebuilt binaries are published on the
+[Releases page](https://github.com/tommsoft2011-del/fling/releases):
+`fling-linux-x64`, `fling-linux-arm64`, `fling-windows-x64.exe`
+(each release ships a `checksums.txt` — verify with `sha256sum -c`).
 
 ## Setup: where to put your key & secret
 
