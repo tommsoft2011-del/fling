@@ -1,14 +1,18 @@
 {
-  "name": "@fling/core",
-  "version": "0.2.0",
-  "type": "module",
-  "exports": {
-    ".": "./src/index.ts",
-    "./node": "./src/transports/node.ts"
-  },
   "dependencies": {
     "@livekit/rtc-node": "1.1.0",
     "@noble/hashes": "^1.8.0",
     "livekit-server-sdk": "2.19.1"
-  }
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./node": "./src/transports/node.ts"
+  },
+  "name": "@fling/core",
+  "scripts": {
+    "test:v2": "bun test/loopback-v2.ts",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "type": "module",
+  "version": "0.3.0"
 }

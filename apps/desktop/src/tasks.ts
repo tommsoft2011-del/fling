@@ -1,0 +1,926 @@
+// 传输引擎：发送任务 / 接收任务 / 全局管理器
+// 一次发送动作 = 一个任务 = 独立 LiveKit 房间，任务之间互不阻塞。
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { writeText as writeClipboardText } from '@tauri-apps/plugin-clipboard-manager';
+import {
+  wrapWebFile,
+  type FileManifest,
+  type OfferItem,
+  type OfferMessage,
+} from '@fling/core';
+import {
+  connectFlingRoom,
+  inboxSpec,
+  inboxRoomName,
+  lobbySpec,
+  nearbyTaskSpecWithRoom,
+  remoteTaskSpec,
+  remoteTaskSpecWithRoom,
+  newTaskRoomName,
+  newTaskKey,
+  normalizeCode,
+  getDeviceId,
+  getDeviceName,
+  KEY_CTX,
+} from './net.js';
+import { saveHistoryEntry, HIST_IMAGE_LIMIT, settings, type HistoryEntry } from './store.js';
+import { b64encode, toast, uid, utf8bytes } from './ui.js';
+import type { FlingRoom } from '@fling/core';
+
+export type ItemKind = 'text' | 'file' | 'clipboard-image';
+
+/** 发送框里的一个条目（快照） */
+export interface ComposeItem {
+  uid: string;
+  kind: ItemKind;
+  name: string;
+  size: number;
+  blob?: Blob;
+  text?: string;
+  previewUrl?: string;
+}
+
+export type SendTarget =
+  | { type: 'nearby'; deviceId: string; deviceName: string }
+  | { type: 'remote'; code: string };
+
+export interface ItemState {
+  uid: string;
+  kind: ItemKind;
+  name: string;
+  size: number;
+  status: 'waiting' | 'active' | 'done' | 'error';
+  doneBytes: number;
+  totalBytes: number;
+  error?: string;
+}
+
+const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const TEXT_CHUNK_CHARS = 15000;
+const OFFER_REANNOUNCE_MS = 5000;
+const WAIT_PEER_TIMEOUT_MS = 5 * 60 * 1000;
+
+function toOfferItem(c: ComposeItem): OfferItem {
+  return {
+    name: c.kind === 'text' ? (c.text ?? '').slice(0, 24) || '文本' : c.name,
+    size: c.size,
+    kind: c.kind,
+  };
+}
+
+function kindLabel(k: ItemKind): string {
+  return k === 'text' ? '文本' : k === 'clipboard-image' ? '剪贴板' : '文件';
+}
+
+// ================================================================== 发送任务
+export type SendPhase = 'preparing' | 'waiting' | 'sending' | 'done' | 'error' | 'cancelled' | 'rejected';
+
+export class SendTask {
+  readonly taskId = uid('task');
+  phase: SendPhase = 'preparing';
+  items: ItemState[];
+  startedAt = Date.now();
+  endedAt?: number;
+  speedBps = 0;
+  error?: string;
+  onChange: () => void = () => {};
+
+  private room?: FlingRoom;
+  private lobbyLeave?: () => void;
+  private announceTimer?: ReturnType<typeof setInterval>;
+  private waitTimer?: ReturnType<typeof setTimeout>;
+  private peerJoined = false;
+  private cancelled = false;
+  private lastBytes = 0;
+  private lastT = 0;
+  private doneNotified = false;
+
+  constructor(
+    readonly source: ComposeItem[],
+    readonly target: SendTarget,
+  ) {
+    this.items = source.map((c) => ({
+      uid: c.uid,
+      kind: c.kind,
+      name: c.kind === 'text' ? (c.text ?? '').slice(0, 24) || '文本' : c.name,
+      size: c.size,
+      status: 'waiting',
+      doneBytes: 0,
+      totalBytes: c.size,
+    }));
+  }
+
+  get peerLabel(): string {
+    return this.target.type === 'nearby' ? this.target.deviceName : `配对码 ${this.target.code}`;
+  }
+  get waitLabel(): string {
+    return this.target.type === 'nearby' ? '连接设备' : '等待对方加入';
+  }
+  get totalBytes(): number {
+    return this.items.reduce((a, i) => a + i.totalBytes, 0);
+  }
+  get doneBytes(): number {
+    return this.items.reduce((a, i) => a + i.doneBytes, 0);
+  }
+  get active(): boolean {
+    return this.phase === 'preparing' || this.phase === 'waiting' || this.phase === 'sending';
+  }
+
+  private notify(): void {
+    this.onChange();
+  }
+
+  private trackSpeed(doneBytes: number): void {
+    const now = Date.now();
+    const dt = (now - this.lastT) / 1000;
+    if (dt >= 0.4 && this.lastT > 0) {
+      const inst = (doneBytes - this.lastBytes) / dt;
+      this.speedBps = this.speedBps === 0 ? inst : this.speedBps * 0.7 + inst * 0.3;
+      this.lastBytes = doneBytes;
+      this.lastT = now;
+    } else if (this.lastT === 0) {
+      this.lastT = now;
+      this.lastBytes = doneBytes;
+    }
+  }
+
+  async run(): Promise<void> {
+    try {
+      const taskRoom = newTaskRoomName();
+      const taskKey = newTaskKey();
+      const offer: OfferMessage = {
+        kind: 'offer',
+        taskId: this.taskId,
+        fromDevice: getDeviceName(),
+        fromDeviceId: getDeviceId(),
+        taskRoom,
+        taskKey,
+        items: this.source.map(toOfferItem),
+      };
+
+      // 1. 建任务房间（发送方先进）
+      const spec =
+        this.target.type === 'nearby'
+          ? nearbyTaskSpecWithRoom(taskRoom, taskKey)
+          : { roomName: taskRoom, keyMaterial: normalizeCode(this.target.code), keyContext: KEY_CTX.room };
+      this.room = await connectFlingRoom(spec, {
+        onPeerJoined: () => this.onPeer(),
+        onPeerLeft: () => {
+          /* 接收方提前离开：若还没发完，传输会失败并标记 */
+        },
+      });
+      if (this.cancelled) return;
+
+      // 2. 投递 offer
+      this.phase = 'waiting';
+      this.notify();
+      if (this.target.type === 'nearby') {
+        await this.deliverOfferNearby(offer, this.target.deviceId);
+      } else {
+        await this.announceInLobby(offer, this.target.code);
+      }
+      if (this.cancelled) return;
+
+      // 3. 等对方加入（5 分钟超时）
+      await new Promise<void>((resolve, reject) => {
+        if (this.peerJoined) return resolve();
+        const check = setInterval(() => {
+          if (this.peerJoined || this.cancelled) {
+            clearInterval(check);
+            clearTimeout(this.waitTimer);
+            resolve();
+          }
+        }, 300);
+        this.waitTimer = setTimeout(() => {
+          clearInterval(check);
+          reject(new Error('对方无响应（5 分钟未加入），已取消'));
+        }, WAIT_PEER_TIMEOUT_MS);
+      });
+      if (this.cancelled) return;
+      this.stopAnnounce();
+
+      // 4. 逐项发送
+      this.phase = 'sending';
+      this.notify();
+      let okCount = 0;
+      for (let i = 0; i < this.source.length; i++) {
+        if (this.cancelled) break;
+        const src = this.source[i];
+        const st = this.items[i];
+        st.status = 'active';
+        this.notify();
+        try {
+          if (src.kind === 'text') {
+            await this.sendTextItem(src.text ?? '', st);
+          } else {
+            const blob = src.blob!;
+            await this.room!.sendFile(wrapWebFile(blob, src.name), (sent) => {
+              st.doneBytes = sent;
+              this.trackSpeed(this.doneBytes);
+              this.notify();
+            }, src.kind);
+          }
+          st.status = 'done';
+          st.doneBytes = st.totalBytes;
+          okCount++;
+        } catch (e) {
+          st.status = 'error';
+          st.error = (e as Error).message || '发送失败';
+        }
+        this.notify();
+      }
+
+      // 5. 收尾
+      try {
+        await this.room!.sendTaskDone(this.taskId);
+      } catch { /* 尽力 */ }
+      this.phase = this.cancelled ? 'cancelled' : okCount === this.items.length ? 'done' : 'error';
+      if (this.phase === 'error') this.error = '部分项目发送失败';
+      this.endedAt = Date.now();
+      this.notify();
+      void this.archive();
+      // 对方收到 task-done 后再关房间，留 2s 宽限
+      setTimeout(() => this.closeRooms(), 2000);
+    } catch (e) {
+      if (this.cancelled) {
+        this.phase = 'cancelled';
+      } else {
+        this.phase = 'error';
+        this.error = (e as Error).message || '发送失败';
+        for (const it of this.items) {
+          if (it.status !== 'done') {
+            it.status = 'error';
+            it.error = it.error ?? this.error;
+          }
+        }
+      }
+      this.endedAt = Date.now();
+      this.notify();
+      void this.archive();
+      this.closeRooms();
+    }
+  }
+
+  private async sendTextItem(text: string, st: ItemState): Promise<void> {
+    const total = utf8bytes(text);
+    st.totalBytes = total;
+    let sentChars = 0;
+    for (let i = 0; i < text.length; i += TEXT_CHUNK_CHARS) {
+      if (this.cancelled) throw new Error('已取消');
+      await this.room!.sendText(text.slice(i, i + TEXT_CHUNK_CHARS));
+      sentChars += Math.min(TEXT_CHUNK_CHARS, text.length - i);
+      st.doneBytes = Math.round((sentChars / text.length) * total);
+      this.trackSpeed(this.doneBytes);
+      this.notify();
+    }
+  }
+
+  private onPeer(): void {
+    if (!this.peerJoined) {
+      this.peerJoined = true;
+      this.stopAnnounce();
+    }
+  }
+
+  /** 接收方拒绝（经 inbox / lobby 回来） */
+  onRejected(): void {
+    if (!this.active) return;
+    this.cancelled = true;
+    this.phase = 'rejected';
+    this.error = '对方拒绝了传输';
+    for (const it of this.items) {
+      if (it.status !== 'done') {
+        it.status = 'error';
+        it.error = '对方拒绝';
+      }
+    }
+    this.endedAt = Date.now();
+    clearTimeout(this.waitTimer);
+    this.stopAnnounce();
+    this.notify();
+    void this.archive();
+    this.closeRooms();
+  }
+
+  private async deliverOfferNearby(offer: OfferMessage, peerDeviceId: string): Promise<void> {
+    const spec = {
+      roomName: inboxRoomName(peerDeviceId),
+      keyMaterial: 'inbox:' + peerDeviceId,
+      keyContext: KEY_CTX.inbox,
+    };
+    const sendOnce = async () => {
+      const r = await connectFlingRoom(spec, {});
+      try {
+        await r.sendOffer(offer);
+        await delay(1200);
+      } finally {
+        await r.close().catch(() => {});
+      }
+    };
+    await sendOnce();
+    // 对方 inbox 若短暂断线，8s 重投一次，直到对方加入或取消
+    this.announceTimer = setInterval(() => {
+      if (this.peerJoined || this.cancelled) return this.stopAnnounce();
+      sendOnce().catch(() => {});
+    }, 8000);
+  }
+
+  private async announceInLobby(offer: OfferMessage, code: string): Promise<void> {
+    this.lobbyLeave = await manager.joinLobby(code);
+    const lobby = manager.lobbyRoomFor(code);
+    if (!lobby) throw new Error('配对房间连接失败');
+    await lobby.sendOffer(offer);
+    this.announceTimer = setInterval(() => {
+      if (this.peerJoined || this.cancelled) return this.stopAnnounce();
+      lobby.sendOffer(offer).catch(() => {});
+    }, OFFER_REANNOUNCE_MS);
+  }
+
+  private stopAnnounce(): void {
+    if (this.announceTimer) {
+      clearInterval(this.announceTimer);
+      this.announceTimer = undefined;
+    }
+  }
+
+  cancel(): void {
+    if (!this.active) return;
+    this.cancelled = true;
+    clearTimeout(this.waitTimer);
+    this.stopAnnounce();
+    // 尽力撤回 offer（对方若还没确认，待确认卡会消失）
+    const withdraw = async () => {
+      try {
+        if (this.target.type === 'nearby') {
+          const spec = {
+            roomName: inboxRoomName(this.target.deviceId),
+            keyMaterial: 'inbox:' + this.target.deviceId,
+            keyContext: KEY_CTX.inbox,
+          };
+          const r = await connectFlingRoom(spec, {});
+          await r.sendOfferWithdraw(this.taskId);
+          await delay(800);
+          await r.close().catch(() => {});
+        } else {
+          const lobby = manager.lobbyRoomFor(this.target.code);
+          await lobby?.sendOfferWithdraw(this.taskId);
+        }
+      } catch { /* 尽力 */ }
+    };
+    void withdraw().finally(() => {
+      this.phase = 'cancelled';
+      this.endedAt = Date.now();
+      for (const it of this.items) {
+        if (it.status !== 'done') {
+          it.status = 'error';
+          it.error = '已取消';
+        }
+      }
+      this.notify();
+      void this.archive();
+      this.closeRooms();
+      if (this.lobbyLeave) {
+        this.lobbyLeave();
+        this.lobbyLeave = undefined;
+      }
+    });
+  }
+
+  private closeRooms(): void {
+    if (this.lobbyLeave) {
+      this.lobbyLeave();
+      this.lobbyLeave = undefined;
+    }
+    const r = this.room;
+    this.room = undefined;
+    if (r) void r.close().catch(() => {});
+  }
+
+  private async archive(): Promise<void> {
+    if (this.doneNotified) return;
+    this.doneNotified = true;
+    const items = await Promise.all(
+      this.source.map(async (c, i) => {
+        const st = this.items[i];
+        const base = {
+          name: st.name,
+          size: c.size,
+          kind: c.kind,
+          status: (st.status === 'done' ? 'ok' : 'fail') as 'ok' | 'fail',
+          error: st.error,
+        };
+        if (c.kind === 'text') return { ...base, text: c.text };
+        if (c.kind === 'clipboard-image' && c.blob && c.blob.size < HIST_IMAGE_LIMIT) {
+          try {
+            const buf = new Uint8Array(await c.blob.arrayBuffer());
+            return { ...base, imageB64: b64encode(buf) };
+          } catch { /* 忽略 */ }
+        }
+        return base;
+      }),
+    );
+    const entry: HistoryEntry = {
+      taskId: this.taskId,
+      dir: 'send',
+      peer: this.peerLabel,
+      time: this.startedAt,
+      items,
+      totalBytes: this.totalBytes,
+    };
+    saveHistoryEntry(entry);
+    manager.recentSources.set(this.taskId, this.source);
+  }
+}
+
+// ================================================================== 接收任务
+export type RecvPhase = 'receiving' | 'done' | 'error' | 'cancelled';
+
+export interface PendingOffer {
+  offer: OfferMessage;
+  via: 'nearby' | 'remote';
+  code?: string;
+  at: number;
+}
+
+export class RecvTask {
+  readonly taskId: string;
+  phase: RecvPhase = 'receiving';
+  items: ItemState[];
+  startedAt = Date.now();
+  endedAt?: number;
+  speedBps = 0;
+  error?: string;
+  onChange: () => void = () => {};
+
+  private room?: FlingRoom;
+  private textParts: string[] = [];
+  private textItem?: ItemState;
+  private fileQueue: ItemState[] = [];
+  private manifestToItem = new Map<string, ItemState>();
+  private cancelled = false;
+  private finished = false;
+  private lastBytes = 0;
+  private lastT = 0;
+  private peerGoneTimer?: ReturnType<typeof setTimeout>;
+  private savedDir = '';
+  /** 收到的剪贴板图片（供"另存为文件"） */
+  clipImages = new Map<string, Uint8Array>();
+
+  constructor(
+    readonly offer: OfferMessage,
+    readonly via: 'nearby' | 'remote',
+    readonly code?: string,
+  ) {
+    this.taskId = offer.taskId;
+    this.items = offer.items.map((o, i) => ({
+      uid: `ri-${i}`,
+      kind: o.kind,
+      name: o.name,
+      size: o.size,
+      status: 'waiting',
+      doneBytes: 0,
+      totalBytes: o.size,
+    }));
+    this.textItem = this.items.find((i) => i.kind === 'text');
+    this.fileQueue = this.items.filter((i) => i.kind !== 'text');
+  }
+
+  get peerLabel(): string {
+    return this.offer.fromDevice;
+  }
+  get totalBytes(): number {
+    return this.items.reduce((a, i) => a + i.totalBytes, 0);
+  }
+  get doneBytes(): number {
+    return this.items.reduce((a, i) => a + i.doneBytes, 0);
+  }
+  get active(): boolean {
+    return this.phase === 'receiving';
+  }
+
+  private notify(): void {
+    this.onChange();
+  }
+
+  private trackSpeed(): void {
+    const now = Date.now();
+    const done = this.doneBytes;
+    const dt = (now - this.lastT) / 1000;
+    if (dt >= 0.4 && this.lastT > 0) {
+      const inst = (done - this.lastBytes) / dt;
+      this.speedBps = this.speedBps === 0 ? inst : this.speedBps * 0.7 + inst * 0.3;
+      this.lastBytes = done;
+      this.lastT = now;
+    } else if (this.lastT === 0) {
+      this.lastT = now;
+      this.lastBytes = done;
+    }
+  }
+
+  async run(): Promise<void> {
+    try {
+      this.savedDir = await manager.getDownloadDir();
+      const spec =
+        this.via === 'nearby'
+          ? nearbyTaskSpecWithRoom(this.offer.taskRoom, this.offer.taskKey)
+          : remoteTaskSpecWithRoom(this.offer.taskRoom, this.code ?? '');
+      this.room = await connectFlingRoom(spec, {
+        onText: (t) => this.onTextPart(t),
+        onFileManifest: (m) => this.onManifest(m),
+        onFileProgress: (id, r, t) => this.onProgress(id, r, t),
+        onFileComplete: (id, m, bytes) => void this.onFileComplete(id, m, bytes),
+        onFileError: (id, err) => this.onFileError(id, err),
+        onTaskDone: (taskId) => {
+          if (taskId === this.taskId) void this.finish(true);
+        },
+        onPeerLeft: () => this.onPeerLeft(),
+      });
+      this.notify();
+    } catch (e) {
+      this.phase = 'error';
+      this.error = (e as Error).message || '接收失败';
+      for (const it of this.items) {
+        if (it.status !== 'done') {
+          it.status = 'error';
+          it.error = this.error;
+        }
+      }
+      this.endedAt = Date.now();
+      this.notify();
+      void this.archive();
+    }
+  }
+
+  private onTextPart(t: string): void {
+    if (!this.textItem || this.finished) return;
+    this.textParts.push(t);
+    this.textItem.status = 'active';
+    this.textItem.doneBytes += utf8bytes(t);
+    if (this.textItem.doneBytes > this.textItem.totalBytes) {
+      this.textItem.totalBytes = this.textItem.doneBytes;
+    }
+    this.trackSpeed();
+    this.notify();
+  }
+
+  private onManifest(m: FileManifest): void {
+    // 按 offer 顺序匹配（data channel 有序可靠），辅以 文件名+大小 兜底
+    let item = this.fileQueue.shift();
+    if (!item) return;
+    if (item.name !== m.name || item.size !== m.size) {
+      const alt = this.fileQueue.find((i) => i.name === m.name && i.size === m.size);
+      if (alt) {
+        this.fileQueue = this.fileQueue.filter((i) => i !== alt);
+        this.fileQueue.unshift(item);
+        item = alt;
+      }
+    }
+    item.status = 'active';
+    item.totalBytes = m.size;
+    this.manifestToItem.set(m.id, item);
+    this.notify();
+  }
+
+  private onProgress(id: string, r: number, t: number): void {
+    const item = this.manifestToItem.get(id);
+    if (!item) return;
+    item.doneBytes = r;
+    item.totalBytes = t;
+    this.trackSpeed();
+    this.notify();
+  }
+
+  private onFileError(id: string, err: string): void {
+    const item = this.manifestToItem.get(id);
+    if (!item) return;
+    item.status = 'error';
+    item.error = err;
+    this.notify();
+  }
+
+  private async onFileComplete(id: string, m: FileManifest, bytes: Uint8Array): Promise<void> {
+    const item = this.manifestToItem.get(id);
+    if (!item) return;
+    try {
+      if (m.kind === 'clipboard-image') {
+        await invoke('write_image_clipboard', { data_b64: b64encode(bytes) });
+        this.clipImages.set(item.uid, bytes);
+        toast('图片已复制到剪贴板');
+      } else {
+        await invoke('save_received_file', {
+          dir: this.savedDir,
+          name: m.name,
+          data_b64: b64encode(bytes),
+        });
+      }
+      item.status = 'done';
+      item.doneBytes = item.totalBytes;
+    } catch (e) {
+      item.status = 'error';
+      item.error = (e as Error).message || '保存失败';
+    }
+    this.notify();
+  }
+
+  private onPeerLeft(): void {
+    if (!this.active || this.finished) return;
+    // 发送方发完 task-done 后 2s 关房间；若 4s 内没收到 task-done，视为中断
+    clearTimeout(this.peerGoneTimer);
+    this.peerGoneTimer = setTimeout(() => {
+      if (this.active && !this.finished) void this.finish(false);
+    }, 4000);
+  }
+
+  private async finish(completed: boolean): Promise<void> {
+    if (this.finished) return;
+    this.finished = true;
+    clearTimeout(this.peerGoneTimer);
+    // 文本：拼起来写剪贴板
+    if (this.textItem && this.textParts.length > 0) {
+      const full = this.textParts.join('');
+      this.textItem.status = 'done';
+      this.textItem.doneBytes = this.textItem.totalBytes;
+      try {
+        await writeClipboardText(full);
+      } catch { /* 忽略 */ }
+    }
+    let failed = 0;
+    for (const it of this.items) {
+      if (it.status !== 'done') {
+        it.status = 'error';
+        it.error = it.error ?? (completed ? '未收到数据' : '对方断开连接');
+        failed++;
+      }
+    }
+    this.phase = failed === 0 ? 'done' : 'error';
+    if (failed > 0) this.error = `${failed} 项未完成`;
+    this.endedAt = Date.now();
+    this.notify();
+    await this.archive();
+    const r = this.room;
+    this.room = undefined;
+    if (r) await r.close().catch(() => {});
+  }
+
+  cancel(): void {
+    if (!this.active) return;
+    this.cancelled = true;
+    void this.finish(false).then(() => {
+      this.phase = 'cancelled';
+      this.notify();
+    });
+  }
+
+  private async archive(): Promise<void> {
+    const items = await Promise.all(
+      this.items.map(async (it) => {
+        const base = {
+          name: it.name,
+          size: it.size,
+          kind: it.kind,
+          status: (it.status === 'done' ? 'ok' : 'fail') as 'ok' | 'fail',
+          error: it.error,
+        };
+        if (it.kind === 'text') return { ...base, text: this.textParts.join('') };
+        if (it.kind === 'clipboard-image') {
+          const bytes = this.clipImages.get(it.uid);
+          if (bytes && bytes.length < HIST_IMAGE_LIMIT) {
+            return { ...base, imageB64: b64encode(bytes) };
+          }
+        }
+        return base;
+      }),
+    );
+    const entry: HistoryEntry = {
+      taskId: this.taskId,
+      dir: 'recv',
+      peer: this.offer.fromDevice,
+      time: this.startedAt,
+      items,
+      totalBytes: this.totalBytes,
+    };
+    saveHistoryEntry(entry);
+  }
+}
+
+// ================================================================== 全局管理器
+type ChangeFn = () => void;
+
+class TransferManager {
+  sendTasks = new Map<string, SendTask>();
+  recvTasks = new Map<string, RecvTask>();
+  pending = new Map<string, PendingOffer>();
+  peers = new Map<string, string>(); // deviceId -> name
+  /** 本 session 内发送源（供失败重试） */
+  recentSources = new Map<string, ComposeItem[]>();
+
+  private listeners = new Set<ChangeFn>();
+  private inboxRoom?: FlingRoom;
+  private lobbies = new Map<string, { room: FlingRoom; refs: number }>();
+  private downloadDir = '';
+
+  onChange(fn: ChangeFn): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+  notify(): void {
+    for (const fn of this.listeners) {
+      try {
+        fn();
+      } catch { /* 忽略 */ }
+    }
+  }
+
+  async init(): Promise<void> {
+    // 常驻 inbox：收附近设备的 offer
+    const spec = inboxSpec();
+    this.inboxRoom = await connectFlingRoom(spec, {
+      onOffer: (offer) => this.onOffer(offer, 'nearby'),
+      onOfferWithdraw: (taskId) => {
+        if (this.pending.delete(taskId)) {
+          toast('对方取消了传输');
+          this.notify();
+        }
+      },
+      onOfferRejected: (taskId) => this.routeRejected(taskId),
+    });
+
+    await listen<{ id: string; name: string }>('fling://peer-up', (e) => {
+      this.peers.set(e.payload.id, e.payload.name);
+      this.notify();
+    });
+    await listen<{ id: string }>('fling://peer-down', (e) => {
+      this.peers.delete(e.payload.id);
+      this.notify();
+    });
+    await invoke('discovery_set_browsing', { on: true });
+    await invoke('discovery_set_discoverable', { on: settings.discoverable });
+  }
+
+  async setDiscoverable(on: boolean): Promise<void> {
+    await invoke('discovery_set_discoverable', { on });
+  }
+
+  async getDownloadDir(): Promise<string> {
+    if (!this.downloadDir) {
+      this.downloadDir = (await invoke('get_download_dir')) as string;
+    }
+    return this.downloadDir;
+  }
+  setDownloadDirCache(dir: string): void {
+    this.downloadDir = dir;
+  }
+
+  // ---------- lobby（远程配对）引用计数 ----------
+  async joinLobby(code: string): Promise<() => void> {
+    const c = normalizeCode(code);
+    let entry = this.lobbies.get(c);
+    if (!entry) {
+      const spec = await lobbySpec(c);
+      const room = await connectFlingRoom(spec, {
+        onOffer: (offer) => this.onOffer(offer, 'remote', c),
+        onOfferWithdraw: (taskId) => {
+          if (this.pending.delete(taskId)) {
+            toast('对方取消了传输');
+            this.notify();
+          }
+        },
+        onOfferRejected: (taskId) => this.routeRejected(taskId),
+      });
+      entry = { room, refs: 0 };
+      this.lobbies.set(c, entry);
+    }
+    entry.refs++;
+    let left = false;
+    return () => {
+      if (left) return;
+      left = true;
+      const e = this.lobbies.get(c);
+      if (!e) return;
+      e.refs--;
+      if (e.refs <= 0) {
+        this.lobbies.delete(c);
+        void e.room.close().catch(() => {});
+      }
+    };
+  }
+
+  lobbyRoomFor(code: string): FlingRoom | undefined {
+    return this.lobbies.get(normalizeCode(code))?.room;
+  }
+
+  // ---------- offer ----------
+  private onOffer(offer: OfferMessage, via: 'nearby' | 'remote', code?: string): void {
+    if (this.pending.has(offer.taskId) || this.recvTasks.has(offer.taskId)) return;
+    // 自己发出的 offer 回环（理论上不会，自己不在 inbox 里）
+    if (offer.fromDeviceId === getDeviceId()) return;
+    this.pending.set(offer.taskId, { offer, via, code, at: Date.now() });
+    const n = offer.items.length;
+    const summary =
+      n === 1 && offer.items[0].kind === 'text'
+        ? '文本'
+        : `${n} 个项目`;
+    toast(`${offer.fromDevice} 发来 ${summary}，等待确认`);
+    this.notify();
+  }
+
+  private routeRejected(taskId: string): void {
+    const t = this.sendTasks.get(taskId);
+    if (t) t.onRejected();
+  }
+
+  // ---------- 发送 ----------
+  startSend(source: ComposeItem[], target: SendTarget): SendTask {
+    const task = new SendTask(source, target);
+    task.onChange = () => this.notify();
+    this.sendTasks.set(task.taskId, task);
+    this.notify();
+    void task.run().finally(() => this.notify());
+    return task;
+  }
+
+  /** 重试发送任务里失败的条目（用本 session 缓存的源） */
+  retryFailed(taskId: string): void {
+    const task = this.sendTasks.get(taskId);
+    const sources = this.recentSources.get(taskId);
+    if (!task || !sources) {
+      toast('源文件已不在缓存中，请重新添加', true);
+      return;
+    }
+    const failedIdx = new Set(
+      task.items.filter((i) => i.status === 'error').map((i) => i.uid),
+    );
+    const retrySources = sources.filter((s) => failedIdx.has(s.uid));
+    if (retrySources.length === 0) {
+      toast('没有可重试的失败项');
+      return;
+    }
+    this.startSend(retrySources, task.target);
+    toast(`开始重试 ${retrySources.length} 个失败项`);
+  }
+
+  // ---------- 接收 ----------
+  acceptOffer(taskId: string): RecvTask | undefined {
+    const p = this.pending.get(taskId);
+    if (!p) return undefined;
+    this.pending.delete(taskId);
+    const task = new RecvTask(p.offer, p.via, p.code);
+    task.onChange = () => this.notify();
+    this.recvTasks.set(taskId, task);
+    this.notify();
+    void task.run().finally(() => this.notify());
+    return task;
+  }
+
+  rejectOffer(taskId: string): void {
+    const p = this.pending.get(taskId);
+    if (!p) return;
+    this.pending.delete(taskId);
+    // 通知发送方
+    const sendReject = async () => {
+      try {
+        if (p.via === 'nearby') {
+          const spec = {
+            roomName: inboxRoomName(p.offer.fromDeviceId),
+            keyMaterial: 'inbox:' + p.offer.fromDeviceId,
+            keyContext: KEY_CTX.inbox,
+          };
+          const r = await connectFlingRoom(spec, {});
+          await r.sendOfferRejected(taskId);
+          await delay(800);
+          await r.close().catch(() => {});
+        } else if (p.code) {
+          const lobby = this.lobbyRoomFor(p.code);
+          await lobby?.sendOfferRejected(taskId);
+        }
+      } catch { /* 尽力 */ }
+    };
+    void sendReject();
+    toast('已拒绝');
+    this.notify();
+  }
+
+  // ---------- badge 计数 ----------
+  get sendActiveCount(): number {
+    let n = 0;
+    for (const t of this.sendTasks.values()) if (t.active) n++;
+    return n;
+  }
+  get recvBadgeCount(): number {
+    let n = this.pending.size;
+    for (const t of this.recvTasks.values()) if (t.active) n++;
+    return n;
+  }
+
+  /** 成功任务展示 5s 后自动收起（UI 层调用） */
+  autoDismiss(task: SendTask | RecvTask, remove: (t: SendTask | RecvTask) => void): void {
+    setTimeout(() => {
+      if ((task.phase === 'done' || task.phase === 'cancelled') && !task.active) {
+        remove(task);
+      }
+    }, 5000);
+  }
+}
+
+export const manager = new TransferManager();

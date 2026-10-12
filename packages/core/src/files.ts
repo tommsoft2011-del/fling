@@ -5,7 +5,7 @@
 
 import { sha256 } from '@noble/hashes/sha2';
 import { bytesToHex } from '@noble/hashes/utils';
-import { FILE_CHUNK_SIZE, randomId, type FileManifest } from './protocol.js';
+import { FILE_CHUNK_SIZE, randomId, type FileKind, type FileManifest } from './protocol.js';
 
 /** Minimal file abstraction shared by browser File, node fs, etc. */
 export interface FileLike {
@@ -48,7 +48,7 @@ export async function hashFile(file: FileLike, chunkSize = 256 * 1024): Promise<
   return bytesToHex(h.digest());
 }
 
-export async function buildManifest(file: FileLike): Promise<FileManifest> {
+export async function buildManifest(file: FileLike, kind: FileKind = 'file'): Promise<FileManifest> {
   const chunkSize = FILE_CHUNK_SIZE;
   return {
     id: randomId(12),
@@ -57,6 +57,7 @@ export async function buildManifest(file: FileLike): Promise<FileManifest> {
     sha256: await hashFile(file),
     chunkSize,
     totalChunks: Math.max(1, Math.ceil(file.size / chunkSize)),
+    kind,
   };
 }
 

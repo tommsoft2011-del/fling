@@ -1,18 +1,58 @@
 // Fling desktop backend (Tauri v2).
-// The Rust side owns: config file (server URL + API key/secret),
-// LiveKit token minting (HS256 JWT — the secret never enters the webview),
-// and nothing else. Files/clipboard go through official Tauri plugins.
+//
+// The Rust side owns:
+// - config file (server URL + API key/secret + device identity + download dir),
+// - LiveKit token minting (HS256 JWT — the secret never enters the webview),
+// - mDNS nearby discovery (service type `_fling._tcp.local.`),
+// - clipboard image writes,
+// - small OS helpers (folder picker, open folder, write file).
+// Text clipboard goes through the official Tauri clipboard plugin.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
-use tauri::Manager;
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc;
+use std::sync::Mutex;
+use tauri::{Emitter, Manager};
+
+// ================================================================ config ==
+
+/// 16 random bytes as lowercase hex. Generated once on first run, never rotated.
+fn new_device_id() -> String {
+    let bytes: [u8; 16] = rand::random();
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn default_device_name() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Fling-PC".to_owned())
+}
+
+fn default_download_dir() -> String {
+    let base = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("Fling");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.to_string_lossy().into_owned()
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 struct FlingConfig {
     server_url: String,
     api_key: String,
     api_secret: String,
+    #[serde(default = "new_device_id")]
+    device_id: String,
+    #[serde(default = "default_device_name")]
+    device_name: String,
+    #[serde(default = "default_download_dir")]
+    download_dir: String,
 }
 
 fn config_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -24,6 +64,39 @@ fn config_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(dir.join("config.json"))
 }
 
+fn write_config_file(p: &std::path::Path, cfg: &FlingConfig) -> Result<(), String> {
+    let s = serde_json::to_string_pretty(&cfg).map_err(|e| format!("encode: {e}"))?;
+    std::fs::write(p, s).map_err(|e| format!("write: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// Old config files may lack the v0.3 fields; fill defaults and write back.
+fn needs_migration(raw: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(v) => ["device_id", "device_name", "download_dir"]
+            .iter()
+            .any(|k| v.get(k).is_none()),
+        Err(_) => false,
+    }
+}
+
+/// Serializes config-file writers so concurrent settings changes can't tear the file.
+struct ConfigLock(Mutex<()>);
+
+fn with_config_lock<T>(app: &tauri::AppHandle, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let state = app.state::<ConfigLock>();
+    let _guard = state
+        .0
+        .lock()
+        .map_err(|e| format!("lock: {e}"))?;
+    f()
+}
+
 #[tauri::command]
 fn get_config(app: tauri::AppHandle) -> Result<Option<FlingConfig>, String> {
     let p = config_path(&app)?;
@@ -31,25 +104,82 @@ fn get_config(app: tauri::AppHandle) -> Result<Option<FlingConfig>, String> {
         return Ok(None);
     }
     let s = std::fs::read_to_string(&p).map_err(|e| format!("read: {e}"))?;
-    serde_json::from_str::<FlingConfig>(&s)
-        .map(Some)
-        .map_err(|e| format!("parse: {e}"))
+    let migrate = needs_migration(&s);
+    let cfg: FlingConfig = serde_json::from_str(&s).map_err(|e| format!("parse: {e}"))?;
+    // A config without server credentials is treated as "not set up"
+    // (the old save_config could never write such a file).
+    if cfg.server_url.trim().is_empty()
+        || cfg.api_key.trim().is_empty()
+        || cfg.api_secret.trim().is_empty()
+    {
+        return Ok(None);
+    }
+    if migrate {
+        let _ = write_config_file(&p, &cfg); // best-effort migration write-back
+    }
+    Ok(Some(cfg))
+}
+
+/// Load the config, creating it (device identity only) on first run.
+fn ensure_config(app: &tauri::AppHandle) -> Result<(std::path::PathBuf, FlingConfig), String> {
+    let p = config_path(app)?;
+    if p.exists() {
+        let s = std::fs::read_to_string(&p).map_err(|e| format!("read: {e}"))?;
+        let migrate = needs_migration(&s);
+        let cfg: FlingConfig = serde_json::from_str(&s).map_err(|e| format!("parse: {e}"))?;
+        if migrate {
+            let _ = write_config_file(&p, &cfg);
+        }
+        return Ok((p, cfg));
+    }
+    let cfg = FlingConfig {
+        server_url: String::new(),
+        api_key: String::new(),
+        api_secret: String::new(),
+        device_id: new_device_id(),
+        device_name: default_device_name(),
+        download_dir: default_download_dir(),
+    };
+    write_config_file(&p, &cfg)?;
+    Ok((p, cfg))
 }
 
 #[tauri::command]
 fn save_config(app: tauri::AppHandle, cfg: FlingConfig) -> Result<(), String> {
-    let p = config_path(&app)?;
-    if cfg.server_url.trim().is_empty() || cfg.api_key.trim().is_empty() || cfg.api_secret.trim().is_empty() {
+    if cfg.server_url.trim().is_empty()
+        || cfg.api_key.trim().is_empty()
+        || cfg.api_secret.trim().is_empty()
+    {
         return Err("server_url, api_key and api_secret are all required".into());
     }
-    let s = serde_json::to_string_pretty(&cfg).map_err(|e| format!("encode: {e}"))?;
-    std::fs::write(&p, s).map_err(|e| format!("write: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    with_config_lock(&app, || {
+        let p = config_path(&app)?;
+        // device_id is immutable once created — never rotate the identity.
+        // device_name / download_dir prefer the incoming non-empty value.
+        let merged = match std::fs::read_to_string(&p) {
+            Ok(s) => match serde_json::from_str::<FlingConfig>(&s) {
+                Ok(old) => FlingConfig {
+                    server_url: cfg.server_url,
+                    api_key: cfg.api_key,
+                    api_secret: cfg.api_secret,
+                    device_id: old.device_id,
+                    device_name: if cfg.device_name.trim().is_empty() {
+                        old.device_name
+                    } else {
+                        cfg.device_name
+                    },
+                    download_dir: if cfg.download_dir.trim().is_empty() {
+                        old.download_dir
+                    } else {
+                        cfg.download_dir
+                    },
+                },
+                Err(_) => cfg,
+            },
+            Err(_) => cfg,
+        };
+        write_config_file(&p, &merged)
+    })
 }
 
 /// Mint a LiveKit join token for `room`/`identity` using the stored secret.
@@ -119,19 +249,501 @@ fn write_binary_file(path: String, data_b64: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Save a received file into `dir`: sanitizes the name, never overwrites
+/// (appends " (1)", " (2)", … on collision), returns the final path.
+#[tauri::command]
+fn save_received_file(dir: String, name: String, data_b64: String) -> Result<String, String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&data_b64)
+        .map_err(|e| format!("base64: {e}"))?;
+
+    // 取 basename，去掉非法字符
+    let base = std::path::Path::new(&name)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let clean: String = base
+        .chars()
+        .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        .collect();
+    let clean = clean.trim();
+    let clean = if clean.is_empty() { "file".to_string() } else { clean.to_string() };
+
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+
+    let dir_path = std::path::PathBuf::from(&dir);
+    let mut candidate = dir_path.join(&clean);
+    if candidate.exists() {
+        let (stem, ext) = match clean.rfind('.') {
+            Some(i) if i > 0 => (clean[..i].to_string(), clean[i..].to_string()),
+            _ => (clean.clone(), String::new()),
+        };
+        let mut i = 1u32;
+        loop {
+            candidate = dir_path.join(format!("{stem} ({i}){ext}"));
+            if !candidate.exists() || i >= 9999 {
+                break;
+            }
+            i += 1;
+        }
+        if candidate.exists() {
+            return Err("无法生成不重名的文件名".to_string());
+        }
+    }
+    std::fs::write(&candidate, bytes).map_err(|e| format!("写入失败: {e}"))?;
+    Ok(candidate.to_string_lossy().into_owned())
+}
+
+// ============================================ device identity & download ==
+
+#[derive(Serialize, Clone)]
+struct DeviceInfo {
+    device_id: String,
+    device_name: String,
+}
+
+#[tauri::command]
+fn get_device_info(app: tauri::AppHandle) -> Result<DeviceInfo, String> {
+    let (_, cfg) = ensure_config(&app)?;
+    Ok(DeviceInfo {
+        device_id: cfg.device_id,
+        device_name: cfg.device_name,
+    })
+}
+
+#[tauri::command]
+fn set_device_name(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("设备名称不能为空".into());
+    }
+    if name.chars().count() > 64 {
+        return Err("设备名称太长（最多 64 个字符）".into());
+    }
+    let (p, mut cfg) = ensure_config(&app)?;
+    cfg.device_name = name.clone();
+    with_config_lock(&app, || write_config_file(&p, &cfg))?;
+    // Re-announce on mDNS so peers see the new name immediately.
+    app.state::<DiscoveryState>().send(DiscoveryCmd::UpdateIdentity {
+        device_id: cfg.device_id,
+        device_name: name,
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn get_download_dir(app: tauri::AppHandle) -> Result<String, String> {
+    Ok(ensure_config(&app)?.1.download_dir)
+}
+
+#[tauri::command]
+fn set_download_dir(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Err("目录不能为空".into());
+    }
+    let dir = std::path::PathBuf::from(&path);
+    if dir.exists() && !dir.is_dir() {
+        return Err("该路径不是目录".into());
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    let (p, mut cfg) = ensure_config(&app)?;
+    cfg.download_dir = dir.to_string_lossy().into_owned();
+    with_config_lock(&app, || write_config_file(&p, &cfg))
+}
+
+/// Open a folder picker and return the chosen directory (None = cancelled).
+#[tauri::command]
+async fn pick_download_dir(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let path = app.dialog().file().blocking_pick_folder();
+    Ok(path.map(|p| p.to_string()))
+}
+
+// ======================================================== mDNS discovery ==
+
+const MDNS_SERVICE_TYPE: &str = "_fling._tcp.local.";
+const FLING_PROTO_VERSION: &str = "3";
+
+#[derive(Serialize, Clone)]
+struct PeerUpPayload {
+    id: String,
+    name: String,
+}
+
+#[derive(Serialize, Clone)]
+struct PeerDownPayload {
+    id: String,
+}
+
+enum DiscoveryCmd {
+    SetBrowsing(bool),
+    SetDiscoverable(bool),
+    UpdateIdentity { device_id: String, device_name: String },
+}
+
+struct DiscoveryState {
+    tx: mpsc::Sender<DiscoveryCmd>,
+}
+
+impl DiscoveryState {
+    fn send(&self, cmd: DiscoveryCmd) {
+        let _ = self.tx.send(cmd);
+    }
+}
+
+/// Parse a resolved service's TXT records into (device_id, device_name).
+/// Returns None for non-Fling services (wrong or absent protocol version).
+fn peer_from_txt(v: Option<&str>, id: Option<&str>, name: Option<&str>) -> Option<(String, String)> {
+    if v? != FLING_PROTO_VERSION {
+        return None;
+    }
+    let id = id?;
+    if id.is_empty() {
+        return None;
+    }
+    let name = name.filter(|n| !n.is_empty()).unwrap_or(id);
+    Some((id.to_string(), name.to_string()))
+}
+
+/// Tracks known peers for up/down dedup. Keyed by mDNS fullname (which may
+/// gain a " (2)" suffix on instance-name conflicts); identity is device_id.
+#[derive(Default)]
+struct PeerSet {
+    by_fullname: HashMap<String, String>, // fullname -> device_id
+    known_ids: HashSet<String>,
+}
+
+impl PeerSet {
+    /// Returns true when this is a newly seen peer (caller emits peer-up).
+    fn insert(&mut self, fullname: &str, id: &str) -> bool {
+        self.by_fullname.insert(fullname.to_string(), id.to_string());
+        self.known_ids.insert(id.to_string())
+    }
+    /// Returns the device_id when the peer was known (caller emits peer-down).
+    fn remove(&mut self, fullname: &str) -> Option<String> {
+        let id = self.by_fullname.remove(fullname)?;
+        if !self.by_fullname.values().any(|v| v == &id) {
+            self.known_ids.remove(&id);
+        }
+        Some(id)
+    }
+    fn clear(&mut self) -> Vec<String> {
+        let ids: Vec<String> = self.known_ids.drain().collect();
+        self.by_fullname.clear();
+        ids
+    }
+}
+
+fn register_fling(
+    daemon: &mdns_sd::ServiceDaemon,
+    device_id: &str,
+    device_name: &str,
+) -> Option<String> {
+    let short = device_id.get(..12).unwrap_or(device_id);
+    let host = format!("fling-{short}.local.");
+    // Port 0: we offer no TCP service; mDNS is discovery-only here.
+    let props = [
+        ("id", device_id),
+        ("v", FLING_PROTO_VERSION),
+        ("name", device_name),
+    ];
+    let info = mdns_sd::ServiceInfo::new(MDNS_SERVICE_TYPE, device_name, &host, "", 0, &props[..])
+        .ok()?
+        .enable_addr_auto();
+    // register() re-announces in place; no need to unregister first.
+    let _ = daemon.register(info);
+    // Expected fullname; on instance-name conflict the daemon appends " (2)",
+    // in which case unregister() with this name is a best-effort no-op.
+    Some(format!("{device_name}.{MDNS_SERVICE_TYPE}"))
+}
+
+fn discovery_thread(
+    app: tauri::AppHandle,
+    rx: mpsc::Receiver<DiscoveryCmd>,
+    initial_id: String,
+    initial_name: String,
+) {
+    use mdns_sd::ServiceEvent;
+
+    let daemon = match mdns_sd::ServiceDaemon::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[fling] mDNS daemon init failed: {e}");
+            return;
+        }
+    };
+
+    let mut device_id = initial_id;
+    let mut device_name = initial_name;
+    let mut browsing = false;
+    let mut discoverable = true; // default on
+    let mut browse_rx: Option<mdns_sd::Receiver<ServiceEvent>> = None;
+    // Initial announce (discoverable defaults to on).
+    let mut registered_name = register_fling(&daemon, &device_id, &device_name);
+    let mut peers = PeerSet::default();
+
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+            Ok(DiscoveryCmd::SetBrowsing(on)) => {
+                if on && !browsing {
+                    match daemon.browse(MDNS_SERVICE_TYPE) {
+                        Ok(r) => {
+                            browse_rx = Some(r);
+                            browsing = true;
+                        }
+                        Err(e) => eprintln!("[fling] mDNS browse failed: {e}"),
+                    }
+                } else if !on && browsing {
+                    let _ = daemon.stop_browse(MDNS_SERVICE_TYPE);
+                    browse_rx = None;
+                    browsing = false;
+                    for id in peers.clear() {
+                        let _ = app.emit("fling://peer-down", PeerDownPayload { id });
+                    }
+                }
+            }
+            Ok(DiscoveryCmd::SetDiscoverable(on)) => {
+                discoverable = on;
+                if on {
+                    registered_name = register_fling(&daemon, &device_id, &device_name);
+                } else if let Some(name) = registered_name.take() {
+                    let _ = daemon.unregister(&name);
+                }
+            }
+            Ok(DiscoveryCmd::UpdateIdentity {
+                device_id: id,
+                device_name: name,
+            }) => {
+                device_id = id;
+                device_name = name;
+                if discoverable {
+                    registered_name = register_fling(&daemon, &device_id, &device_name);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        if let Some(brx) = browse_rx.as_ref() {
+            for ev in brx.try_iter() {
+                match ev {
+                    ServiceEvent::ServiceResolved(info) => {
+                        match peer_from_txt(
+                            info.get_property_val_str("v"),
+                            info.get_property_val_str("id"),
+                            info.get_property_val_str("name"),
+                        ) {
+                            Some((id, name)) if id != device_id => {
+                                if peers.insert(info.get_fullname(), &id) {
+                                    let _ =
+                                        app.emit("fling://peer-up", PeerUpPayload { id, name });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    ServiceEvent::ServiceRemoved(_ty, fullname) => {
+                        if let Some(id) = peers.remove(&fullname) {
+                            let _ = app.emit("fling://peer-down", PeerDownPayload { id });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let _ = daemon.shutdown();
+}
+
+#[tauri::command]
+fn discovery_set_browsing(app: tauri::AppHandle, on: bool) -> Result<(), String> {
+    app.state::<DiscoveryState>()
+        .send(DiscoveryCmd::SetBrowsing(on));
+    Ok(())
+}
+
+#[tauri::command]
+fn discovery_set_discoverable(app: tauri::AppHandle, on: bool) -> Result<(), String> {
+    app.state::<DiscoveryState>()
+        .send(DiscoveryCmd::SetDiscoverable(on));
+    Ok(())
+}
+
+// ======================================================= clipboard image ==
+
+/// Write a base64-encoded PNG to the system clipboard as an image
+/// (used for received clipboard-images; they must NOT become files).
+#[tauri::command]
+fn write_image_clipboard(data_b64: String) -> Result<(), String> {
+    use base64::Engine;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(&data_b64)
+        .map_err(|e| format!("base64 解码失败: {e}"))?;
+    let img = image::load_from_memory(&png)
+        .map_err(|e| format!("图片解码失败: {e}"))?
+        .to_rgba8();
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w == 0 || h == 0 {
+        return Err("图片尺寸无效".into());
+    }
+    let mut clip = arboard::Clipboard::new().map_err(|e| format!("打开剪贴板失败: {e}"))?;
+    clip.set_image(arboard::ImageData {
+        width: w,
+        height: h,
+        bytes: img.into_raw().into(),
+    })
+    .map_err(|e| format!("写入剪贴板失败: {e}"))?;
+    Ok(())
+}
+
+// ============================================================= OS helpers ==
+
+/// Open a folder in the system file manager (Windows Explorer / xdg-open).
+#[tauri::command]
+fn open_folder(path: String) -> Result<(), String> {
+    open::that(&path).map_err(|e| format!("打开文件夹失败: {e}"))?;
+    Ok(())
+}
+
+// ================================================================== main ==
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .setup(|app| {
+            // Device identity (created on first run) + mDNS discovery thread.
+            let (_, cfg) = ensure_config(app.handle())?;
+            let (tx, rx) = mpsc::channel::<DiscoveryCmd>();
+            app.manage(ConfigLock(Mutex::new(())));
+            app.manage(DiscoveryState { tx });
+            let handle = app.handle().clone();
+            let (device_id, device_name) = (cfg.device_id, cfg.device_name);
+            std::thread::Builder::new()
+                .name("fling-mdns".into())
+                .spawn(move || discovery_thread(handle, rx, device_id, device_name))
+                .map_err(|e| format!("mdns thread: {e}"))?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_config,
             save_config,
             mint_token,
             server_url,
             pick_save_path,
-            write_binary_file
+            write_binary_file,
+            save_received_file,
+            get_device_info,
+            set_device_name,
+            get_download_dir,
+            set_download_dir,
+            pick_download_dir,
+            discovery_set_browsing,
+            discovery_set_discoverable,
+            write_image_clipboard,
+            open_folder
         ])
         .run(tauri::generate_context!())
         .expect("error while running fling");
+}
+
+// ================================================================= tests ==
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_id_is_32_hex_and_unique() {
+        let a = new_device_id();
+        let b = new_device_id();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn migration_detects_old_config() {
+        assert!(needs_migration(
+            r#"{"server_url":"u","api_key":"k","api_secret":"s"}"#
+        ));
+        assert!(!needs_migration(
+            r#"{"server_url":"u","api_key":"k","api_secret":"s","device_id":"x","device_name":"y","download_dir":"z"}"#
+        ));
+        assert!(!needs_migration("not json"));
+    }
+
+    #[test]
+    fn old_config_parses_with_defaults() {
+        let cfg: FlingConfig =
+            serde_json::from_str(r#"{"server_url":"u","api_key":"k","api_secret":"s"}"#).unwrap();
+        assert_eq!(cfg.device_id.len(), 32);
+        assert!(!cfg.device_name.is_empty());
+        assert!(cfg.download_dir.ends_with("Fling"));
+    }
+
+    #[test]
+    fn peer_txt_parsing() {
+        assert_eq!(
+            peer_from_txt(Some("3"), Some("abc123"), Some("PC")),
+            Some(("abc123".to_string(), "PC".to_string()))
+        );
+        // wrong / missing version -> ignored
+        assert_eq!(peer_from_txt(Some("2"), Some("abc123"), Some("PC")), None);
+        assert_eq!(peer_from_txt(None, Some("abc123"), Some("PC")), None);
+        // missing / empty id -> ignored
+        assert_eq!(peer_from_txt(Some("3"), None, Some("PC")), None);
+        assert_eq!(peer_from_txt(Some("3"), Some(""), Some("PC")), None);
+        // missing name falls back to id
+        assert_eq!(
+            peer_from_txt(Some("3"), Some("abc123"), None),
+            Some(("abc123".to_string(), "abc123".to_string()))
+        );
+    }
+
+    #[test]
+    fn peer_set_dedup() {
+        let mut ps = PeerSet::default();
+        assert!(ps.insert("PC._fling._tcp.local.", "id1")); // new -> emit up
+        assert!(!ps.insert("PC._fling._tcp.local.", "id1")); // dup -> suppressed
+        assert!(!ps.insert("PC (2)._fling._tcp.local.", "id1")); // same id -> suppressed
+        assert_eq!(
+            ps.remove("PC._fling._tcp.local."),
+            Some("id1".to_string())
+        );
+        // id still referenced by the "(2)" name
+        assert_eq!(
+            ps.remove("PC (2)._fling._tcp.local."),
+            Some("id1".to_string())
+        );
+        assert_eq!(ps.remove("PC (2)._fling._tcp.local."), None);
+        // down then up may emit again
+        assert!(ps.insert("PC._fling._tcp.local.", "id1"));
+    }
+
+    #[test]
+    fn peer_set_clear() {
+        let mut ps = PeerSet::default();
+        ps.insert("a._fling._tcp.local.", "id1");
+        ps.insert("b._fling._tcp.local.", "id2");
+        let mut cleared = ps.clear();
+        cleared.sort();
+        assert_eq!(cleared, vec!["id1".to_string(), "id2".to_string()]);
+        assert!(ps.insert("a._fling._tcp.local.", "id1"));
+    }
+
+    #[test]
+    fn default_download_dir_exists() {
+        let d = default_download_dir();
+        assert!(d.ends_with("Fling"));
+        assert!(std::path::Path::new(&d).is_dir());
+    }
+
+    #[test]
+    fn default_device_name_nonempty() {
+        assert!(!default_device_name().is_empty());
+    }
 }

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -7,43 +7,154 @@
   </head>
   <body>
     <div id="app">
-      <!-- setup -->
+      <!-- 首次设置：服务器配置 -->
       <div class="screen" id="setupScreen">
         <div class="center">
           <h1><span class="logo">Fling</span> 设置</h1>
-          <p class="sub">填一次就行，key/secret 只存在本机</p>
+          <p class="sub">填一次就行，key / secret 只存在本机</p>
           <div class="field"><label>Server URL</label><input id="cfgUrl" placeholder="wss://rtc.syncpage.app" /></div>
           <div class="field"><label>API key</label><input id="cfgKey" placeholder="devkey_…" /></div>
-          <div class="field"><label>API secret</label><input id="cfgSecret" type="password" placeholder="secret_…" /></div>
-          <button class="primary" id="saveCfg">保存</button>
+          <div class="field"><label>API secret</label><input id="cfgSecret" type="password" placeholder="只存本机，不上传" /></div>
+          <button class="primary" id="saveCfg">保存并进入</button>
+          <div id="setupErr" class="err"></div>
         </div>
       </div>
-      <!-- join -->
-      <div class="screen" id="joinScreen">
-        <div class="center">
-          <h1><span class="logo">Fling</span></h1>
-          <p class="sub">和对方输入同一个房间号即可互传</p>
-          <div class="field"><label>房间号</label><input id="roomInput" placeholder="比如 myroom123" autocomplete="off" /></div>
-          <button class="primary" id="joinBtn">加入房间</button>
-          <div class="linkrow"><button id="editCfg">修改服务器设置</button></div>
-          <div id="status"></div>
-        </div>
-      </div>
-      <!-- room -->
-      <div class="screen" id="roomScreen">
-        <header>
-          <h2 id="roomTitle">房间</h2>
-          <span id="peers"></span>
-          <button class="ghost" id="leaveBtn">离开</button>
-        </header>
-        <div id="msgList"></div>
-        <div class="composer">
-          <label class="filebtn"><button type="button">📎 文件</button><input type="file" id="fileInput" multiple /></label>
-          <input type="text" id="textInput" placeholder="输入消息回车发送…" autocomplete="off" />
-          <button id="sendBtn">发送</button>
-        </div>
+
+      <!-- 主界面 -->
+      <div class="screen" id="mainScreen">
+        <nav id="sideNav">
+          <div class="brand">Fling</div>
+          <button data-page="send" class="active">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
+            发送<span class="badge" id="badgeSend" hidden></span>
+          </button>
+          <button data-page="recv">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>
+            接收<span class="badge" id="badgeRecv" hidden></span>
+          </button>
+          <button data-page="hist">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>
+            历史
+          </button>
+          <button data-page="settings">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg>
+            设置
+          </button>
+          <div class="nav-foot" id="myDeviceLine">…</div>
+        </nav>
+
+        <main id="pageHost">
+          <!-- 发送 -->
+          <section class="page active" id="page-send">
+            <h2>发送</h2>
+            <div class="card">
+              <div class="card-t">发送内容 <span class="hint">可输入文字，Ctrl+V 粘贴文本 / 图片 / 文件</span></div>
+              <div id="composeBox" tabindex="0">
+                <div id="chipRow"></div>
+                <textarea id="composeText" rows="3" placeholder="输入文字，或 Ctrl+V 粘贴…"></textarea>
+              </div>
+              <div class="compose-actions">
+                <label class="filebtn">＋ 添加文件<input type="file" id="fileInput" multiple hidden /></label>
+                <span class="hint" id="composeHint"></span>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-t">选择目标</div>
+              <div class="card-sub">附近的设备</div>
+              <div id="nearbyList" class="devlist"><div class="empty">正在搜索附近的设备…</div></div>
+              <div class="card-sub">远程设备</div>
+              <button class="ghostbtn" id="remotePairBtn">🔗 用配对码发送</button>
+            </div>
+            <button class="primary big" id="sendBtn" disabled>发送</button>
+            <div id="sendTasks"></div>
+          </section>
+
+          <!-- 接收 -->
+          <section class="page" id="page-recv">
+            <h2>接收</h2>
+            <div class="card row">
+              <div>
+                <div class="card-t">允许附近的设备发现我</div>
+                <div class="hint">关闭后，附近设备列表里看不到这台电脑（不影响配对码）</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="discoverToggle" checked /><span></span></label>
+            </div>
+            <div class="card">
+              <div class="card-t">等待你确认 <span class="hint">对方发来的内容，先确认再接收</span></div>
+              <div id="pendingList"><div class="empty">暂无待确认的传输</div></div>
+              <button class="ghostbtn" id="remoteRecvBtn" style="margin-top:10px">🔗 用配对码接收</button>
+            </div>
+            <div class="card">
+              <div class="card-t">接收中</div>
+              <div id="recvTasks"><div class="empty">暂无正在接收的任务</div></div>
+            </div>
+          </section>
+
+          <!-- 历史 -->
+          <section class="page" id="page-hist">
+            <h2>历史</h2>
+            <div class="filters" id="histFilters">
+              <button data-f="all" class="active">全部</button>
+              <button data-f="send">我发送的</button>
+              <button data-f="recv">我接收的</button>
+              <button data-f="clip">剪贴板</button>
+            </div>
+            <div id="histList"></div>
+          </section>
+
+          <!-- 设置 -->
+          <section class="page" id="page-settings">
+            <h2>设置</h2>
+            <div class="card">
+              <div class="card-t">设备名称</div>
+              <div class="hint">附近的设备会看到这个名字</div>
+              <div class="row" style="margin-top:8px">
+                <input id="deviceNameInput" class="textinput" maxlength="64" />
+                <button class="ghostbtn" id="saveDeviceName">保存</button>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-t">接收目录</div>
+              <div class="hint">收到的文件自动保存在这里</div>
+              <div class="row" style="margin-top:8px">
+                <input id="downloadDirInput" class="textinput" readonly />
+                <button class="ghostbtn" id="pickDownloadDir">选择文件夹</button>
+                <button class="ghostbtn" id="openDownloadDir">打开</button>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-t">界面风格</div>
+              <div class="seg" id="themeSeg">
+                <button data-theme="light">浅色</button>
+                <button data-theme="dark">深色</button>
+                <button data-theme="system">跟随系统</button>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-t">关于</div>
+              <div class="hint" id="aboutLine">Fling</div>
+              <div class="linkrow"><button class="linkbtn" id="editServerBtn">修改服务器设置</button></div>
+            </div>
+          </section>
+        </main>
       </div>
     </div>
+
+    <!-- 配对弹窗 -->
+    <div id="pairModal" class="modal" hidden>
+      <div class="modal-box">
+        <h3 id="pairTitle">远程配对</h3>
+        <p class="hint" id="pairDesc">和对方输入相同的 6 位配对码</p>
+        <input id="pairCode" class="textinput big-code" maxlength="8" placeholder="K7Q2M9" autocomplete="off" />
+        <div class="modal-actions">
+          <button class="ghostbtn" id="pairCancel">取消</button>
+          <button class="primary" id="pairOk">确定</button>
+        </div>
+        <div id="pairStatus" class="hint"></div>
+      </div>
+    </div>
+
+    <div id="toasts"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

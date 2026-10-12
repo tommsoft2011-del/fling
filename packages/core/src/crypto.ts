@@ -25,8 +25,14 @@ export interface SealedEnvelope {
   ct: string; // base64
 }
 
-/** Derive the room encryption key from the pairing code. */
-export async function deriveRoomKey(code: string): Promise<CryptoKey> {
+/**
+ * Derive the room encryption key from the pairing code.
+ *
+ * `context` selects the PBKDF2 salt domain. It defaults to the historical
+ * 'fling-v1-key' salt so existing single-argument callers keep deriving the
+ * exact same key. New v2 callers pass 'fling-v2-room' / 'fling-v2-lobby'.
+ */
+export async function deriveRoomKey(code: string, context: string = 'fling-v1-key'): Promise<CryptoKey> {
   const enc = new TextEncoder();
   const base = await crypto.subtle.importKey(
     'raw',
@@ -38,7 +44,7 @@ export async function deriveRoomKey(code: string): Promise<CryptoKey> {
   return crypto.subtle.deriveKey(
     {
       name: 'PBKDF2',
-      salt: enc.encode('fling-v1-key'),
+      salt: enc.encode(context),
       iterations: PBKDF2_ITERATIONS,
       hash: 'SHA-256',
     },

@@ -1,6 +1,6 @@
 {
   "name": "@fling/desktop",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,7 +8,7 @@
     "build": "vite build"
   },
   "dependencies": {
-    "@fling/core": "0.2.0",
+    "@fling/core": "0.3.0",
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-clipboard-manager": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.0.0",
