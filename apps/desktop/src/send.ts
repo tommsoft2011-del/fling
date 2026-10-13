@@ -1,16 +1,16 @@
-// 发送页：统一发送框 + 目标选择 + 进行中的发送
+// 发送页：原生工作台 — 内容区 + 设备磁贴（点即发送）+ 底部任务抽屉
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { $, el, fmtSize, toast, uid, utf8bytes } from './ui.js';
 import { manager, type ComposeItem, type SendTarget } from './tasks.js';
-import { createTaskCard, type CardHandle } from './taskcard.js';
-import { openPairDialog } from './pairdialog.js';
+import { createTaskRow, type CardHandle } from './taskcard.js';
+import { normalizeCode } from '@fling/core';
 
 let clipItems: ComposeItem[] = []; // 输入框里的剪贴板图片（chip）
 let fileItems: ComposeItem[] = []; // 下方文件列表里的文件
-let selectedTarget: SendTarget | null = null;
-const cards = new Map<string, CardHandle>();
+const rows = new Map<string, CardHandle>();
 let inited = false;
+let drawerOpen = false;
 
 export function initSendPage(): void {
   if (inited) return;
@@ -37,7 +37,6 @@ export function initSendPage(): void {
       handled = true;
     }
     if (handled) e.preventDefault();
-    refreshSendBtn();
   });
 
   // --- 拖拽文件到发送页任意位置 → 文件列表 ---
@@ -68,7 +67,6 @@ export function initSendPage(): void {
     const files = (e as DragEvent).dataTransfer?.files;
     if (files) {
       for (const f of Array.from(files)) addFileItem(f);
-      refreshSendBtn();
     }
   });
 
@@ -93,7 +91,6 @@ export function initSendPage(): void {
       }
     }
     if (added > 0) toast(`已添加 ${added} 个文件`);
-    refreshSendBtn();
   }).catch(() => { /* 非 Tauri 环境忽略 */ });
 
   ($('#fileInput') as HTMLInputElement).addEventListener('change', (e) => {
@@ -101,48 +98,55 @@ export function initSendPage(): void {
     if (files) {
       for (const f of Array.from(files)) addFileItem(f);
       (e.target as HTMLInputElement).value = '';
-      refreshSendBtn();
     }
   });
 
-  textarea.addEventListener('input', refreshSendBtn);
-
-  // --- 远程配对发送 ---
-  $('#remotePairBtn').onclick = () => {
-    openPairDialog('send', (code) => {
-      const items = snapshotItems();
-      if (items.length === 0) {
-        toast('发送内容是空的', true);
-        return;
-      }
-      doSend(items, { type: 'remote', code });
-      toast(`等待对方输入配对码 ${code} 加入…`);
-    });
-  };
-
-  // --- 发送按钮 ---
-  $('#sendBtn').onclick = () => {
-    const target = selectedTarget;
+  // --- 远程配对磁贴：行内输入配对码发送 ---
+  const pairInput = $('#pairCodeInput') as HTMLInputElement;
+  const pairBtn = $('#pairSendBtn') as HTMLButtonElement;
+  const doPairSend = () => {
+    const code = normalizeCode(pairInput.value);
+    if (!code) {
+      toast('请输入 6 位配对码', true);
+      pairInput.focus();
+      return;
+    }
     const items = snapshotItems();
-    if (items.length === 0 || !target) return;
-    doSend(items, target);
+    if (items.length === 0) {
+      toast('发送内容是空的', true);
+      return;
+    }
+    doSend(items, { type: 'remote', code });
+    toast(`等待对方输入配对码 ${code} 加入…`);
+    pairInput.value = '';
+  };
+  pairBtn.onclick = doPairSend;
+  pairInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') doPairSend();
+    e.stopPropagation(); // 回车不触发磁贴点击
+  });
+  pairInput.addEventListener('click', (e) => e.stopPropagation());
+
+  // --- 任务抽屉开关 ---
+  $('#taskStrip').onclick = () => {
+    drawerOpen = !drawerOpen;
+    $('#taskRows').hidden = !drawerOpen;
+    $('#taskCar').textContent = drawerOpen ? '▾' : '▴';
   };
 
   manager.onChange(() => {
-    renderNearby();
-    syncTaskCards();
-    refreshSendBtn();
+    renderTiles();
+    syncTaskRows();
   });
-  renderNearby();
+  renderTiles();
   renderChips();
   renderFileList();
-  refreshSendBtn();
+  syncTaskRows();
 }
 
 /** 历史页"重发"文本时调用：把文本填回发送框 */
 export function setComposeText(text: string): void {
   ($('#composeText') as HTMLTextAreaElement).value = text;
-  refreshSendBtn();
   $('#composeText').focus();
 }
 
@@ -191,7 +195,6 @@ function removeFileItem(uid_: string): void {
   if (i >= 0) {
     fileItems.splice(i, 1);
     renderFileList();
-    refreshSendBtn();
   }
 }
 
@@ -201,7 +204,6 @@ function removeComposeItem(uid_: string): void {
     const [c] = clipItems.splice(i, 1);
     if (c.previewUrl) URL.revokeObjectURL(c.previewUrl);
     renderChips();
-    refreshSendBtn();
   }
 }
 
@@ -263,90 +265,87 @@ function snapshotItems(): ComposeItem[] {
   return items;
 }
 
-/** 点击发送：快照 → 建任务 → 立即清空发送框 */
+/** 点击磁贴即发送：快照 → 建任务 → 立即清空发送框 */
 function doSend(items: ComposeItem[], target: SendTarget): void {
-  const btn = $('#sendBtn') as HTMLButtonElement;
-  btn.disabled = true;
-  btn.textContent = '准备中…';
   try {
     manager.startSend(items, target);
   } catch (e) {
     toast('创建任务失败：' + (e as Error).message, true);
-  } finally {
-    ($('#composeText') as HTMLTextAreaElement).value = '';
-    for (const c of clipItems) if (c.previewUrl) URL.revokeObjectURL(c.previewUrl);
-    clipItems = [];
-    fileItems = [];
-    if (target.type === 'remote') selectedTarget = null;
-    renderChips();
-    renderFileList();
-    renderNearby();
-    btn.textContent = '发送';
-    refreshSendBtn();
+    return;
   }
+  ($('#composeText') as HTMLTextAreaElement).value = '';
+  for (const c of clipItems) if (c.previewUrl) URL.revokeObjectURL(c.previewUrl);
+  clipItems = [];
+  fileItems = [];
+  renderChips();
+  renderFileList();
 }
 
-function refreshSendBtn(): void {
-  const btn = $('#sendBtn') as HTMLButtonElement;
-  if (btn.textContent === '准备中…') return;
-  const text = ($('#composeText') as HTMLTextAreaElement).value.trim();
-  const hasContent = text !== '' || clipItems.length > 0 || fileItems.length > 0;
-  btn.disabled = !hasContent || !selectedTarget;
+/** 磁贴点击：有内容才发 */
+function trySend(target: SendTarget, label: string): void {
+  const items = snapshotItems();
+  if (items.length === 0) {
+    toast('发送内容是空的，先输入文字或添加文件', true);
+    return;
+  }
+  doSend(items, target);
+  toast(`正在发送给 ${label}…`);
 }
 
-function renderNearby(): void {
-  const host = $('#nearbyList');
-  // 选中的设备若已下线，清除选择
-  if (
-    selectedTarget?.type === 'nearby' &&
-    !manager.peers.has(selectedTarget.deviceId)
-  ) {
-    selectedTarget = null;
-  }
+function renderTiles(): void {
+  const host = $('#nearbyTiles');
   host.innerHTML = '';
   const peers = [...manager.peers.entries()];
   if (peers.length === 0) {
-    host.appendChild(el('div', 'empty', '正在搜索附近的设备…（对方需开启 Fling 并允许被发现）'));
+    host.appendChild(el('div', 'devtile ghost', '正在搜索…'));
     return;
   }
   for (const [id, name] of peers) {
-    const b = el('button', 'dev') as HTMLButtonElement;
-    if (selectedTarget?.type === 'nearby' && selectedTarget.deviceId === id) {
-      b.classList.add('selected');
-    }
-    const dot = el('span', 'dot');
-    const nm = el('span', 'dname', name);
-    const sub = el('span', 'dsub', '点击选择');
-    b.append(dot, nm, sub);
-    b.onclick = () => {
-      if (selectedTarget?.type === 'nearby' && selectedTarget.deviceId === id) {
-        selectedTarget = null;
-      } else {
-        selectedTarget = { type: 'nearby', deviceId: id, deviceName: name };
-      }
-      renderNearby();
-      refreshSendBtn();
-    };
-    host.appendChild(b);
+    const t = el('button', 'devtile') as HTMLButtonElement;
+    t.append(
+      el('div', 'pic', '💻'),
+      el('div', 'dname', name),
+      (() => { const s = el('div', 'st', '在线'); return s; })(),
+    );
+    t.title = `点击发送给 ${name}`;
+    t.onclick = () => trySend({ type: 'nearby', deviceId: id, deviceName: name }, name);
+    host.appendChild(t);
   }
 }
 
-function syncTaskCards(): void {
-  const host = $('#sendTasks');
+function syncTaskRows(): void {
+  const drawer = $('#taskDrawer');
+  const list = $('#taskRows');
   const tasks = [...manager.sendTasks.values()].reverse(); // 最新在上
   for (const t of tasks) {
-    let h = cards.get(t.taskId);
+    let h = rows.get(t.taskId);
     if (!h) {
-      h = createTaskCard(t, 'send');
-      cards.set(t.taskId, h);
+      h = createTaskRow(t, 'send');
+      rows.set(t.taskId, h);
     }
-    host.appendChild(h.root);
+    list.appendChild(h.root);
     h.update();
   }
-  for (const [id, h] of [...cards]) {
+  for (const [id, h] of [...rows]) {
     if (!manager.sendTasks.has(id)) {
       h.destroy();
-      cards.delete(id);
+      rows.delete(id);
     }
   }
+  // 状态条：有任务才显示
+  const n = tasks.length;
+  drawer.hidden = n === 0;
+  if (n > 0) {
+    const cnt = $('#taskCount');
+    cnt.hidden = false;
+    cnt.textContent = String(n);
+    const first = tasks.find((t) => t.active) ?? tasks[0];
+    $('#taskMini').textContent = taskMiniLabel(first);
+  }
+  if (!drawerOpen) list.hidden = true;
+}
+
+function taskMiniLabel(t: { peerLabel: string; active: boolean; phase: string }): string {
+  if (!t.active) return `${t.peerLabel} · ${t.phase === 'done' ? '完成' : t.phase}`;
+  return `→ ${t.peerLabel}`;
 }

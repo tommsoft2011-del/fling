@@ -47,36 +47,35 @@
           <!-- 发送 -->
           <section class="page active" id="page-send">
             <h2>发送</h2>
-            <div class="split">
-              <div class="split-main">
-                <div class="card step-card">
-                  <div class="step-head"><span class="step-num">1</span><span class="step-t">发送内容</span><span class="hint">文字可留空，作为本次传输的说明；文字、文件、剪贴板至少选其一</span></div>
-                  <div id="composeBox" tabindex="0">
-                    <div id="chipRow"></div>
-                    <textarea id="composeText" rows="2" placeholder="输入说明文字（可选），或 Ctrl+V 粘贴…"></textarea>
-                    <div class="compose-hint"><span class="hint" id="composeHint"></span></div>
-                  </div>
-                  <div id="fileListWrap">
-                    <div class="filelist-head"><span class="hint" id="fileCountHint"></span></div>
-                    <div id="fileList"><div class="empty">还没有文件 — 点「添加文件」，或直接把文件拖进来</div></div>
-                    <div class="compose-actions">
-                      <label class="filebtn">＋ 添加文件<input type="file" id="fileInput" multiple hidden /></label>
-                      <span class="hint">支持拖放文件到本页任意位置</span>
-                    </div>
+            <div class="sendwrap">
+              <div class="sendmain">
+                <div id="composeBox" tabindex="0">
+                  <div id="chipRow"></div>
+                  <textarea id="composeText" rows="2" placeholder="输入文字，或 Ctrl+V 粘贴…"></textarea>
+                  <div class="compose-hint"><span class="hint" id="composeHint"></span></div>
+                </div>
+                <div id="fileListWrap">
+                  <div class="filelist-head"><span class="hint" id="fileCountHint"></span></div>
+                  <div id="fileList"><div class="empty">还没有文件 — 点「添加文件」，或直接把文件拖进来</div></div>
+                  <div class="compose-actions">
+                    <label class="filebtn">＋ 添加文件<input type="file" id="fileInput" multiple hidden /></label>
+                    <span class="hint">支持拖放文件到本页任意位置</span>
                   </div>
                 </div>
-                <div class="card step-card">
-                  <div class="step-head"><span class="step-num">2</span><span class="step-t">发送目标</span></div>
-                  <div class="card-sub">附近的设备</div>
-                  <div id="nearbyList" class="devlist"><div class="empty">正在搜索附近的设备…</div></div>
-                  <div class="card-sub">远程设备</div>
-                  <button class="ghostbtn" id="remotePairBtn">🔗 用配对码发送</button>
+                <div class="devsec-label">设备 <span class="hint">点击直接发送</span></div>
+                <div class="devtiles">
+                  <div id="nearbyTiles" class="tiles-flow"></div>
+                  <div class="devtile pair">
+                    <div class="pic">🔗</div>
+                    <div class="dname">远程配对</div>
+                    <input id="pairCodeInput" maxlength="8" placeholder="6 位配对码" autocomplete="off" />
+                    <button id="pairSendBtn" class="nbtn">发送</button>
+                  </div>
                 </div>
-                <button class="primary big" id="sendBtn" disabled>发送</button>
               </div>
-              <div class="split-side">
-                <div class="side-t">传输任务</div>
-                <div id="sendTasks"></div>
+              <div id="taskDrawer" hidden>
+                <button id="taskStrip"><span class="car" id="taskCar">▴</span> 传输任务 <span class="cnt" id="taskCount" hidden></span><span class="mini" id="taskMini"></span></button>
+                <div id="taskRows" hidden></div>
               </div>
             </div>
             <div id="dropOverlay"><div class="box">松开鼠标添加文件<span class="sub">文件将加入本次发送内容</span></div></div>
@@ -85,25 +84,33 @@
           <!-- 接收 -->
           <section class="page" id="page-recv">
             <h2>接收</h2>
-            <div class="split">
-              <div class="split-main">
-                <div class="card row">
-                  <div>
-                    <div class="card-t">允许附近的设备发现我</div>
-                    <div class="hint">关闭后，附近设备列表里看不到这台电脑（不影响配对码）</div>
-                  </div>
-                  <label class="switch"><input type="checkbox" id="discoverToggle" checked /><span></span></label>
+            <div class="group">
+              <div class="grow">
+                <div>
+                  <div class="lab">允许附近的设备发现我</div>
+                  <div class="desc">关闭后，附近设备列表里看不到这台电脑（不影响配对码）</div>
                 </div>
-                <div class="card">
-                  <div class="card-t">等待你确认 <span class="hint">对方发来的内容，先确认再接收</span></div>
-                  <div id="pendingList"><div class="empty">暂无待确认的传输</div></div>
-                  <button class="ghostbtn" id="remoteRecvBtn" style="margin-top:10px">🔗 用配对码接收</button>
+                <div class="right"><label class="switch"><input type="checkbox" id="discoverToggle" checked /><span></span></label></div>
+              </div>
+              <div class="grow">
+                <div class="lab">配对码接收</div>
+                <div class="right">
+                  <input id="pairRecvInput" class="codeinput" maxlength="8" placeholder="6 位配对码" autocomplete="off" />
+                  <button id="pairRecvBtn" class="nbtn">开始监听</button>
                 </div>
               </div>
-              <div class="split-side">
-                <div class="side-t">接收中的任务</div>
-                <div id="recvTasks"><div class="empty">暂无正在接收的任务</div></div>
+              <div class="grow" id="lobbyStatusRow" hidden>
+                <div class="lab"><span class="livedot"></span>正在监听 <b id="lobbyCodeLabel"></b></div>
+                <div class="right"><button class="linkbtn" id="lobbyStopBtn">停止</button></div>
               </div>
+            </div>
+            <div class="ghead">等待确认 <span class="cnt" id="pendingCount" hidden></span></div>
+            <div class="group">
+              <div id="pendingList"><div class="empty">暂无待确认的传输</div></div>
+            </div>
+            <div class="ghead">接收中</div>
+            <div class="group">
+              <div id="recvRows"><div class="empty">暂无正在接收的任务</div></div>
             </div>
           </section>
 
@@ -161,20 +168,6 @@
             </div>
           </section>
         </main>
-      </div>
-    </div>
-
-    <!-- 配对弹窗 -->
-    <div id="pairModal" class="modal" hidden>
-      <div class="modal-box">
-        <h3 id="pairTitle">远程配对</h3>
-        <p class="hint" id="pairDesc">和对方输入相同的 6 位配对码</p>
-        <input id="pairCode" class="textinput big-code" maxlength="8" placeholder="K7Q2M9" autocomplete="off" />
-        <div class="modal-actions">
-          <button class="ghostbtn" id="pairCancel">取消</button>
-          <button class="primary" id="pairOk">确定</button>
-        </div>
-        <div id="pairStatus" class="hint"></div>
       </div>
     </div>
 

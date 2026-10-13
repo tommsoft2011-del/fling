@@ -88,15 +88,7 @@ button { font: inherit; cursor: pointer; }
 .row { display: flex; gap: 8px; align-items: center; }
 .empty { color: var(--muted); font-size: 13px; padding: 10px 2px; }
 
-/* ---------- 发送页两步式 ---------- */
-.step-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-.step-num {
-  width: 22px; height: 22px; border-radius: 50%; flex-shrink: 0;
-  background: var(--accent); color: #fff; font-size: 13px; font-weight: 700;
-  display: inline-flex; align-items: center; justify-content: center;
-}
-.step-t { font-weight: 700; font-size: 15px; }
-.step-head .hint { margin-left: 2px; }
+/* ---------- 发送页：原生工作台 ---------- */
 #fileListWrap { margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 10px; }
 #fileListWrap.dragover { outline: 2px dashed var(--accent); outline-offset: 4px; border-radius: 8px; }
 /* 全页拖放提示层：文件拖入时高亮，明确可松手 */
@@ -146,23 +138,10 @@ button { font: inherit; cursor: pointer; }
 .page.active { display: block; }
 .page h2 { margin: 0 0 14px; font-size: 20px; }
 
-/* ---------- 宽屏双栏布局（>=1200px） ---------- */
-/* 窄屏下 .split 只是普通块级容器，页面保持原来的单列样式 */
-.split-main, .split-side { min-width: 0; }
-.side-t { display: none; }
+/* ---------- 页面宽度 ---------- */
 @media (min-width: 1200px) {
-  #page-send, #page-recv { max-width: none; }
+  #page-send, #page-recv { max-width: 860px; }
   #page-hist, #page-settings { max-width: 1060px; }
-  .split {
-    display: grid;
-    grid-template-columns: minmax(430px, 540px) minmax(0, 1fr);
-    gap: 18px; align-items: start;
-  }
-  .side-t {
-    display: block; font-weight: 700; font-size: 14px; color: var(--muted);
-    margin: 2px 0 10px;
-  }
-  #page-send #sendTasks { margin-top: 0; }
 }
 
 /* ---------- 发送页 ---------- */
@@ -199,18 +178,7 @@ button { font: inherit; cursor: pointer; }
   border-radius: 8px; padding: 6px 12px;
 }
 .filebtn:hover { border-color: var(--accent); }
-.devlist { display: flex; flex-direction: column; gap: 8px; }
-.dev {
-  display: flex; align-items: center; gap: 10px; padding: 10px 12px;
-  border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2);
-  cursor: pointer; width: 100%; text-align: left; color: var(--text);
-}
-.dev:hover { border-color: var(--accent); }
-.dev.selected { border-color: var(--accent); background: var(--accent-soft); }
-.dev .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
-.dev .dname { font-weight: 600; }
-.dev .dsub { color: var(--muted); font-size: 12px; margin-left: auto; }
-#sendTasks { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+/* 设备磁贴（新）见下方原生工作台一节 */
 /* ---------- 待发送文件列表 ---------- */
 #fileList { display: flex; flex-direction: column; gap: 8px; }
 .frow {
@@ -227,51 +195,6 @@ button { font: inherit; cursor: pointer; }
   padding: 0 2px; flex-shrink: 0;
 }
 .frow .fx:hover { color: var(--danger); }
-/* 暂无任务时的占位提示（任务卡出现后自动消失） */
-#sendTasks:empty::after {
-  content: '暂无传输任务，发送后这里会显示进度';
-  display: block; border: 1px dashed var(--border); border-radius: 12px;
-  padding: 26px 16px; text-align: center; color: var(--muted); font-size: 13px;
-}
-
-/* ---------- 任务卡 ---------- */
-.task {
-  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
-  padding: 12px 14px; transition: opacity .4s;
-}
-.task.fading { opacity: 0; }
-.task-t { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 13px; }
-.task-t .tpeer { color: var(--muted); font-weight: 400; }
-.task-t .x { margin-left: auto; border: none; background: none; color: var(--muted); font-size: 15px; }
-.task-t .x:hover { color: var(--danger); }
-.steps { display: flex; gap: 6px; margin: 8px 0; font-size: 11px; color: var(--muted); }
-.step { padding: 2px 9px; border-radius: 20px; background: var(--surface-2); border: 1px solid var(--border); }
-.step.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
-.step.done { color: var(--accent); border-color: var(--accent); }
-.titems { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
-.titem { font-size: 12px; color: var(--muted); }
-.titem .trow { display: flex; align-items: center; gap: 8px; }
-.titem .tname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
-.titem .tsize { flex-shrink: 0; }
-.titem .tok { color: var(--accent); font-weight: 700; }
-.titem .tbad { color: var(--danger); font-weight: 700; }
-.pbar { height: 6px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; margin-top: 4px; }
-.pfill {
-  height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), #2dd4bf, var(--accent));
-  background-size: 200% 100%; border-radius: 4px; transition: width .2s;
-}
-.pbar.live .pfill { animation: shimmer 1.2s linear infinite; }
-@keyframes shimmer { to { background-position: -200% 0; } }
-.tmeta { display: flex; gap: 12px; font-size: 11px; color: var(--muted); margin-top: 6px; }
-.kb {
-  display: inline-block; font-size: 10px; border: 1px solid var(--border); border-radius: 4px;
-  padding: 0 5px; color: var(--muted); background: var(--surface-2); flex-shrink: 0;
-}
-.kb.clip { color: var(--accent); border-color: var(--accent); }
-.kb.text { color: #3b82f6; border-color: #3b82f6; }
-.pulse { animation: pulse 1.6s ease-in-out infinite; }
-@keyframes pulse { 50% { opacity: .55; } }
-.done-check { color: var(--accent); font-size: 15px; font-weight: 800; }
 
 /* ---------- 接收页 ---------- */
 .switch { position: relative; width: 44px; height: 24px; flex-shrink: 0; }
@@ -287,16 +210,15 @@ button { font: inherit; cursor: pointer; }
 .switch input:checked + span { background: var(--accent-soft); border-color: var(--accent); }
 .switch input:checked + span:before { transform: translateX(20px); background: var(--accent); }
 .pend {
-  display: flex; align-items: center; gap: 10px; padding: 10px 12px;
-  border: 1px solid var(--border); border-radius: 10px; margin-bottom: 8px; background: var(--surface-2);
+  display: flex; align-items: center; gap: 10px; padding: 11px 16px;
 }
+.pend + .pend { border-top: 1px solid var(--border); }
 .pend .pinfo { flex: 1; min-width: 0; }
 .pend .pfrom { font-weight: 600; font-size: 13px; }
 .pend .pitems { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pend .pact { display: flex; gap: 6px; flex-shrink: 0; }
 .btn-ok { background: var(--accent); color: var(--accent-text); border: none; border-radius: 7px; padding: 6px 14px; font-weight: 600; }
 .btn-no { background: var(--surface); border: 1px solid var(--border); color: var(--text); border-radius: 7px; padding: 6px 12px; }
-#recvTasks { display: flex; flex-direction: column; gap: 10px; }
 
 /* ---------- 历史页 ---------- */
 .filters { display: flex; gap: 8px; margin-bottom: 12px; }
@@ -379,3 +301,131 @@ button { font: inherit; cursor: pointer; }
 
 ::-webkit-scrollbar { width: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 6px; }
+
+/* ================= 原生工作台（v0.5.10） ================= */
+/* 发送页：内容 + 设备磁贴 + 底部任务抽屉；接收页：分组列表 */
+
+/* ---------- 发送页布局 ---------- */
+.sendwrap { display: flex; flex-direction: column; min-height: calc(100vh - 120px); }
+.sendmain { flex: 1; }
+.devsec-label { font-size: 13px; font-weight: 700; margin: 16px 0 8px; }
+.devsec-label .hint { font-weight: 400; margin-left: 6px; }
+
+/* 设备磁贴 */
+.devtiles { display: flex; flex-wrap: wrap; gap: 10px; }
+.tiles-flow { display: contents; }
+.devtile {
+  width: 132px; padding: 14px 10px 12px; text-align: center;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  cursor: pointer; color: var(--text); font: inherit;
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+}
+.devtile:hover { border-color: var(--accent); background: var(--surface-2); }
+.devtile:active { transform: scale(.98); }
+.devtile .pic { font-size: 28px; line-height: 1.2; }
+.devtile .dname { font-size: 13px; font-weight: 600; margin-top: 6px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.devtile .st { font-size: 11px; color: var(--accent); margin-top: 2px; }
+.devtile .st::before {
+  content: ''; display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); margin-right: 4px; vertical-align: 1px;
+}
+.devtile.ghost {
+  border-style: dashed; color: var(--muted); cursor: default;
+  justify-content: center; min-height: 118px; font-size: 12px;
+}
+.devtile.ghost:hover { border-color: var(--border); background: var(--surface); }
+/* 远程配对磁贴：输入框 + 按钮收进磁贴内 */
+.devtile.pair { width: 196px; cursor: default; }
+.devtile.pair:hover { border-color: var(--border); background: var(--surface); }
+.devtile.pair input {
+  width: 100%; margin-top: 8px; padding: 7px 8px; font-size: 12px; letter-spacing: 2px;
+  text-align: center; text-transform: uppercase; color: var(--text);
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; outline: none;
+}
+.devtile.pair input:focus { border-color: var(--accent); }
+.devtile.pair .nbtn { width: 100%; margin-top: 6px; }
+
+/* 原生小按钮 */
+.nbtn {
+  background: var(--accent); color: var(--accent-text); border: none;
+  border-radius: 6px; padding: 7px 18px; font-size: 13px; font-weight: 600;
+}
+.nbtn:hover { filter: brightness(1.06); }
+.nbtn:disabled { opacity: .45; cursor: not-allowed; }
+
+/* ---------- 底部任务抽屉 ---------- */
+#taskDrawer {
+  border-top: 1px solid var(--border); background: var(--surface-2);
+  margin: 18px -26px -40px; padding: 0 26px;
+}
+#taskStrip {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  background: none; border: none; color: var(--text);
+  padding: 9px 0; font-size: 13px; text-align: left;
+}
+#taskStrip .car { color: var(--muted); font-size: 10px; }
+#taskStrip .cnt {
+  background: var(--accent); color: var(--accent-text); font-size: 11px; font-weight: 700;
+  min-width: 18px; height: 18px; border-radius: 9px;
+  display: inline-flex; align-items: center; justify-content: center; padding: 0 5px;
+}
+#taskStrip .cnt[hidden] { display: none; }
+#taskStrip .mini { margin-left: auto; color: var(--muted); font-size: 12px; }
+#taskRows { padding-bottom: 10px; }
+#taskRows[hidden] { display: none; }
+
+/* 紧凑任务行 */
+.trow {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 12px; margin-bottom: 6px; font-size: 12.5px;
+  transition: opacity .4s;
+}
+.trow.fading { opacity: 0; }
+.trow .tdir { color: var(--accent); font-weight: 700; flex-shrink: 0; }
+.trow .tpeer { font-weight: 600; flex-shrink: 0; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trow .tsum { color: var(--muted); flex-shrink: 0; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trow .pbar { flex: 1; margin-top: 0; }
+.trow .tpct { flex-shrink: 0; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 110px; text-align: right; }
+.trow .tpct.ok { color: var(--accent); font-weight: 600; }
+.trow .tpct.bad { color: var(--danger); }
+.trow .x {
+  border: none; background: none; color: var(--muted); font-size: 13px;
+  padding: 0 2px; flex-shrink: 0;
+}
+.trow .x:hover { color: var(--danger); }
+.pbar { height: 5px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 3px; overflow: hidden; }
+
+/* ---------- 接收页分组列表 ---------- */
+.group {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  overflow: hidden; margin-bottom: 6px;
+}
+.group .empty { padding: 11px 16px; }
+.grow {
+  display: flex; align-items: center; gap: 10px; padding: 11px 16px;
+}
+.grow[hidden] { display: none; }
+.grow + .grow { border-top: 1px solid var(--border); }
+.grow .lab { font-size: 13px; }
+.grow .desc { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+.grow .right { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.ghead { font-size: 12px; font-weight: 700; color: var(--muted); margin: 14px 2px 6px; }
+.ghead .cnt {
+  background: var(--accent); color: var(--accent-text); font-size: 11px; font-weight: 700;
+  border-radius: 9px; padding: 0 7px; margin-left: 6px;
+}
+.ghead .cnt[hidden] { display: none; }
+.codeinput {
+  width: 140px; padding: 7px 10px; font-size: 13px; letter-spacing: 2px; text-transform: uppercase;
+  color: var(--text); background: var(--surface-2);
+  border: 1px solid var(--border); border-radius: 6px; outline: none;
+}
+.codeinput:focus { border-color: var(--accent); }
+.livedot {
+  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent); margin-right: 6px; vertical-align: 1px;
+  animation: pulse 1.6s ease-in-out infinite;
+}
+@keyframes pulse { 50% { opacity: .55; } }
+#pendingList .empty { padding: 11px 16px; }

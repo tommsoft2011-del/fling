@@ -7,7 +7,6 @@ import { $, toast } from './ui.js';
 import { initNet, getDeviceName } from './net.js';
 import { manager } from './tasks.js';
 import { applyTheme } from './store.js';
-import { initPairDialog } from './pairdialog.js';
 import { initSendPage } from './send.js';
 import { initRecvPage, blurRecvPage } from './receive.js';
 import { initHistPage, refreshHistPage } from './history.js';
@@ -95,7 +94,6 @@ async function startMain(): Promise<void> {
     (b as HTMLButtonElement).onclick = () => switchPage((b as HTMLElement).dataset.page as Page);
   });
 
-  initPairDialog();
   initSendPage();
   initRecvPage();
   initHistPage();

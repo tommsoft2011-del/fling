@@ -1,15 +1,14 @@
-// 接收页：附近发现开关 + 待确认 + 接收中
+// 接收页：原生分组列表 — 开关行 / 配对码行 / 待确认 / 接收中
 import { $, el, fmtSize, toast } from './ui.js';
 import { manager, type PendingOffer } from './tasks.js';
-import { createTaskCard, type CardHandle } from './taskcard.js';
-import { openPairDialog } from './pairdialog.js';
+import { createTaskRow, type CardHandle } from './taskcard.js';
 import { settings } from './store.js';
+import { normalizeCode } from '@fling/core';
 
 let inited = false;
-const cards = new Map<string, CardHandle>();
+const rows = new Map<string, CardHandle>();
 let lobbyLeave: (() => void) | null = null;
 let lobbyCode: string | null = null;
-let lobbyBar: HTMLElement | null = null;
 
 export function initRecvPage(): void {
   if (inited) return;
@@ -28,19 +27,32 @@ export function initRecvPage(): void {
     }
   };
 
-  $('#remoteRecvBtn').onclick = () => {
-    openPairDialog('recv', async (code) => {
-      try {
-        if (lobbyLeave) lobbyLeave();
-        lobbyLeave = await manager.joinLobby(code);
-        lobbyCode = code;
-        renderLobbyStatus();
-        toast(`正在通过配对码 ${code} 等待对方的传输…`);
-      } catch (e) {
-        toast('加入配对房间失败：' + (e as Error).message, true);
-      }
-    });
+  // 配对码接收：行内输入 + 开始监听
+  const codeInput = $('#pairRecvInput') as HTMLInputElement;
+  const listenBtn = $('#pairRecvBtn') as HTMLButtonElement;
+  const startListen = async () => {
+    const code = normalizeCode(codeInput.value);
+    if (!code) {
+      toast('请输入 6 位配对码', true);
+      codeInput.focus();
+      return;
+    }
+    try {
+      if (lobbyLeave) lobbyLeave();
+      lobbyLeave = await manager.joinLobby(code);
+      lobbyCode = code;
+      renderLobbyStatus();
+      codeInput.value = '';
+      toast(`正在通过配对码 ${code} 等待对方的传输…`);
+    } catch (e) {
+      toast('加入配对房间失败：' + (e as Error).message, true);
+    }
   };
+  listenBtn.onclick = () => void startListen();
+  codeInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') void startListen();
+  });
+  $('#lobbyStopBtn').onclick = () => stopListen();
 
   // 待确认超过 15 分钟自动清理
   setInterval(() => {
@@ -57,14 +69,19 @@ export function initRecvPage(): void {
 
   manager.onChange(() => {
     renderPending();
-    syncRecvCards();
+    syncRecvRows();
   });
+  renderLobbyStatus();
   renderPending();
-  syncRecvCards();
+  syncRecvRows();
 }
 
 /** 离开接收页：断开配对码监听（附近 inbox 常驻不受影响） */
 export function blurRecvPage(): void {
+  stopListen();
+}
+
+function stopListen(): void {
   if (lobbyLeave) {
     lobbyLeave();
     lobbyLeave = null;
@@ -74,41 +91,27 @@ export function blurRecvPage(): void {
 }
 
 function renderLobbyStatus(): void {
-  const host = $('#pendingList').parentElement;
-  if (!host) return;
-  if (lobbyCode && !lobbyBar) {
-    lobbyBar = el('div', 'hint');
-    lobbyBar.style.margin = '0 0 8px';
-    host.insertBefore(lobbyBar, $('#pendingList'));
-  }
-  if (!lobbyCode && lobbyBar) {
-    lobbyBar.remove();
-    lobbyBar = null;
-    return;
-  }
-  if (lobbyBar && lobbyCode) {
-    lobbyBar.innerHTML = '';
-    lobbyBar.append(`配对码 ${lobbyCode} 监听中… `);
-    const off = el('button', 'linkbtn', '断开') as HTMLButtonElement;
-    off.onclick = () => {
-      if (lobbyLeave) lobbyLeave();
-      lobbyLeave = null;
-      lobbyCode = null;
-      renderLobbyStatus();
-    };
-    lobbyBar.appendChild(off);
+  const row = $('#lobbyStatusRow');
+  if (lobbyCode) {
+    row.hidden = false;
+    $('#lobbyCodeLabel').textContent = lobbyCode;
+  } else {
+    row.hidden = true;
   }
 }
 
 function renderPending(): void {
-  renderLobbyStatus();
   const host = $('#pendingList');
   host.innerHTML = '';
   const offers = [...manager.pending.values()].sort((a, b) => b.at - a.at);
+  const cnt = $('#pendingCount');
   if (offers.length === 0) {
+    cnt.hidden = true;
     host.appendChild(el('div', 'empty', '暂无待确认的传输'));
     return;
   }
+  cnt.hidden = false;
+  cnt.textContent = String(offers.length);
   for (const p of offers) {
     const row = el('div', 'pend');
     const info = el('div', 'pinfo');
@@ -140,33 +143,28 @@ function summarizeOffer(p: PendingOffer): string {
   return `${parts.join('、')} · 共 ${fmtSize(total)}${p.via === 'remote' ? ` · 配对码 ${p.code}` : ''}`;
 }
 
-function syncRecvCards(): void {
-  const host = $('#recvTasks');
+function syncRecvRows(): void {
+  const host = $('#recvRows');
   const tasks = [...manager.recvTasks.values()].reverse();
-  if (tasks.length === 0 && cards.size === 0) {
-    host.innerHTML = '';
-    host.appendChild(el('div', 'empty', '暂无正在接收的任务'));
-    return;
-  }
-  // 清掉 empty 占位
-  const emptyEl = host.querySelector('.empty');
-  if (emptyEl && tasks.length > 0) emptyEl.remove();
   for (const t of tasks) {
-    let h = cards.get(t.taskId);
+    let h = rows.get(t.taskId);
     if (!h) {
-      h = createTaskCard(t, 'recv');
-      cards.set(t.taskId, h);
+      h = createTaskRow(t, 'recv');
+      rows.set(t.taskId, h);
     }
     host.appendChild(h.root);
     h.update();
   }
-  for (const [id, h] of [...cards]) {
+  for (const [id, h] of [...rows]) {
     if (!manager.recvTasks.has(id)) {
       h.destroy();
-      cards.delete(id);
+      rows.delete(id);
     }
   }
-  if (host.children.length === 0) {
-    host.appendChild(el('div', 'empty', '暂无正在接收的任务'));
+  const emptyEl = host.querySelector('.empty');
+  if (tasks.length === 0) {
+    if (!emptyEl) host.appendChild(el('div', 'empty', '暂无正在接收的任务'));
+  } else {
+    if (emptyEl) emptyEl.remove();
   }
 }
