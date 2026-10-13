@@ -139,8 +139,9 @@ button { font: inherit; cursor: pointer; }
 .page h2 { margin: 0 0 14px; font-size: 20px; }
 
 /* ---------- 页面宽度 ---------- */
+/* 发送/接收页横向满屏；历史/设置保持收敛宽度 */
+#page-send, #page-recv { max-width: none; }
 @media (min-width: 1200px) {
-  #page-send, #page-recv { max-width: 860px; }
   #page-hist, #page-settings { max-width: 1060px; }
 }
 
@@ -322,6 +323,11 @@ button { font: inherit; cursor: pointer; }
 }
 .devtile:hover { border-color: var(--accent); background: var(--surface-2); }
 .devtile:active { transform: scale(.98); }
+.devtile.selected {
+  border-color: var(--accent); border-width: 2px; background: var(--accent-soft);
+  padding: 13px 9px 11px; /* 补偿加粗边框 */
+}
+.devtile.selected .dname { color: var(--accent); }
 .devtile .pic { font-size: 28px; line-height: 1.2; }
 .devtile .dname { font-size: 13px; font-weight: 600; margin-top: 6px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .devtile .st { font-size: 11px; color: var(--accent); margin-top: 2px; }
@@ -334,16 +340,17 @@ button { font: inherit; cursor: pointer; }
   justify-content: center; min-height: 118px; font-size: 12px;
 }
 .devtile.ghost:hover { border-color: var(--border); background: var(--surface); }
-/* 远程配对磁贴：输入框 + 按钮收进磁贴内 */
-.devtile.pair { width: 196px; cursor: default; }
-.devtile.pair:hover { border-color: var(--border); background: var(--surface); }
-.devtile.pair input {
-  width: 100%; margin-top: 8px; padding: 7px 8px; font-size: 12px; letter-spacing: 2px;
-  text-align: center; text-transform: uppercase; color: var(--text);
-  background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; outline: none;
+/* 远程配对磁贴：点击弹输入框 */
+.devtile.pair { border-style: dashed; }
+.devtile.pair:hover { border-color: var(--accent); background: var(--accent-soft); }
+.devtile .psub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+/* 已配对的远程设备磁贴 */
+.devtile.remote { position: relative; }
+.devtile .rx {
+  position: absolute; top: 2px; right: 4px; border: none; background: none;
+  color: var(--muted); font-size: 13px; padding: 2px 4px; cursor: pointer;
 }
-.devtile.pair input:focus { border-color: var(--accent); }
-.devtile.pair .nbtn { width: 100%; margin-top: 6px; }
+.devtile .rx:hover { color: var(--danger); }
 
 /* 原生小按钮 */
 .nbtn {
@@ -429,3 +436,33 @@ button { font: inherit; cursor: pointer; }
 }
 @keyframes pulse { 50% { opacity: .55; } }
 #pendingList .empty { padding: 11px 16px; }
+
+/* ================= v0.5.11 ================= */
+/* 底部发送栏 */
+.sendbar { margin-top: 18px; }
+.sendbar .primary.big { margin-top: 0; }
+/* 接收页等待动画 */
+.waitanim { text-align: center; padding: 26px 0 20px; }
+.waitanim .rings {
+  position: relative; width: 96px; height: 96px; margin: 0 auto 12px;
+}
+.waitanim .rings span {
+  position: absolute; inset: 0; border-radius: 50%;
+  border: 2px solid var(--accent); opacity: 0;
+  animation: ring 2.4s ease-out infinite;
+}
+.waitanim .rings span:nth-child(2) { animation-delay: .8s; }
+.waitanim .rings span:nth-child(3) { animation-delay: 1.6s; }
+@keyframes ring {
+  0% { transform: scale(.35); opacity: .7; }
+  100% { transform: scale(1); opacity: 0; }
+}
+.waitanim .rings .core {
+  position: absolute; inset: 28px; border-radius: 50%;
+  background: var(--accent-soft); color: var(--accent);
+  display: flex; align-items: center; justify-content: center; font-size: 22px;
+}
+.waitanim .wt { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+@media (prefers-reduced-motion: reduce) {
+  .waitanim .rings span { animation: none; opacity: .25; }
+}

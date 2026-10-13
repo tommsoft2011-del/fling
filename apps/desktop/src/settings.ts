@@ -64,6 +64,20 @@ export function initSettingsPage(): void {
     }
   };
 
+  // ---- 允许被发现（从接收页搬过来） ----
+  const tgl = $('#discoverToggle') as HTMLInputElement;
+  tgl.checked = settings.discoverable;
+  tgl.onchange = async () => {
+    settings.discoverable = tgl.checked;
+    try {
+      await manager.setDiscoverable(tgl.checked);
+    } catch (e) {
+      toast('切换失败：' + (e as Error).message, true);
+      tgl.checked = !tgl.checked;
+      settings.discoverable = tgl.checked;
+    }
+  };
+
   // ---- 界面风格 ----
   const seg = $('#themeSeg');
   const paint = () => {

@@ -1,8 +1,8 @@
-// 接收页：原生分组列表 — 开关行 / 配对码行 / 待确认 / 接收中
+// 接收页：原生分组列表 — 等待动画 / 配对码行 / 待确认 / 接收中
+// （"允许被发现"开关已移到设置页）
 import { $, el, fmtSize, toast } from './ui.js';
 import { manager, type PendingOffer } from './tasks.js';
 import { createTaskRow, type CardHandle } from './taskcard.js';
-import { settings } from './store.js';
 import { normalizeCode } from '@fling/core';
 
 let inited = false;
@@ -13,19 +13,6 @@ let lobbyCode: string | null = null;
 export function initRecvPage(): void {
   if (inited) return;
   inited = true;
-
-  const tgl = $('#discoverToggle') as HTMLInputElement;
-  tgl.checked = settings.discoverable;
-  tgl.onchange = async () => {
-    settings.discoverable = tgl.checked;
-    try {
-      await manager.setDiscoverable(tgl.checked);
-    } catch (e) {
-      toast('切换失败：' + (e as Error).message, true);
-      tgl.checked = !tgl.checked;
-      settings.discoverable = tgl.checked;
-    }
-  };
 
   // 配对码接收：行内输入 + 开始监听
   const codeInput = $('#pairRecvInput') as HTMLInputElement;

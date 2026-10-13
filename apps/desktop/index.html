@@ -62,16 +62,18 @@
                     <span class="hint">支持拖放文件到本页任意位置</span>
                   </div>
                 </div>
-                <div class="devsec-label">设备 <span class="hint">点击直接发送</span></div>
+                <div class="devsec-label">设备 <span class="hint">点击选择目标，再点下方发送</span></div>
                 <div class="devtiles">
                   <div id="nearbyTiles" class="tiles-flow"></div>
-                  <div class="devtile pair">
+                  <button class="devtile pair" id="pairTile" title="输入配对码，添加远程设备">
                     <div class="pic">🔗</div>
                     <div class="dname">远程配对</div>
-                    <input id="pairCodeInput" maxlength="8" placeholder="6 位配对码" autocomplete="off" />
-                    <button id="pairSendBtn" class="nbtn">发送</button>
-                  </div>
+                    <div class="psub">点击输入配对码</div>
+                  </button>
                 </div>
+              </div>
+              <div class="sendbar">
+                <button id="sendBtn" class="primary big" disabled>发送</button>
               </div>
               <div id="taskDrawer" hidden>
                 <button id="taskStrip"><span class="car" id="taskCar">▴</span> 传输任务 <span class="cnt" id="taskCount" hidden></span><span class="mini" id="taskMini"></span></button>
@@ -84,14 +86,12 @@
           <!-- 接收 -->
           <section class="page" id="page-recv">
             <h2>接收</h2>
+            <div class="waitanim">
+              <div class="rings"><span></span><span></span><span></span><div class="core">⬇</div></div>
+              <div class="wt">正在等待接收…</div>
+              <div class="hint">对方可通过附近设备或配对码向你发送</div>
+            </div>
             <div class="group">
-              <div class="grow">
-                <div>
-                  <div class="lab">允许附近的设备发现我</div>
-                  <div class="desc">关闭后，附近设备列表里看不到这台电脑（不影响配对码）</div>
-                </div>
-                <div class="right"><label class="switch"><input type="checkbox" id="discoverToggle" checked /><span></span></label></div>
-              </div>
               <div class="grow">
                 <div class="lab">配对码接收</div>
                 <div class="right">
@@ -129,6 +129,13 @@
           <!-- 设置 -->
           <section class="page" id="page-settings">
             <h2>设置</h2>
+            <div class="card row">
+              <div>
+                <div class="card-t">允许附近的设备发现我</div>
+                <div class="hint">关闭后，附近设备列表里看不到这台电脑（不影响配对码）</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="discoverToggle" checked /><span></span></label>
+            </div>
             <div class="card">
               <div class="card-t">设备名称</div>
               <div class="hint">附近的设备会看到这个名字</div>
@@ -172,6 +179,19 @@
     </div>
 
     <div id="toasts"></div>
+
+    <!-- 远程配对弹窗（发送页） -->
+    <div id="pairModal" class="modal" hidden>
+      <div class="modal-box">
+        <h3>远程配对</h3>
+        <p class="hint">和对方输入相同的配对码，确认后会加入设备列表</p>
+        <input id="pairCodeInput" class="textinput big-code" maxlength="8" placeholder="K7Q2M9" autocomplete="off" />
+        <div class="modal-actions">
+          <button class="ghostbtn" id="pairCancel">取消</button>
+          <button class="primary" id="pairOk">确定</button>
+        </div>
+      </div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

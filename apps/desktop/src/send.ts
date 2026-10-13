@@ -1,4 +1,4 @@
-// 发送页：原生工作台 — 内容区 + 设备磁贴（点即发送）+ 底部任务抽屉
+// 发送页：原生工作台 — 内容区 + 设备选择 + 底部发送栏 + 任务抽屉
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { $, el, fmtSize, toast, uid, utf8bytes } from './ui.js';
@@ -8,6 +8,8 @@ import { normalizeCode } from '@fling/core';
 
 let clipItems: ComposeItem[] = []; // 输入框里的剪贴板图片（chip）
 let fileItems: ComposeItem[] = []; // 下方文件列表里的文件
+let selectedTarget: SendTarget | null = null;
+let remoteCode: string | null = null; // 已配对的远程设备（一次一个，新的替换旧的）
 const rows = new Map<string, CardHandle>();
 let inited = false;
 let drawerOpen = false;
@@ -37,6 +39,7 @@ export function initSendPage(): void {
       handled = true;
     }
     if (handled) e.preventDefault();
+    refreshSendBtn();
   });
 
   // --- 拖拽文件到发送页任意位置 → 文件列表 ---
@@ -67,6 +70,7 @@ export function initSendPage(): void {
     const files = (e as DragEvent).dataTransfer?.files;
     if (files) {
       for (const f of Array.from(files)) addFileItem(f);
+      refreshSendBtn();
     }
   });
 
@@ -91,6 +95,7 @@ export function initSendPage(): void {
       }
     }
     if (added > 0) toast(`已添加 ${added} 个文件`);
+    refreshSendBtn();
   }).catch(() => { /* 非 Tauri 环境忽略 */ });
 
   ($('#fileInput') as HTMLInputElement).addEventListener('change', (e) => {
@@ -98,34 +103,31 @@ export function initSendPage(): void {
     if (files) {
       for (const f of Array.from(files)) addFileItem(f);
       (e.target as HTMLInputElement).value = '';
+      refreshSendBtn();
     }
   });
 
-  // --- 远程配对磁贴：行内输入配对码发送 ---
-  const pairInput = $('#pairCodeInput') as HTMLInputElement;
-  const pairBtn = $('#pairSendBtn') as HTMLButtonElement;
-  const doPairSend = () => {
-    const code = normalizeCode(pairInput.value);
-    if (!code) {
-      toast('请输入 6 位配对码', true);
-      pairInput.focus();
-      return;
-    }
-    const items = snapshotItems();
-    if (items.length === 0) {
-      toast('发送内容是空的', true);
-      return;
-    }
-    doSend(items, { type: 'remote', code });
-    toast(`等待对方输入配对码 ${code} 加入…`);
-    pairInput.value = '';
-  };
-  pairBtn.onclick = doPairSend;
-  pairInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') doPairSend();
-    e.stopPropagation(); // 回车不触发磁贴点击
+  textarea.addEventListener('input', refreshSendBtn);
+
+  // --- 远程配对磁贴 → 弹窗输配对码 → 加入设备列表并自动选中 ---
+  $('#pairTile').onclick = () => openPairModal();
+  $('#pairCancel').onclick = () => closePairModal();
+  $('#pairOk').onclick = () => confirmPairModal();
+  ($('#pairCodeInput') as HTMLInputElement).addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') confirmPairModal();
+    if (e.key === 'Escape') closePairModal();
   });
-  pairInput.addEventListener('click', (e) => e.stopPropagation());
+  $('#pairModal').addEventListener('click', (e) => {
+    if ((e.target as HTMLElement).id === 'pairModal') closePairModal();
+  });
+
+  // --- 发送按钮：有内容 + 选中目标才可用 ---
+  $('#sendBtn').onclick = () => {
+    const target = selectedTarget;
+    const items = snapshotItems();
+    if (items.length === 0 || !target) return;
+    doSend(items, target);
+  };
 
   // --- 任务抽屉开关 ---
   $('#taskStrip').onclick = () => {
@@ -137,16 +139,19 @@ export function initSendPage(): void {
   manager.onChange(() => {
     renderTiles();
     syncTaskRows();
+    refreshSendBtn();
   });
   renderTiles();
   renderChips();
   renderFileList();
   syncTaskRows();
+  refreshSendBtn();
 }
 
 /** 历史页"重发"文本时调用：把文本填回发送框 */
 export function setComposeText(text: string): void {
   ($('#composeText') as HTMLTextAreaElement).value = text;
+  refreshSendBtn();
   $('#composeText').focus();
 }
 
@@ -176,6 +181,7 @@ function addFileItem(file: File): void {
     blob: file,
   });
   renderFileList();
+  refreshSendBtn();
 }
 
 function addClipItem(blob: Blob): void {
@@ -188,6 +194,7 @@ function addClipItem(blob: Blob): void {
     previewUrl: URL.createObjectURL(blob),
   });
   renderChips();
+  refreshSendBtn();
 }
 
 function removeFileItem(uid_: string): void {
@@ -195,6 +202,7 @@ function removeFileItem(uid_: string): void {
   if (i >= 0) {
     fileItems.splice(i, 1);
     renderFileList();
+    refreshSendBtn();
   }
 }
 
@@ -204,6 +212,7 @@ function removeComposeItem(uid_: string): void {
     const [c] = clipItems.splice(i, 1);
     if (c.previewUrl) URL.revokeObjectURL(c.previewUrl);
     renderChips();
+    refreshSendBtn();
   }
 }
 
@@ -265,7 +274,7 @@ function snapshotItems(): ComposeItem[] {
   return items;
 }
 
-/** 点击磁贴即发送：快照 → 建任务 → 立即清空发送框 */
+/** 点击发送：快照 → 建任务 → 立即清空发送框（目标保留，方便连发） */
 function doSend(items: ComposeItem[], target: SendTarget): void {
   try {
     manager.startSend(items, target);
@@ -279,39 +288,127 @@ function doSend(items: ComposeItem[], target: SendTarget): void {
   fileItems = [];
   renderChips();
   renderFileList();
+  refreshSendBtn();
+  toast(`正在发送给 ${targetLabel(target)}…`);
 }
 
-/** 磁贴点击：有内容才发 */
-function trySend(target: SendTarget, label: string): void {
-  const items = snapshotItems();
-  if (items.length === 0) {
-    toast('发送内容是空的，先输入文字或添加文件', true);
-    return;
+function targetLabel(t: SendTarget): string {
+  return t.type === 'remote' ? `远程设备（${t.code}）` : t.deviceName;
+}
+
+function hasContent(): boolean {
+  const text = ($('#composeText') as HTMLTextAreaElement).value.trim();
+  return text !== '' || clipItems.length > 0 || fileItems.length > 0;
+}
+
+function refreshSendBtn(): void {
+  const btn = $('#sendBtn') as HTMLButtonElement;
+  const ok = hasContent() && !!selectedTarget;
+  btn.disabled = !ok;
+  if (!selectedTarget) {
+    btn.textContent = hasContent() ? '发送（先选择设备）' : '发送';
+  } else {
+    const items = snapshotItems();
+    const total = items.reduce((a, c) => a + c.size, 0);
+    btn.textContent = `发送给 ${targetLabel(selectedTarget)} · ${fmtSize(total)}`;
   }
-  doSend(items, target);
-  toast(`正在发送给 ${label}…`);
+}
+
+// ---------- 设备磁贴 ----------
+
+function isSelected(t: SendTarget): boolean {
+  if (!selectedTarget) return false;
+  if (t.type !== selectedTarget.type) return false;
+  return t.type === 'remote'
+    ? (selectedTarget as { code: string }).code === (t as { code: string }).code
+    : (selectedTarget as { deviceId: string }).deviceId === (t as { deviceId: string }).deviceId;
 }
 
 function renderTiles(): void {
   const host = $('#nearbyTiles');
   host.innerHTML = '';
+  // 选中的附近设备若已下线，清除选择
+  if (
+    selectedTarget?.type === 'nearby' &&
+    !manager.peers.has(selectedTarget.deviceId)
+  ) {
+    selectedTarget = null;
+  }
   const peers = [...manager.peers.entries()];
-  if (peers.length === 0) {
+  if (peers.length === 0 && !remoteCode) {
     host.appendChild(el('div', 'devtile ghost', '正在搜索…'));
-    return;
   }
   for (const [id, name] of peers) {
-    const t = el('button', 'devtile') as HTMLButtonElement;
-    t.append(
-      el('div', 'pic', '💻'),
-      el('div', 'dname', name),
-      (() => { const s = el('div', 'st', '在线'); return s; })(),
-    );
-    t.title = `点击发送给 ${name}`;
-    t.onclick = () => trySend({ type: 'nearby', deviceId: id, deviceName: name }, name);
-    host.appendChild(t);
+    const target: SendTarget = { type: 'nearby', deviceId: id, deviceName: name };
+    host.appendChild(makeTile('💻', name, '在线', isSelected(target), () =>
+      toggleSelect(target),
+    ));
   }
+  // 已配对的远程设备（一次一个）
+  if (remoteCode) {
+    const target: SendTarget = { type: 'remote', code: remoteCode };
+    const tile = makeTile('🔗', '远程设备', `配对码 ${remoteCode}`, isSelected(target), () =>
+      toggleSelect(target),
+    );
+    tile.classList.add('remote');
+    const rx = el('span', 'rx', '✕');
+    rx.title = '移除该远程设备';
+    (rx as HTMLElement).setAttribute('role', 'button');
+    rx.onclick = (e) => {
+      e.stopPropagation();
+      if (selectedTarget?.type === 'remote') selectedTarget = null;
+      remoteCode = null;
+      renderTiles();
+      refreshSendBtn();
+    };
+    tile.appendChild(rx);
+    host.appendChild(tile);
+  }
+  refreshSendBtn();
 }
+
+function makeTile(pic: string, name: string, sub: string, selected: boolean, onClick: () => void): HTMLElement {
+  const t = el('button', 'devtile' + (selected ? ' selected' : '')) as HTMLButtonElement;
+  t.append(el('div', 'pic', pic), el('div', 'dname', name), el('div', 'st', sub));
+  t.title = selected ? `已选择 ${name}（再点取消）` : `选择 ${name}`;
+  t.onclick = onClick;
+  return t;
+}
+
+function toggleSelect(t: SendTarget): void {
+  selectedTarget = isSelected(t) ? null : t;
+  renderTiles();
+  refreshSendBtn();
+}
+
+// ---------- 远程配对弹窗 ----------
+
+function openPairModal(): void {
+  ($('#pairModal') as HTMLElement).hidden = false;
+  const input = $('#pairCodeInput') as HTMLInputElement;
+  input.value = '';
+  setTimeout(() => input.focus(), 50);
+}
+
+function closePairModal(): void {
+  ($('#pairModal') as HTMLElement).hidden = true;
+}
+
+function confirmPairModal(): void {
+  const code = normalizeCode(($('#pairCodeInput') as HTMLInputElement).value);
+  if (!code) {
+    toast('请输入配对码', true);
+    return;
+  }
+  remoteCode = code; // 新的替换旧的
+  selectedTarget = { type: 'remote', code };
+  closePairModal();
+  renderTiles();
+  refreshSendBtn();
+  toast(`已添加远程设备（配对码 ${code}），对方输入相同配对码即可接收`);
+}
+
+// ---------- 任务抽屉 ----------
 
 function syncTaskRows(): void {
   const drawer = $('#taskDrawer');
@@ -340,12 +437,7 @@ function syncTaskRows(): void {
     cnt.hidden = false;
     cnt.textContent = String(n);
     const first = tasks.find((t) => t.active) ?? tasks[0];
-    $('#taskMini').textContent = taskMiniLabel(first);
+    $('#taskMini').textContent = first.active ? `→ ${first.peerLabel}` : `${first.peerLabel} · 完成`;
   }
   if (!drawerOpen) list.hidden = true;
-}
-
-function taskMiniLabel(t: { peerLabel: string; active: boolean; phase: string }): string {
-  if (!t.active) return `${t.peerLabel} · ${t.phase === 'done' ? '完成' : t.phase}`;
-  return `→ ${t.peerLabel}`;
 }
