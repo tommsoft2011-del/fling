@@ -109,6 +109,8 @@ export class SendTask {
 
   private room?: FlingRoom;
   private p2pLink: P2PLink | null = null;
+  /** P2P 就绪（open/failed），文件发送前等待，避免前半走慢中继 */
+  private p2pReady: Promise<'open' | 'failed'> | null = null;
   /** 等待接收方 task-ack 的 resolver（收到确认/对方离开/超时后置空） */
   private ackResolve: ((ok: boolean) => void) | null = null;
   private lobbyLeave?: () => void;
@@ -264,14 +266,23 @@ export class SendTask {
       // 握手失败或超时则无缝回退中继，不阻塞发送。
       this.startP2P();
 
-      // 4. 逐项发送
+      // 4. 逐项发送。文本先行（小，走中继即可）；文件等 P2P 结论
+      // （open 走直连 / failed 走中继）再发，避免前半部分走慢速中继。
       this.phase = 'sending';
       this.notify();
       let okCount = 0;
+      let p2pAwaited = false;
       for (let i = 0; i < this.source.length; i++) {
         if (this.cancelled) break;
         const src = this.source[i];
         const st = this.items[i];
+        if (src.kind !== 'text' && !p2pAwaited) {
+          p2pAwaited = true;
+          const ready = (await this.p2pReady?.catch(() => 'failed' as const)) ?? 'failed';
+          log('p2p', ready === 'open' ? 'ready, files go direct' : 'not ready, files go relay', {
+            taskId: this.taskId,
+          });
+        }
         st.status = 'active';
         this.notify();
         log('xfer', 'send item start', { taskId: this.taskId, kind: src.kind, name: st.name, size: st.size });
@@ -371,10 +382,19 @@ export class SendTask {
     if (this.p2pLink || !this.room || this.cancelled) return;
     const link = new P2PLink(this.room, 'initiator', this.peerLabel);
     this.p2pLink = link;
-    link.onstate = (s) => {
-      this.p2p = s;
-      this.notify();
-    };
+    // 就绪 promise：open 或明确失败时 resolve，12s 超时则按失败处理。
+    // 文件在 P2P 结论出来前不发送——否则前半部分走慢速中继，永远追不上。
+    this.p2pReady = new Promise<'open' | 'failed'>((resolve) => {
+      const timer = setTimeout(() => resolve('failed'), 12_000);
+      link.onstate = (s) => {
+        this.p2p = s;
+        this.notify();
+        if (s === 'open' || s === 'failed') {
+          clearTimeout(timer);
+          resolve(s);
+        }
+      };
+    });
     void link.start();
   }
 
