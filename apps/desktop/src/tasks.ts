@@ -73,6 +73,8 @@ export interface ItemState {
   doneBytes: number;
   totalBytes: number;
   error?: string;
+  /** 接收端落盘后的完整路径（历史记录用） */
+  savedPath?: string;
 }
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -111,6 +113,9 @@ export class SendTask {
   private p2pLink: P2PLink | null = null;
   /** P2P 就绪（open/failed），文件发送前等待，避免前半走慢中继 */
   private p2pReady: Promise<'open' | 'failed'> | null = null;
+  /** 接收方上报的真实接收进度（task-progress），UI 显示"对方已接收" */
+  peerDoneBytes = 0;
+  peerTotalBytes = 0;
   /** 等待接收方 task-ack 的 resolver（收到确认/对方离开/超时后置空） */
   private ackResolve: ((ok: boolean) => void) | null = null;
   private lobbyLeave?: () => void;
@@ -228,6 +233,13 @@ export class SendTask {
           if (taskId === this.taskId) {
             log('task', 'task-ack received', { taskId });
             this.ackResolve?.(true);
+          }
+        },
+        onTaskProgress: (taskId, doneBytes, totalBytes) => {
+          if (taskId === this.taskId) {
+            this.peerDoneBytes = doneBytes;
+            this.peerTotalBytes = totalBytes;
+            this.notify();
           }
         },
         onLog: (tag, msg) => log(tag as LogTag, `[room] ${msg}`),
@@ -610,6 +622,10 @@ export class RecvTask {
   private pendingSaves = new Set<Promise<void>>();
   /** 已收到 manifest 但还没落盘完成的个数（在途分块计数） */
   private pendingFiles = 0;
+  /** 期望收到的 manifest 总数（offer 里 file/clipboard-image 的个数） */
+  private expectedManifests = 0;
+  /** 已收到的 manifest 个数 */
+  private manifestsReceived = 0;
   /** 收到的剪贴板图片（供"另存为文件"） */
   clipImages = new Map<string, Uint8Array>();
 
@@ -630,6 +646,7 @@ export class RecvTask {
     }));
     this.textItem = this.items.find((i) => i.kind === 'text');
     this.fileQueue = this.items.filter((i) => i.kind !== 'text');
+    this.expectedManifests = this.fileQueue.length;
   }
 
   get peerLabel(): string {
@@ -765,6 +782,7 @@ export class RecvTask {
     item.totalBytes = m.size;
     this.manifestToItem.set(m.id, item);
     this.pendingFiles++;
+    this.manifestsReceived++;
     log('xfer', 'manifest recv', {
       taskId: this.taskId,
       name: m.name,
@@ -783,6 +801,19 @@ export class RecvTask {
     item.totalBytes = t;
     this.trackSpeed();
     this.notify();
+    this.reportProgress();
+  }
+
+  private lastProgressReport = 0;
+  /** 向发送方上报真实接收进度（1s 节流），让发送端显示"对方已接收"而非"已发送" */
+  private reportProgress(): void {
+    const now = Date.now();
+    if (now - this.lastProgressReport < 1000 || this.finished) return;
+    this.lastProgressReport = now;
+    const room = this.room;
+    if (room) {
+      void room.sendTaskProgress(this.taskId, this.doneBytes, this.totalBytes).catch(() => {});
+    }
   }
 
   private onFileError(id: string, err: string): void {
@@ -809,6 +840,7 @@ export class RecvTask {
           dataB64: b64encode(bytes),
         })) as string;
         log('xfer', 'clipboard image saved', { taskId: this.taskId, name, size: bytes.length, path: savedPath });
+        item.savedPath = savedPath;
         if (bytes.length < HIST_IMAGE_LIMIT) this.clipImages.set(item.uid, bytes);
       } else {
         const savedPath = (await invoke('save_received_file', {
@@ -817,6 +849,7 @@ export class RecvTask {
           dataB64: b64encode(bytes),
         })) as string;
         log('xfer', 'item saved', { taskId: this.taskId, name: m.name, size: bytes.length, path: savedPath });
+        item.savedPath = savedPath;
       }
       item.status = 'done';
       item.doneBytes = item.totalBytes;
@@ -837,6 +870,27 @@ export class RecvTask {
       await new Promise((r) => setTimeout(r, 200));
     }
     return this.pendingFiles === 0;
+  }
+
+  /**
+   * 等待所有 manifest 到达。task-done 走中继、manifest 可能走直连，
+   * 两条通道乱序时 task-done 可能先到——此时不能直接判定结束，
+   * 否则还没到的 manifest 对应的文件会被误判失败。
+   */
+  private async waitForManifests(timeoutMs: number): Promise<boolean> {
+    const start = Date.now();
+    while (this.manifestsReceived < this.expectedManifests && Date.now() - start < timeoutMs) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    const ok = this.manifestsReceived >= this.expectedManifests;
+    if (!ok) {
+      log('task', 'wait manifests timeout', {
+        taskId: this.taskId,
+        got: this.manifestsReceived,
+        want: this.expectedManifests,
+      });
+    }
+    return ok;
   }
 
   private onPeerLeft(): void {
@@ -876,8 +930,10 @@ export class RecvTask {
     this.finished = true;
     clearTimeout(this.peerGoneTimer);
     if (completed) {
-      // task-done 可能先于部分分块到达：先等在途分块收齐、落盘完成，再判定。
+      // task-done 可能先于 manifest/分块到达（中继与直连是两条通道）：
+      // 先等齐 manifest，再等在途分块收齐、落盘完成，最后判定。
       // 注意此时不能关 P2P，否则在途分块会丢失。
+      await this.waitForManifests(30_000);
       const drained = await this.waitForPendingFiles(30_000);
       if (!drained) {
         log('task', 'wait pending files timeout', { taskId: this.taskId, pending: this.pendingFiles });
@@ -949,6 +1005,7 @@ export class RecvTask {
           kind: it.kind,
           status: (it.status === 'done' ? 'ok' : 'fail') as 'ok' | 'fail',
           error: it.error,
+          savedPath: it.savedPath,
         };
         if (it.kind === 'text') return { ...base, text: this.textParts.join('') };
         if (it.kind === 'clipboard-image') {

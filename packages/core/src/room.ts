@@ -34,6 +34,8 @@ export interface FlingRoomEvents {
   onP2PSignal?(sig: Extract<FlingMessage, { kind: `p2p-${string}` }>, from: string): void;
   /** Receiver confirms all items received AND saved (see task-ack). */
   onTaskAck?(taskId: string, from: string): void;
+  /** Receiver's periodic real progress report (see task-progress). */
+  onTaskProgress?(taskId: string, doneBytes: number, totalBytes: number, from: string): void;
   /** Optional diagnostics sink (the app wires this to its log file). */
   onLog?(tag: string, msg: string): void;
 }
@@ -193,6 +195,11 @@ export class FlingRoom {
     await this.send({ kind: 'task-ack', taskId });
   }
 
+  /** v2: receiver reports real receive progress (throttled by caller). */
+  async sendTaskProgress(taskId: string, doneBytes: number, totalBytes: number): Promise<void> {
+    await this.send({ kind: 'task-progress', taskId, doneBytes, totalBytes });
+  }
+
   private async send(msg: FlingMessage): Promise<void> {
     // File bytes prefer the direct P2P channel when it's open: the DTLS-SCTP
     // data channel is already encrypted, so no AES-GCM envelope needed here.
@@ -329,6 +336,9 @@ export class FlingRoom {
         break;
       case 'task-ack':
         this.events.onTaskAck?.(msg.taskId, from);
+        break;
+      case 'task-progress':
+        this.events.onTaskProgress?.(msg.taskId, msg.doneBytes, msg.totalBytes, from);
         break;
       case 'p2p-offer':
       case 'p2p-answer':

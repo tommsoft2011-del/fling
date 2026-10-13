@@ -295,6 +295,26 @@ fn save_received_file(dir: String, name: String, data_b64: String) -> Result<Str
     Ok(candidate.to_string_lossy().into_owned())
 }
 
+/// 传输历史落盘：每条记录一行 JSON（JSONL），存在配置目录的 history.jsonl。
+/// 前端 localStorage 仍保留一份做快速展示，硬盘文件是完整存档（含保存路径）。
+#[tauri::command]
+fn append_history(app: tauri::AppHandle, line: String) -> Result<(), String> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("config dir: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
+    let p = dir.join("history.jsonl");
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&p)
+        .map_err(|e| format!("open history: {e}"))?;
+    writeln!(f, "{line}").map_err(|e| format!("write history: {e}"))?;
+    Ok(())
+}
+
 // ============================================ device identity & download ==
 
 #[derive(Serialize, Clone)]
@@ -739,7 +759,8 @@ fn main() {
             open_folder,
             app_version,
             get_log_dir,
-            append_log
+            append_log,
+            append_history
         ])
         .run(tauri::generate_context!())
         .expect("error while running fling");

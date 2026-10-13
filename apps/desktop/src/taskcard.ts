@@ -110,6 +110,15 @@ export function createTaskCard(task: AnyTask, dir: 'send' | 'recv'): CardHandle 
     let metaHtml = '';
     if (task.active && task.speedBps > 0) metaHtml += `<span>${fmtSpeed(task.speedBps)}</span>`;
     metaHtml += `<span>共 ${fmtSize(task.totalBytes)}</span><span>用时 ${fmtDur(secs)}</span>`;
+    // 发送端：显示对方真实接收进度（而非本地"已发送"，后者只是进了缓冲）
+    if (dir === 'send' && task.active) {
+      const peerDone = (task as SendTask).peerDoneBytes ?? 0;
+      const peerTotal = (task as SendTask).peerTotalBytes ?? 0;
+      if (peerTotal > 0) {
+        const pct = Math.min(100, Math.round((peerDone / peerTotal) * 100));
+        metaHtml += `<span>对方已接收 ${pct}%</span>`;
+      }
+    }
     // P2P 直连状态（方便确认走的是直连还是中继）
     const p2p = task.p2p;
     if (p2p === 'open') metaHtml += `<span class="done-check">⚡P2P直连</span>`;

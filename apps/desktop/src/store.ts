@@ -1,4 +1,5 @@
 // 历史记录 + 本地设置持久化（localStorage）
+import { invoke } from '@tauri-apps/api/core';
 import type { ItemKind } from './tasks.js';
 
 export interface HistoryItem {
@@ -11,6 +12,8 @@ export interface HistoryItem {
   text?: string;
   /** 剪贴板图片 base64（<1MB 才存，用于"复制到剪贴板"） */
   imageB64?: string;
+  /** 接收端落盘后的完整路径（硬盘历史记录用，分辨每次的文件名） */
+  savedPath?: string;
 }
 
 export interface HistoryEntry {
@@ -47,6 +50,8 @@ export function saveHistoryEntry(entry: HistoryEntry): void {
   } catch {
     /* 配额满了就丢弃本次写入，不阻塞主流程 */
   }
+  // 硬盘完整存档：JSONL，每行一条，含保存路径等 localStorage 放不下的信息
+  void invoke('append_history', { line: JSON.stringify(entry) }).catch(() => {});
 }
 
 // ---------- 简单键值设置 ----------

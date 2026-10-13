@@ -79,6 +79,9 @@ export type FlingMessage =
   // 接收方全部收齐并落盘后发送：发送方收到前不得拆除连接，
   // 否则"发送成功"只是数据进了发送缓冲，接收方实际没收完。
   | { kind: 'task-ack'; taskId: string }
+  // 接收方周期性上报真实接收进度（发送端的"已发送"只是进了缓冲，
+  // 用接收端的数字才是用户真正关心的"对方收到了多少"）。
+  | { kind: 'task-progress'; taskId: string; doneBytes: number; totalBytes: number }
   // P2P 直连信令：经 LiveKit 中继通道（端到端加密）交换 SDP / ICE，
   // 文件数据本身走直连的 RTCDataChannel，不经过 LiveKit SFU。
   | { kind: 'p2p-offer'; sdp: string }
@@ -99,6 +102,7 @@ export function isFlingMessage(o: unknown): o is FlingMessage {
     k === 'offer-rejected' ||
     k === 'task-done' ||
     k === 'task-ack' ||
+    k === 'task-progress' ||
     k === 'p2p-offer' ||
     k === 'p2p-answer' ||
     k === 'p2p-ice'
