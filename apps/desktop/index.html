@@ -47,46 +47,57 @@
           <!-- 发送 -->
           <section class="page active" id="page-send">
             <h2>发送</h2>
-            <div class="card">
-              <div class="card-t">发送内容 <span class="hint">可输入文字，Ctrl+V 粘贴文本 / 图片 / 文件</span></div>
-              <div id="composeBox" tabindex="0">
-                <div id="chipRow"></div>
-                <textarea id="composeText" rows="3" placeholder="输入文字，或 Ctrl+V 粘贴…"></textarea>
+            <div class="split">
+              <div class="split-main">
+                <div class="card">
+                  <div class="card-t">发送内容 <span class="hint">可输入文字，Ctrl+V 粘贴文本 / 图片 / 文件</span></div>
+                  <div id="composeBox" tabindex="0">
+                    <div id="chipRow"></div>
+                    <textarea id="composeText" rows="3" placeholder="输入文字，或 Ctrl+V 粘贴…"></textarea>
+                  </div>
+                  <div class="compose-actions">
+                    <label class="filebtn">＋ 添加文件<input type="file" id="fileInput" multiple hidden /></label>
+                    <span class="hint" id="composeHint"></span>
+                  </div>
+                </div>
+                <div class="card">
+                  <div class="card-t">选择目标</div>
+                  <div class="card-sub">附近的设备</div>
+                  <div id="nearbyList" class="devlist"><div class="empty">正在搜索附近的设备…</div></div>
+                  <div class="card-sub">远程设备</div>
+                  <button class="ghostbtn" id="remotePairBtn">🔗 用配对码发送</button>
+                </div>
+                <button class="primary big" id="sendBtn" disabled>发送</button>
               </div>
-              <div class="compose-actions">
-                <label class="filebtn">＋ 添加文件<input type="file" id="fileInput" multiple hidden /></label>
-                <span class="hint" id="composeHint"></span>
+              <div class="split-side">
+                <div class="side-t">传输任务</div>
+                <div id="sendTasks"></div>
               </div>
             </div>
-            <div class="card">
-              <div class="card-t">选择目标</div>
-              <div class="card-sub">附近的设备</div>
-              <div id="nearbyList" class="devlist"><div class="empty">正在搜索附近的设备…</div></div>
-              <div class="card-sub">远程设备</div>
-              <button class="ghostbtn" id="remotePairBtn">🔗 用配对码发送</button>
-            </div>
-            <button class="primary big" id="sendBtn" disabled>发送</button>
-            <div id="sendTasks"></div>
           </section>
 
           <!-- 接收 -->
           <section class="page" id="page-recv">
             <h2>接收</h2>
-            <div class="card row">
-              <div>
-                <div class="card-t">允许附近的设备发现我</div>
-                <div class="hint">关闭后，附近设备列表里看不到这台电脑（不影响配对码）</div>
+            <div class="split">
+              <div class="split-main">
+                <div class="card row">
+                  <div>
+                    <div class="card-t">允许附近的设备发现我</div>
+                    <div class="hint">关闭后，附近设备列表里看不到这台电脑（不影响配对码）</div>
+                  </div>
+                  <label class="switch"><input type="checkbox" id="discoverToggle" checked /><span></span></label>
+                </div>
+                <div class="card">
+                  <div class="card-t">等待你确认 <span class="hint">对方发来的内容，先确认再接收</span></div>
+                  <div id="pendingList"><div class="empty">暂无待确认的传输</div></div>
+                  <button class="ghostbtn" id="remoteRecvBtn" style="margin-top:10px">🔗 用配对码接收</button>
+                </div>
               </div>
-              <label class="switch"><input type="checkbox" id="discoverToggle" checked /><span></span></label>
-            </div>
-            <div class="card">
-              <div class="card-t">等待你确认 <span class="hint">对方发来的内容，先确认再接收</span></div>
-              <div id="pendingList"><div class="empty">暂无待确认的传输</div></div>
-              <button class="ghostbtn" id="remoteRecvBtn" style="margin-top:10px">🔗 用配对码接收</button>
-            </div>
-            <div class="card">
-              <div class="card-t">接收中</div>
-              <div id="recvTasks"><div class="empty">暂无正在接收的任务</div></div>
+              <div class="split-side">
+                <div class="side-t">接收中的任务</div>
+                <div id="recvTasks"><div class="empty">暂无正在接收的任务</div></div>
+              </div>
             </div>
           </section>
 
