@@ -33,6 +33,22 @@ import type { FlingRoom } from '@fling/core';
 
 export type ItemKind = 'text' | 'file' | 'clipboard-image';
 
+/**
+ * 统一错误信息提取：Tauri invoke 失败时 reject 的是字符串而非 Error，
+ * 直接取 .message 会吞掉真实信息（曾导致"保存失败"掩盖真实原因）。
+ */
+export function errText(e: unknown): string {
+  if (typeof e === 'string') return e;
+  if (e instanceof Error && e.message) return e.message;
+  try {
+    const s = JSON.stringify(e);
+    if (s && s !== '{}') return s;
+  } catch {
+    /* ignore */
+  }
+  return '未知错误';
+}
+
 /** 发送框里的一个条目（快照） */
 export interface ComposeItem {
   uid: string;
@@ -93,6 +109,8 @@ export class SendTask {
 
   private room?: FlingRoom;
   private p2pLink: P2PLink | null = null;
+  /** 等待接收方 task-ack 的 resolver（收到确认/对方离开/超时后置空） */
+  private ackResolve: ((ok: boolean) => void) | null = null;
   private lobbyLeave?: () => void;
   private announceTimer?: ReturnType<typeof setInterval>;
   private waitTimer?: ReturnType<typeof setTimeout>;
@@ -178,10 +196,17 @@ export class SendTask {
       this.room = await connectFlingRoom(spec, {
         onPeerJoined: () => this.onPeer(),
         onPeerLeft: () => {
-          /* 接收方提前离开：若还没发完，传输会失败并标记 */
+          // 接收方提前离开：若还在等 task-ack，直接结束等待
+          this.ackResolve?.(false);
         },
         onP2PSignal: (sig) => {
           void this.p2pLink?.handleSignal(sig);
+        },
+        onTaskAck: (taskId) => {
+          if (taskId === this.taskId) {
+            log('task', 'task-ack received', { taskId });
+            this.ackResolve?.(true);
+          }
         },
         onLog: (tag, msg) => log(tag as LogTag, `[room] ${msg}`),
       });
@@ -253,11 +278,15 @@ export class SendTask {
         this.notify();
       }
 
-      // 5. 收尾
+      // 5. 收尾：等接收方确认全部落盘（task-ack）再拆连接。
+      // 以前是 task-done 后固定等 2s 就关——"发送成功"只是数据进了发送缓冲，
+      // 接收方可能还没收完，这是"发送端成功但接收端失败"的根因。
       try {
         await this.room!.sendTaskDone(this.taskId);
         log('task', 'task-done sent', { taskId: this.taskId });
       } catch { /* 尽力 */ }
+      const acked = await this.waitForAck(30_000);
+      log('task', acked ? 'ack ok, closing' : 'ack timeout, closing anyway', { taskId: this.taskId });
       this.phase = this.cancelled ? 'cancelled' : okCount === this.items.length ? 'done' : 'error';
       if (this.phase === 'error') this.error = '部分项目发送失败';
       this.endedAt = Date.now();
@@ -268,12 +297,12 @@ export class SendTask {
         phase: this.phase,
         ok: `${okCount}/${this.items.length}`,
         p2p: this.p2p,
+        acked,
         error: this.error,
       });
       void flushLogs();
       void this.archive();
-      // 对方收到 task-done 后再关房间，留 2s 宽限
-      setTimeout(() => this.closeRooms(), 2000);
+      this.closeRooms();
     } catch (e) {
       if (this.cancelled) {
         this.phase = 'cancelled';
@@ -332,6 +361,24 @@ export class SendTask {
   private closeP2P(): void {
     this.p2pLink?.close();
     this.p2pLink = null;
+  }
+
+  /**
+   * 等接收方 task-ack（全部收齐并落盘）。超时/对方离开则返回 false，
+   * 调用方照常关闭——旧版本接收方不会发 ack，不能无限等。
+   */
+  private waitForAck(timeoutMs: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.ackResolve = null;
+        resolve(false);
+      }, timeoutMs);
+      this.ackResolve = (ok) => {
+        clearTimeout(timer);
+        this.ackResolve = null;
+        resolve(ok);
+      };
+    });
   }
 
   /** 接收方拒绝（经 inbox / lobby 回来） */
@@ -519,6 +566,10 @@ export class RecvTask {
   /** P2P 直连状态：idle=未尝试 connecting=握手中 open=直连传输中 failed=已回退中继 */
   p2p: P2PState = 'idle';
   private p2pLink: P2PLink | null = null;
+  /** 正在落盘的 promise（task-done 到达时需等它们完成再发 task-ack） */
+  private pendingSaves = new Set<Promise<void>>();
+  /** 已收到 manifest 但还没落盘完成的个数（在途分块计数） */
+  private pendingFiles = 0;
   /** 收到的剪贴板图片（供"另存为文件"） */
   clipImages = new Map<string, Uint8Array>();
 
@@ -591,7 +642,12 @@ export class RecvTask {
         onText: (t) => this.onTextPart(t),
         onFileManifest: (m) => this.onManifest(m),
         onFileProgress: (id, r, t) => this.onProgress(id, r, t),
-        onFileComplete: (id, m, bytes) => void this.onFileComplete(id, m, bytes),
+        onFileComplete: (id, m, bytes) => {
+          // 落盘是异步的：跟踪起来，finish(true) 需要等它们全部完成再发 task-ack
+          const p = this.onFileComplete(id, m, bytes);
+          this.pendingSaves.add(p);
+          void p.finally(() => this.pendingSaves.delete(p));
+        },
         onFileError: (id, err) => this.onFileError(id, err),
         onP2PSignal: (sig) => this.onP2PSignal(sig),
         onLog: (tag, msg) => log(tag as LogTag, `[room] ${msg}`),
@@ -648,6 +704,7 @@ export class RecvTask {
     item.status = 'active';
     item.totalBytes = m.size;
     this.manifestToItem.set(m.id, item);
+    this.pendingFiles++;
     log('xfer', 'manifest recv', {
       taskId: this.taskId,
       name: m.name,
@@ -673,6 +730,7 @@ export class RecvTask {
     if (!item) return;
     item.status = 'error';
     item.error = err;
+    this.pendingFiles = Math.max(0, this.pendingFiles - 1);
     log('xfer', 'item failed', { taskId: this.taskId, name: item.name, error: err });
     this.notify();
   }
@@ -704,10 +762,21 @@ export class RecvTask {
       item.doneBytes = item.totalBytes;
     } catch (e) {
       item.status = 'error';
-      item.error = (e as Error).message || '保存失败';
+      item.error = errText(e);
       log('xfer', 'item save failed', { taskId: this.taskId, name: item.name, error: item.error });
+    } finally {
+      this.pendingFiles = Math.max(0, this.pendingFiles - 1);
     }
     this.notify();
+  }
+
+  /** 等待在途分块收齐并落盘（task-done 可能先于部分分块到达）。超时返回 false。 */
+  private async waitForPendingFiles(timeoutMs: number): Promise<boolean> {
+    const start = Date.now();
+    while (this.pendingFiles > 0 && Date.now() - start < timeoutMs) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return this.pendingFiles === 0;
   }
 
   private onPeerLeft(): void {
@@ -746,6 +815,16 @@ export class RecvTask {
     if (this.finished) return;
     this.finished = true;
     clearTimeout(this.peerGoneTimer);
+    if (completed) {
+      // task-done 可能先于部分分块到达：先等在途分块收齐、落盘完成，再判定。
+      // 注意此时不能关 P2P，否则在途分块会丢失。
+      const drained = await this.waitForPendingFiles(30_000);
+      if (!drained) {
+        log('task', 'wait pending files timeout', { taskId: this.taskId, pending: this.pendingFiles });
+      }
+      await this.room?.flush().catch(() => {});
+      await Promise.allSettled([...this.pendingSaves]);
+    }
     this.closeP2P();
     // 文本：拼起来写剪贴板
     if (this.textItem && this.textParts.length > 0) {
@@ -766,6 +845,15 @@ export class RecvTask {
     }
     this.phase = failed === 0 ? 'done' : 'error';
     if (failed > 0) this.error = `${failed} 项未完成`;
+    // 全部收齐并落盘：告诉发送方可以拆连接了（发送方收到前不会主动断开）
+    if (completed && failed === 0 && this.room) {
+      try {
+        await this.room.sendTaskAck(this.taskId);
+        log('task', 'task-ack sent', { taskId: this.taskId });
+      } catch {
+        /* 忽略 */
+      }
+    }
     this.endedAt = Date.now();
     this.notify();
     log('task', 'recv end', {

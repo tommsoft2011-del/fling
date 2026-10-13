@@ -91,6 +91,8 @@ export class P2PLink {
   private _state: P2PState = 'idle';
   private iceLocal = 0;
   private iceRemote = 0;
+  /** 正常关闭（任务结束）时不报 failed，避免日志误导 */
+  private closed = false;
   onstate: ((s: P2PState) => void) | null = null;
 
   constructor(
@@ -174,6 +176,7 @@ export class P2PLink {
       }
     };
     dc.onclose = () => {
+      if (this.closed) return;
       if (this._state === 'open') this.fail('data channel closed');
     };
     dc.onerror = () => {
@@ -279,6 +282,7 @@ export class P2PLink {
   }
 
   close(): void {
+    this.closed = true;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;

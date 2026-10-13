@@ -31,8 +31,8 @@ export function log(tag: LogTag, msg: string, data?: Record<string, unknown>): v
     queue.push(line);
     // 顺手也打到控制台，方便 devtools 联调
     if (tag === 'err') console.error(line);
-    if (queue.length >= 50) void flush();
-    else if (!flushTimer) flushTimer = setTimeout(() => void flush(), 2000);
+    if (queue.length >= 50) void flushLogs();
+    else if (!flushTimer) flushTimer = setTimeout(() => void flushLogs(), 2000);
   } catch {
     /* 日志永不干扰主流程 */
   }

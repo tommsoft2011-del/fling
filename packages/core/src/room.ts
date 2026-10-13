@@ -32,6 +32,8 @@ export interface FlingRoomEvents {
   onTaskDone?(taskId: string, from: string): void;
   /** P2P handshake signaling (SDP / ICE), carried over the encrypted relay. */
   onP2PSignal?(sig: Extract<FlingMessage, { kind: `p2p-${string}` }>, from: string): void;
+  /** Receiver confirms all items received AND saved (see task-ack). */
+  onTaskAck?(taskId: string, from: string): void;
   /** Optional diagnostics sink (the app wires this to its log file). */
   onLog?(tag: string, msg: string): void;
 }
@@ -74,9 +76,11 @@ export class FlingRoom {
    * receive pipeline. Safe to call at any time (per-chunk routing).
    */
   setDirectChannel(ch: DirectChannel | null): void {
-    if (this.direct) {
-      this.direct.onmessage = null;
-      this.direct.onclose = null;
+    const old = this.direct;
+    if (old) {
+      old.onmessage = null;
+      // NOTE: do NOT touch onclose — it belongs to the link that owns the
+      // channel lifecycle (overwriting it broke the link's failure path).
     }
     this.direct = ch;
     if (ch) {
@@ -85,12 +89,6 @@ export class FlingRoom {
         this.handleQueue = this.handleQueue
           .then(() => this.handleDirectData(data, ch.label))
           .catch((e) => console.error('fling: direct payload handling failed:', e));
-      };
-      ch.onclose = () => {
-        if (this.direct === ch) {
-          this.events.onLog?.('p2p', 'direct channel closed by peer');
-          this.direct = null;
-        }
       };
     } else {
       this.events.onLog?.('p2p', 'direct channel detached (relay mode)');
@@ -179,6 +177,11 @@ export class FlingRoom {
   /** v2: signal that a task's transfer is fully complete. */
   async sendTaskDone(taskId: string): Promise<void> {
     await this.send({ kind: 'task-done', taskId });
+  }
+
+  /** v2: receiver confirms every item is received and saved to disk. */
+  async sendTaskAck(taskId: string): Promise<void> {
+    await this.send({ kind: 'task-ack', taskId });
   }
 
   private async send(msg: FlingMessage): Promise<void> {
@@ -291,6 +294,9 @@ export class FlingRoom {
         break;
       case 'task-done':
         this.events.onTaskDone?.(msg.taskId, from);
+        break;
+      case 'task-ack':
+        this.events.onTaskAck?.(msg.taskId, from);
         break;
       case 'p2p-offer':
       case 'p2p-answer':
