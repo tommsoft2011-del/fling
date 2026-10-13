@@ -109,8 +109,8 @@ async function main(): Promise<void> {
   const directB = new FakeDirect('B->A');
   // wire the pair: A's sends arrive at B's room and vice versa
   const wire = () => {
-    directA.sent.forEach((d) => (roomB as any).handleDirectData(d, 'A'));
-    directB.sent.forEach((d) => (roomA as any).handleDirectData(d, 'B'));
+    directA.sent.forEach((d) => directB.onmessage?.(d as Uint8Array<ArrayBuffer>));
+    directB.sent.forEach((d) => directA.onmessage?.(d as Uint8Array<ArrayBuffer>));
     directA.sent = [];
     directB.sent = [];
   };
@@ -178,9 +178,9 @@ async function main(): Promise<void> {
     ...raws.filter((m) => m.kind === 'file-manifest'),
   ];
   for (const m of chunksFirst) {
-    await (roomB as any).handleDirectData(enc.encode(JSON.stringify(m)), 'A');
+    directB.onmessage?.(enc.encode(JSON.stringify(m)) as Uint8Array<ArrayBuffer>);
   }
-  await (roomB as any).flush();
+  await new Promise((r) => setTimeout(r, 20));
   const gotE = done.cur;
   check(
     gotE !== null && gotE.bytes.length === 100_000 && gotE.bytes[99999] === (99999 & 0xff),

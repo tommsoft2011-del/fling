@@ -92,9 +92,12 @@ export class FlingRoom {
     if (ch) {
       this.events.onLog?.('p2p', `direct channel attached (${ch.label})`);
       ch.onmessage = (data) => {
-        this.handleQueue = this.handleQueue
-          .then(() => this.handleDirectData(data, ch.label))
-          .catch((e) => console.error('fling: direct payload handling failed:', e));
+        // Synchronous: see handleDirectMessage. Never chain onto handleQueue.
+        try {
+          this.handleDirectMessage(data, ch.label);
+        } catch (e) {
+          console.error('fling: direct payload handling failed:', e);
+        }
       };
     } else {
       this.events.onLog?.('p2p', 'direct channel detached (relay mode)');
@@ -216,11 +219,16 @@ export class FlingRoom {
   }
 
   private async handlePayload(payload: Uint8Array, from: string): Promise<void> {
+    const t0 = performance.now();
     let plain: string;
     try {
       plain = await openText(this.roomKey, dec.decode(payload));
     } catch {
       return; // not ours (wrong key / garbage) — ignore
+    }
+    const decryptMs = performance.now() - t0;
+    if (decryptMs > 200) {
+      this.events.onLog?.('xfer', `slow relay decrypt: ${Math.round(decryptMs)}ms`);
     }
     let msg: unknown;
     try {
@@ -232,17 +240,37 @@ export class FlingRoom {
     this.dispatchMessage(msg, from);
   }
 
-  /** Inbound message from the direct P2P channel (already DTLS-encrypted). */
-  private async handleDirectData(data: Uint8Array, from: string): Promise<void> {
+  /**
+   * Inbound message from the direct P2P channel (already DTLS-encrypted).
+   * Synchronous fast path: no AES-GCM, just JSON parse. Handled immediately
+   * in onmessage instead of chaining onto the shared handleQueue, so a slow
+   * relay trickle (decrypt-bound) can never head-of-line-block direct chunks.
+   * Manifest/chunk races are covered by early-chunk buffering.
+   */
+  private handleDirectMessage(data: Uint8Array, from: string): void {
     let msg: unknown;
     try {
       msg = JSON.parse(dec.decode(data));
     } catch {
+      this.events.onLog?.('xfer', 'dropping non-JSON direct payload');
       return;
     }
-    if (!isFlingMessage(msg)) return;
+    if (!isFlingMessage(msg)) {
+      this.events.onLog?.('xfer', 'dropping unknown direct message');
+      return;
+    }
+    if (msg.kind === 'file-chunk') {
+      const n = (this.directChunkCounts.get(msg.id) ?? 0) + 1;
+      this.directChunkCounts.set(msg.id, n);
+      if (n % 20 === 0) {
+        this.events.onLog?.('xfer', `direct chunks received: ${n} (${msg.id.slice(0, 8)})`);
+      }
+    }
     this.dispatchMessage(msg, from);
   }
+
+  /** Per-file direct-chunk counters (diagnostics). Cleared in finishFile. */
+  private directChunkCounts = new Map<string, number>();
 
   private dispatchMessage(msg: FlingMessage, from: string): void {
     switch (msg.kind) {
@@ -315,6 +343,7 @@ export class FlingRoom {
     if (!entry) return;
     this.incoming.delete(id);
     this.earlyChunks.delete(id);
+    this.directChunkCounts.delete(id);
     try {
       const bytes = entry.receiver.assemble();
       this.events.onFileComplete?.(id, entry.receiver.manifest, bytes);
