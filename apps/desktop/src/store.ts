@@ -14,6 +14,8 @@ export interface HistoryItem {
   imageB64?: string;
   /** 接收端落盘后的完整路径（硬盘历史记录用，分辨每次的文件名） */
   savedPath?: string;
+  /** 文件 sha256（发送端计算、接收端校验一致，用于完整性核对） */
+  sha256?: string;
 }
 
 export interface HistoryEntry {

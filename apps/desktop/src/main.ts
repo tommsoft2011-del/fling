@@ -1,5 +1,7 @@
 // Fling v0.3 桌面端入口：传输工具（发送 / 接收 / 历史 / 设置）
 import './style.css';
+// 禁用 WebView 右键菜单（桌面端不需要浏览器上下文菜单）
+document.addEventListener('contextmenu', (e) => e.preventDefault());
 import { invoke } from '@tauri-apps/api/core';
 import { $, toast } from './ui.js';
 import { initNet, getDeviceName } from './net.js';

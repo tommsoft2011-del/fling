@@ -75,6 +75,8 @@ export interface ItemState {
   error?: string;
   /** 接收端落盘后的完整路径（历史记录用） */
   savedPath?: string;
+  /** 文件 sha256（用于完整性核对） */
+  sha256?: string;
 }
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -829,6 +831,8 @@ export class RecvTask {
   private async onFileComplete(id: string, m: FileManifest, bytes: Uint8Array): Promise<void> {
     const item = this.manifestToItem.get(id);
     if (!item) return;
+    // sha256 已在 assemble() 里校验过（不一致会抛错进 catch），这里记录供历史核对
+    item.sha256 = m.sha256;
     try {
       if (m.kind === 'clipboard-image') {
         // 剪贴板图片存为 PNG 文件，不直接写入系统剪贴板（避免覆盖用户剪贴板内容）；
@@ -1006,6 +1010,7 @@ export class RecvTask {
           status: (it.status === 'done' ? 'ok' : 'fail') as 'ok' | 'fail',
           error: it.error,
           savedPath: it.savedPath,
+          sha256: it.sha256,
         };
         if (it.kind === 'text') return { ...base, text: this.textParts.join('') };
         if (it.kind === 'clipboard-image') {

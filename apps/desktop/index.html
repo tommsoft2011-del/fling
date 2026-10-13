@@ -49,26 +49,22 @@
             <h2>发送</h2>
             <div class="split">
               <div class="split-main">
-                <div class="card">
-                  <div class="card-t">发送内容 <span class="hint">可输入文字，Ctrl+V 粘贴文本 / 图片</span></div>
+                <div class="card step-card">
+                  <div class="step-head"><span class="step-num">1</span><span class="step-t">发送内容</span><span class="hint">文字可留空，作为本次传输的说明；文字、文件、剪贴板至少选其一</span></div>
                   <div id="composeBox" tabindex="0">
                     <div id="chipRow"></div>
-                    <textarea id="composeText" rows="3" placeholder="输入文字，或 Ctrl+V 粘贴…"></textarea>
+                    <textarea id="composeText" rows="2" placeholder="输入说明文字（可选），或 Ctrl+V 粘贴…"></textarea>
                   </div>
-                  <div class="compose-actions">
-                    <span class="hint" id="composeHint"></span>
-                  </div>
-                </div>
-                <div class="card" id="fileCard">
-                  <div class="card-t">待发送文件 <span class="hint" id="fileCountHint"></span></div>
-                  <div id="fileList"><div class="empty">还没有文件 — 点「添加文件」，或直接把文件拖进来</div></div>
-                  <div class="compose-actions" style="margin-top:10px">
-                    <label class="filebtn">＋ 添加文件<input type="file" id="fileInput" multiple hidden /></label>
-                    <span class="hint">支持拖放文件到本页任意位置</span>
+                  <div id="fileListWrap">
+                    <div id="fileList"><div class="empty">还没有文件 — 点「添加文件」，或直接把文件拖进来</div></div>
+                    <div class="compose-actions">
+                      <label class="filebtn">＋ 添加文件<input type="file" id="fileInput" multiple hidden /></label>
+                      <span class="hint">支持拖放文件到本页任意位置</span>
+                    </div>
                   </div>
                 </div>
-                <div class="card">
-                  <div class="card-t">选择目标</div>
+                <div class="card step-card">
+                  <div class="step-head"><span class="step-num">2</span><span class="step-t">发送目标</span></div>
                   <div class="card-sub">附近的设备</div>
                   <div id="nearbyList" class="devlist"><div class="empty">正在搜索附近的设备…</div></div>
                   <div class="card-sub">远程设备</div>
@@ -81,6 +77,7 @@
                 <div id="sendTasks"></div>
               </div>
             </div>
+            <div id="dropOverlay"><div class="box">松开鼠标添加文件<span class="sub">文件将加入本次发送内容</span></div></div>
           </section>
 
           <!-- 接收 -->

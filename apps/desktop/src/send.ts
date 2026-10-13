@@ -42,24 +42,29 @@ export function initSendPage(): void {
 
   // --- 拖拽文件到发送页任意位置 → 文件列表 ---
   const pageSend = $('#page-send');
-  const fileCard = $('#fileCard');
+  const fileCard = $('#fileListWrap');
+  const dropOverlay = $('#dropOverlay');
   let dragDepth = 0;
   const hasFiles = (e: DragEvent) =>
     !!e.dataTransfer && Array.from(e.dataTransfer.types).includes('Files');
+  const setDropHint = (on: boolean) => {
+    fileCard.classList.toggle('dragover', on);
+    dropOverlay.classList.toggle('show', on);
+  };
   pageSend.addEventListener('dragenter', (e) => {
     if (!hasFiles(e as DragEvent)) return;
     dragDepth++;
-    fileCard.classList.add('dragover');
+    setDropHint(true);
   });
   pageSend.addEventListener('dragleave', () => {
     dragDepth = Math.max(0, dragDepth - 1);
-    if (dragDepth === 0) fileCard.classList.remove('dragover');
+    if (dragDepth === 0) setDropHint(false);
   });
   pageSend.addEventListener('dragover', (e) => e.preventDefault());
   pageSend.addEventListener('drop', (e) => {
     e.preventDefault();
     dragDepth = 0;
-    fileCard.classList.remove('dragover');
+    setDropHint(false);
     const files = (e as DragEvent).dataTransfer?.files;
     if (files) {
       for (const f of Array.from(files)) addFileItem(f);
