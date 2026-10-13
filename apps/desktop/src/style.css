@@ -112,6 +112,10 @@ button { font: inherit; cursor: pointer; }
   box-shadow: 0 8px 32px rgba(0,0,0,.18);
   font-size: 17px; font-weight: 700; color: var(--accent);
 }
+.filelist-head { margin-bottom: 4px; min-height: 18px; }
+.filelist-head .hint:empty { display: none; }
+.compose-hint { min-height: 18px; padding: 0 4px; }
+.compose-hint .hint:empty { display: none; }
 #dropOverlay .box .sub { display: block; margin-top: 8px; font-size: 13px; font-weight: 400; color: var(--muted); }
 
 /* ---------- 主界面布局 ---------- */

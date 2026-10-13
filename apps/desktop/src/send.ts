@@ -225,7 +225,8 @@ function renderChips(): void {
     chip.appendChild(x);
     row.appendChild(chip);
   }
-  $('#composeHint').textContent =
+  const ch = $('#composeHint');
+  if (ch) ch.textContent =
     clipItems.length > 0 ? `${clipItems.length} 张剪贴板图片` : '';
 }
 
@@ -248,7 +249,8 @@ function renderFileList(): void {
     }
   }
   const total = fileItems.reduce((a, c) => a + c.size, 0);
-  $('#fileCountHint').textContent =
+  const fh = $('#fileCountHint');
+  if (fh) fh.textContent =
     fileItems.length > 0 ? `${fileItems.length} 个文件 · 共 ${fmtSize(total)}` : '';
 }
 

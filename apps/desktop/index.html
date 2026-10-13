@@ -54,8 +54,10 @@
                   <div id="composeBox" tabindex="0">
                     <div id="chipRow"></div>
                     <textarea id="composeText" rows="2" placeholder="输入说明文字（可选），或 Ctrl+V 粘贴…"></textarea>
+                    <div class="compose-hint"><span class="hint" id="composeHint"></span></div>
                   </div>
                   <div id="fileListWrap">
+                    <div class="filelist-head"><span class="hint" id="fileCountHint"></span></div>
                     <div id="fileList"><div class="empty">还没有文件 — 点「添加文件」，或直接把文件拖进来</div></div>
                     <div class="compose-actions">
                       <label class="filebtn">＋ 添加文件<input type="file" id="fileInput" multiple hidden /></label>
