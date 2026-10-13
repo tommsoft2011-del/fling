@@ -116,6 +116,25 @@ button { font: inherit; cursor: pointer; }
 .page.active { display: block; }
 .page h2 { margin: 0 0 14px; font-size: 20px; }
 
+/* ---------- 宽屏双栏布局（>=1200px） ---------- */
+/* 窄屏下 .split 只是普通块级容器，页面保持原来的单列样式 */
+.split-main, .split-side { min-width: 0; }
+.side-t { display: none; }
+@media (min-width: 1200px) {
+  #page-send, #page-recv { max-width: none; }
+  #page-hist, #page-settings { max-width: 1060px; }
+  .split {
+    display: grid;
+    grid-template-columns: minmax(430px, 540px) minmax(0, 1fr);
+    gap: 18px; align-items: start;
+  }
+  .side-t {
+    display: block; font-weight: 700; font-size: 14px; color: var(--muted);
+    margin: 2px 0 10px;
+  }
+  #page-send #sendTasks { margin-top: 0; }
+}
+
 /* ---------- 发送页 ---------- */
 #composeBox {
   border: 1.5px solid var(--border); border-radius: 10px; background: var(--surface-2);
@@ -162,6 +181,12 @@ button { font: inherit; cursor: pointer; }
 .dev .dname { font-weight: 600; }
 .dev .dsub { color: var(--muted); font-size: 12px; margin-left: auto; }
 #sendTasks { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+/* 暂无任务时的占位提示（任务卡出现后自动消失） */
+#sendTasks:empty::after {
+  content: '暂无传输任务，发送后这里会显示进度';
+  display: block; border: 1px dashed var(--border); border-radius: 12px;
+  padding: 26px 16px; text-align: center; color: var(--muted); font-size: 13px;
+}
 
 /* ---------- 任务卡 ---------- */
 .task {
