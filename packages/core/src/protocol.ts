@@ -11,8 +11,17 @@ export const PROTOCOL_VERSION = 2;
 /** Max plaintext bytes per text message (keep well under data-channel limits). */
 export const MAX_TEXT_BYTES = 60 * 1024;
 
-/** Raw chunk size for file transfer; base64 + encryption overhead still fits. */
-export const FILE_CHUNK_SIZE = 256 * 1024;
+/**
+ * Raw chunk size for file transfer.
+ *
+ * WARNING: do NOT raise this without checking livekit-client's per-packet cap
+ * (RTCEngine.DEFAULT_MAX_MESSAGE_SIZE = 64_000 bytes). A chunk goes through
+ * base64 (x4/3) inside the file-chunk JSON, then the whole message is sealed
+ * with AES-GCM into another base64 envelope (x4/3 again) plus protobuf framing.
+ * 32 KiB raw  => ~58.5 KiB on the wire (fits with margin).
+ * 256 KiB raw => ~466 KiB on the wire => PublishDataError, every chunk fails.
+ */
+export const FILE_CHUNK_SIZE = 32 * 1024;
 
 /** What the bytes of a transferred item mean to the receiver. */
 export type FileKind = 'file' | 'clipboard-image';
