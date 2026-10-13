@@ -46,6 +46,12 @@ export class FlingRoom {
   private events!: FlingRoomEvents;
   private helloTimer?: ReturnType<typeof setInterval>;
   private incoming = new Map<string, { receiver: FileReceiver; from: string }>();
+  /**
+   * Chunks that arrived before their manifest. Manifests and chunks can
+   * travel on different channels (relay vs direct), so a chunk may win the
+   * race; buffer it and replay when the manifest arrives instead of dropping.
+   */
+  private earlyChunks = new Map<string, Extract<FlingMessage, { kind: 'file-chunk' }>[]>();
   // Data channels are ordered, but decrypt+parse is async — serialize
   // handling so a chunk can never overtake its manifest.
   private handleQueue: Promise<void> = Promise.resolve();
@@ -187,10 +193,13 @@ export class FlingRoom {
   private async send(msg: FlingMessage): Promise<void> {
     // File bytes prefer the direct P2P channel when it's open: the DTLS-SCTP
     // data channel is already encrypted, so no AES-GCM envelope needed here.
-    // Everything else (signaling, manifests, small messages) uses the relay.
+    // The manifest goes through the same channel so it can never arrive
+    // AFTER its chunks (previously: manifest via relay, chunks via direct
+    // → chunks arrived first and were dropped as "unknown manifest").
+    // Everything else (signaling, small messages) uses the relay.
     // A failing direct channel falls back to the relay for this chunk.
     const dc = this.direct;
-    if (msg.kind === 'file-chunk' && dc && dc.readyState === 'open') {
+    if ((msg.kind === 'file-chunk' || msg.kind === 'file-manifest') && dc && dc.readyState === 'open') {
       try {
         if (dc.bufferedAmount > P2P_DRAIN_THRESHOLD) {
           await dc.waitForDrain(P2P_DRAIN_THRESHOLD);
@@ -198,7 +207,7 @@ export class FlingRoom {
         dc.send(enc.encode(JSON.stringify(msg)));
         return;
       } catch {
-        this.events.onLog?.('p2p', `direct send failed for chunk ${msg.seq}, falling back to relay`);
+        this.events.onLog?.('p2p', `direct send failed for ${msg.kind} ${msg.kind === 'file-chunk' ? msg.seq : ''}, falling back to relay`);
         this.setDirectChannel(null);
       }
     }
@@ -261,6 +270,13 @@ export class FlingRoom {
         };
         this.incoming.set(manifest.id, { receiver: new FileReceiver(manifest), from });
         this.events.onFileManifest?.(manifest, from);
+        // Replay any chunks that beat the manifest here.
+        const buffered = this.earlyChunks.get(manifest.id);
+        if (buffered) {
+          this.earlyChunks.delete(manifest.id);
+          this.events.onLog?.('xfer', `replaying ${buffered.length} early chunks for ${manifest.name}`);
+          for (const c of buffered) this.handleChunkMessage(c);
+        }
         // Empty file: complete immediately.
         if (manifest.totalChunks === 1 && manifest.size === 0) {
           this.finishFile(manifest.id);
@@ -268,19 +284,7 @@ export class FlingRoom {
         break;
       }
       case 'file-chunk': {
-        const entry = this.incoming.get(msg.id);
-        if (!entry) return; // unknown / already finished
-        const { receiver } = entry;
-        let complete = false;
-        try {
-          complete = receiver.addChunk(msg.seq, msg.data);
-        } catch (e) {
-          this.events.onFileError?.(msg.id, (e as Error).message);
-          this.incoming.delete(msg.id);
-          return;
-        }
-        this.events.onFileProgress?.(msg.id, receiver.progress * receiver.totalBytes, receiver.totalBytes);
-        if (complete) this.finishFile(msg.id);
+        this.handleChunkMessage(msg);
         break;
       }
       case 'offer':
@@ -310,12 +314,40 @@ export class FlingRoom {
     const entry = this.incoming.get(id);
     if (!entry) return;
     this.incoming.delete(id);
+    this.earlyChunks.delete(id);
     try {
       const bytes = entry.receiver.assemble();
       this.events.onFileComplete?.(id, entry.receiver.manifest, bytes);
     } catch (e) {
       this.events.onFileError?.(id, (e as Error).message);
     }
+  }
+
+  /** Single place that applies a file-chunk to its receiver. */
+  private handleChunkMessage(msg: Extract<FlingMessage, { kind: 'file-chunk' }>): void {
+    const entry = this.incoming.get(msg.id);
+    if (!entry) {
+      // Manifest not seen yet (chunk beat it on a faster channel): buffer
+      // instead of dropping. Cap the buffer so a garbage id can't grow it.
+      const buf = this.earlyChunks.get(msg.id);
+      if (buf) {
+        if (buf.length < 2000) buf.push(msg);
+      } else {
+        this.earlyChunks.set(msg.id, [msg]);
+      }
+      return;
+    }
+    const { receiver } = entry;
+    let complete = false;
+    try {
+      complete = receiver.addChunk(msg.seq, msg.data);
+    } catch (e) {
+      this.events.onFileError?.(msg.id, (e as Error).message);
+      this.incoming.delete(msg.id);
+      return;
+    }
+    this.events.onFileProgress?.(msg.id, receiver.progress * receiver.totalBytes, receiver.totalBytes);
+    if (complete) this.finishFile(msg.id);
   }
 
   /** Wait until all received payloads have been processed. */
@@ -325,6 +357,7 @@ export class FlingRoom {
 
   async close(): Promise<void> {
     if (this.helloTimer) clearInterval(this.helloTimer);
+    this.earlyChunks.clear();
     if (this.direct) {
       try {
         this.direct.close();

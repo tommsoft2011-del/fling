@@ -151,8 +151,28 @@ export class SendTask {
     return this.phase === 'preparing' || this.phase === 'waiting' || this.phase === 'sending';
   }
 
+  private lastNotify = 0;
+  private notifyTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * UI 刷新节流：分块到来时每块都调 notify 会高频重绘，
+   * 在慢机器上拖慢接收管线。300ms 内合并，尾调用保证最终状态刷出。
+   */
   private notify(): void {
-    this.onChange();
+    const now = Date.now();
+    const elapsed = now - this.lastNotify;
+    if (elapsed >= 300) {
+      this.lastNotify = now;
+      this.onChange();
+      return;
+    }
+    if (!this.notifyTimer) {
+      this.notifyTimer = setTimeout(() => {
+        this.notifyTimer = null;
+        this.lastNotify = Date.now();
+        this.onChange();
+      }, 300 - elapsed);
+    }
   }
 
   private trackSpeed(doneBytes: number): void {
@@ -605,8 +625,28 @@ export class RecvTask {
     return this.phase === 'receiving';
   }
 
+  private lastNotify = 0;
+  private notifyTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * UI 刷新节流：分块到来时每块都调 notify 会高频重绘，
+   * 在慢机器上拖慢接收管线。300ms 内合并，尾调用保证最终状态刷出。
+   */
   private notify(): void {
-    this.onChange();
+    const now = Date.now();
+    const elapsed = now - this.lastNotify;
+    if (elapsed >= 300) {
+      this.lastNotify = now;
+      this.onChange();
+      return;
+    }
+    if (!this.notifyTimer) {
+      this.notifyTimer = setTimeout(() => {
+        this.notifyTimer = null;
+        this.lastNotify = Date.now();
+        this.onChange();
+      }, 300 - elapsed);
+    }
   }
 
   private trackSpeed(): void {
@@ -746,7 +786,7 @@ export class RecvTask {
         const savedPath = (await invoke('save_received_file', {
           dir: this.savedDir,
           name,
-          data_b64: b64encode(bytes),
+          dataB64: b64encode(bytes),
         })) as string;
         log('xfer', 'clipboard image saved', { taskId: this.taskId, name, size: bytes.length, path: savedPath });
         if (bytes.length < HIST_IMAGE_LIMIT) this.clipImages.set(item.uid, bytes);
@@ -754,7 +794,7 @@ export class RecvTask {
         const savedPath = (await invoke('save_received_file', {
           dir: this.savedDir,
           name: m.name,
-          data_b64: b64encode(bytes),
+          dataB64: b64encode(bytes),
         })) as string;
         log('xfer', 'item saved', { taskId: this.taskId, name: m.name, size: bytes.length, path: savedPath });
       }

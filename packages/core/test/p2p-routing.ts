@@ -1,9 +1,11 @@
 // P2P direct-channel routing test (no WebRTC, no network).
 // Two FlingRooms talk through the in-memory mock transport; a fake
 // DirectChannel pair simulates the P2P link. Covers:
-//   - file-chunk goes through the direct channel while open (raw JSON, no relay)
-//   - text / manifest / task-done still use the relay
+//   - file-chunk + file-manifest go through the direct channel while open
+//     (same ordered channel, so chunks can never beat the manifest)
+//   - text / task-done still use the relay
 //   - receiver reassembles a file delivered over the direct channel
+//   - chunks arriving before the manifest are buffered and replayed
 //   - mid-transfer direct failure falls back to the relay transparently
 //   - per-chunk mixed routing (some chunks direct, some relay) reassembles
 
@@ -158,9 +160,32 @@ async function main(): Promise<void> {
       got1.bytes[99999] === (99999 & 0xff),
     'reassembled bytes identical over direct channel',
   );
-  // manifest went via relay (1 publish); chunks did not
+  // manifest + chunks all bypass the relay while direct is open
   const relayDuringDirect = relayPublishesA - relayBefore;
-  check(relayDuringDirect === 1, `chunks bypassed relay (relay publishes: ${relayDuringDirect}, want 1 manifest)`);
+  check(relayDuringDirect === 0, `manifest+chunks bypassed relay (relay publishes: ${relayDuringDirect}, want 0)`);
+
+  // --- 1b. chunks beating the manifest are buffered, not dropped -----------
+  done = freshBox();
+  directA.sent = [];
+  const fileE = fileLike('early.bin', 100_000); // 4 chunks
+  await roomA.sendFile(fileE, undefined, 'file'); // all via direct; captured, not wired
+  const raws = directA.sent.map((d) => JSON.parse(dec.decode(d)) as { kind: string });
+  directA.sent = [];
+  check(raws.filter((m) => m.kind === 'file-chunk').length === 4, 'captured 4 direct chunks');
+  // deliver chunks FIRST, manifest last (simulates the old relay/direct race)
+  const chunksFirst = [
+    ...raws.filter((m) => m.kind === 'file-chunk'),
+    ...raws.filter((m) => m.kind === 'file-manifest'),
+  ];
+  for (const m of chunksFirst) {
+    await (roomB as any).handleDirectData(enc.encode(JSON.stringify(m)), 'A');
+  }
+  await (roomB as any).flush();
+  const gotE = done.cur;
+  check(
+    gotE !== null && gotE.bytes.length === 100_000 && gotE.bytes[99999] === (99999 & 0xff),
+    'early chunks buffered and replayed once the manifest arrived',
+  );
 
   // --- 2. direct dies mid-transfer -> transparent relay fallback ------------
   done = freshBox();
