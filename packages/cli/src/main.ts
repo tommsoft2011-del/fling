@@ -1,28 +1,40 @@
 #!/usr/bin/env bun
-// Fling CLI v1: fling text between devices over LiveKit data channels.
+// Fling CLI v2: transfer tool over LiveKit data channels (fling-v2 protocol).
 //   fling init              set up server URL + API key/secret (you type them yourself)
-//   fling host              show a pairing code and listen; received text -> clipboard
-//   fling join <CODE>       join a room; type lines to send, received text -> clipboard
-//   fling send <CODE> TEXT  one-shot send (or pipe stdin)
+//   fling host              show a pairing code, listen in lobby; offers ask accept/decline
+//   fling join <CODE>       interactive send: each line / file becomes one transfer task
+//   fling send <CODE> TEXT  one-shot text send (or pipe stdin)
 
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { hostname } from 'node:os';
-import { existsSync, writeFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import {
   FlingRoom,
   MAX_TEXT_BYTES,
   generatePairingCode,
+  lobbyNameForCode,
   mintToken,
+  newTaskRoomName,
   normalizeCode,
-  roomNameForCode,
+  randomId,
+  type FileLike,
+  type FileManifest,
+  type OfferMessage,
 } from '@fling/core';
 import { NodeTransport } from '@fling/core/node';
 import { DEFAULT_SERVER_URL, configPath, loadConfig, saveConfig } from './config.js';
 import { writeClipboard } from './clipboard.js';
 
-const VERSION = '0.2.3';
+const VERSION = '0.3.1';
+
+/** v2 key contexts — must match the desktop app. */
+const KEY_CTX_LOBBY = 'fling-v2-lobby';
+const KEY_CTX_ROOM = 'fling-v2-room';
+
+const WAIT_PEER_MS = 120_000;
+const OFFER_REANNOUNCE_MS = 8_000;
 
 function formatBytes(n: number): string {
   return n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
@@ -44,17 +56,35 @@ function uniqueSavePath(dir: string, name: string): string {
   return p;
 }
 
+/** Stable device id, persisted in the config file. */
+function deviceId(): string {
+  const cfg = loadConfig() as unknown as Record<string, unknown>;
+  if (typeof cfg.deviceId === 'string' && cfg.deviceId) return cfg.deviceId;
+  const id = 'cli-' + randomId(8);
+  try {
+    saveConfig({ ...(cfg as object), deviceId: id } as never);
+  } catch {
+    /* best effort */
+  }
+  return id;
+}
+
 function deviceName(): string {
-  const rand = Math.floor(Math.random() * 0xffff).toString(16).padStart(4, '0');
-  return `fling-${hostname()}-${rand}`;
+  return `fling-cli-${hostname()}`;
+}
+
+/** Fresh LiveKit identity per connection so we never kick ourselves. */
+function freshIdentity(): string {
+  return `fling-${randomId(6)}`;
 }
 
 function usage(): never {
-  console.log(`fling v${VERSION} — fling text between your devices
+  console.log(`fling v${VERSION} — fling text & files between your devices
 Usage:
   fling init                    set up config (server URL, API key/secret)
-  fling host                    show pairing code, listen for incoming text
+  fling host                    show pairing code, listen for incoming transfers
   fling join <CODE>             join with a pairing code, interactive send
+                                (type text + Enter; /file <path> to send a file; /quit to exit)
   fling send <CODE> <TEXT...>   send once and exit (or pipe via stdin)
   fling config                  show config file path
   fling --version | -v`);
@@ -92,98 +122,293 @@ async function cmdInit(): Promise<void> {
     console.error('API key and secret are required.');
     process.exit(1);
   }
-  const p = saveConfig(cfg);
+  const p = saveConfig(cfg as never);
   console.log(`\nSaved to ${p}`);
 }
 
-async function connectRoom(code: string): Promise<{ room: FlingRoom; roomName: string }> {
+/** Connect a FlingRoom; waits until the transport is actually up. */
+async function connectRoom(opts: {
+  roomName: string;
+  keyMaterial: string;
+  keyContext: string;
+  events?: Parameters<FlingRoom['connect']>[3];
+}): Promise<FlingRoom> {
   const cfg = loadConfig();
-  const pairingCode = normalizeCode(code);
-  if (!pairingCode) {
-    console.error('Empty pairing code.');
-    process.exit(1);
-  }
-  const roomName = await roomNameForCode(pairingCode);
-  const identity = deviceName();
-  const token = await mintToken(cfg.apiKey, cfg.apiSecret, roomName, identity);
-  const room = new FlingRoom(new NodeTransport(), identity);
-
-  let peerSeen = false;
-  const onPeer = (id: string, joined: boolean) => {
-    if (id === identity) return;
-    if (joined && !peerSeen) {
-      peerSeen = true;
-      console.log(`\n✓ peer joined: ${id}\n`);
-    } else if (!joined) {
-      console.log(`\n- peer left: ${id}\n`);
-    }
-  };
-
-  room.connect(cfg.serverUrl, token, pairingCode, {
-    onText: (text, from) => {
-      console.log(`\n<<< from ${from} (${text.length} chars, copied to clipboard)`);
-      const preview = text.length > 200 ? text.slice(0, 200) + '…' : text;
-      console.log(preview + '\n');
-      writeClipboard(text).catch((e) => console.error('(clipboard write failed: ' + e.message + ')'));
-    },
-    onPeerJoined: (id) => onPeer(id, true),
-    onPeerLeft: (id) => onPeer(id, false),
-    // File transfer lands in CLI v2; for now just acknowledge.
-    onFileManifest: (m, from) =>
-      console.log(`\n<<< receiving "${m.name}" (${formatBytes(m.size)}) from ${from}`),
-    onFileProgress: (_id, received, total) => {
-      const pct = total > 0 ? Math.floor((received / total) * 100) : 100;
-      output.write(`\r    ${pct}% (${formatBytes(received)}/${formatBytes(total)})`);
-    },
-    onFileComplete: (_id, m, bytes) => {
-      const p = uniqueSavePath(process.cwd(), m.name);
-      writeFileSync(p, bytes);
-      output.write('\n');
-      console.log(`<<< saved to ${p} (sha256 verified)`);
-    },
-    onFileError: (id, err) => console.error(`\nfile ${id} error: ${err}`),
-  });
-
-  // Wait until actually connected (or fail fast).
+  const token = await mintToken(cfg.apiKey, cfg.apiSecret, opts.roomName, freshIdentity());
+  const room = new FlingRoom(new NodeTransport(), deviceName());
+  await room.connect(cfg.serverUrl, token, opts.keyMaterial, opts.events ?? {}, opts.keyContext);
   const deadline = Date.now() + 15_000;
   while (!room.isConnected && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 200));
   }
   if (!room.isConnected) {
+    await room.close().catch(() => {});
     console.error('Could not connect to ' + cfg.serverUrl + ' — check server URL and key/secret.');
     process.exit(1);
   }
-  return { room, roomName };
+  return room;
+}
+
+function offerSummary(o: OfferMessage): string {
+  return o.items.map((i) => `${i.kind === 'text' ? '文本' : i.kind === 'clipboard-image' ? '图片' : '文件'} ${i.name} (${formatBytes(i.size)})`).join(', ');
+}
+
+// ---------------------------------------------------------------------------
+// Receiver (host)
+// ---------------------------------------------------------------------------
+
+async function receiveTask(code: string, offer: OfferMessage): Promise<void> {
+  const taskRoom = offer.taskRoom;
+  console.log(`\n⇅ joining task room…`);
+  const textParts: string[] = [];
+  const started = Date.now();
+  let done = false;
+
+  const room = await connectRoom({
+    roomName: taskRoom,
+    keyMaterial: normalizeCode(code),
+    keyContext: KEY_CTX_ROOM,
+    events: {
+      onText: (t) => {
+        textParts.push(t);
+        output.write(`\r…receiving text (${formatBytes(textParts.join('').length)})`);
+      },
+      onFileManifest: (m) => console.log(`\n⇅ receiving "${m.name}" (${formatBytes(m.size)})`),
+      onFileProgress: (_id, r, t) => {
+        const pct = t > 0 ? Math.floor((r / t) * 100) : 100;
+        output.write(`\r  ${pct}% (${formatBytes(r)}/${formatBytes(t)})   `);
+      },
+      onFileComplete: (_id, m: FileManifest, bytes: Uint8Array) => {
+        output.write('\n');
+        const p = uniqueSavePath(process.cwd(), m.name);
+        mkdirSync(dirname(p), { recursive: true });
+        writeFileSync(p, bytes);
+        console.log(`✓ saved "${m.name}" → ${p} (sha256 verified)`);
+        if (m.kind === 'clipboard-image') {
+          console.log('  (image saved to file — no image clipboard on headless Linux)');
+        }
+      },
+      onFileError: (id, err) => console.error(`\n✗ file ${id} error: ${err}`),
+      onTaskDone: (taskId) => {
+        if (taskId === offer.taskId) done = true;
+      },
+      onPeerLeft: () => {
+        if (!done) console.log('\n- peer left before task-done');
+        done = true;
+      },
+    },
+  });
+
+  // Wait for task-done (or peer leave), up to 10 min.
+  const deadline = Date.now() + 600_000;
+  while (!done && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  const text = textParts.join('');
+  if (text) {
+    console.log(`\n<<< text from ${offer.fromDevice} (${text.length} chars):`);
+    console.log(text.length > 500 ? text.slice(0, 500) + '…' : text);
+    try {
+      await writeClipboard(text);
+      console.log('(copied to clipboard)');
+    } catch (e) {
+      console.log('(clipboard unavailable: ' + (e as Error).message + ')');
+    }
+  }
+  console.log(`✓ transfer ${offer.taskId.slice(0, 8)} done in ${Math.round((Date.now() - started) / 1000)}s\n`);
+  await room.close().catch(() => {});
 }
 
 async function cmdHost(): Promise<void> {
   const code = generatePairingCode();
+  const myId = deviceId();
   console.log(`\n  Pairing code:  ${code}\n`);
-  console.log('  On the other device run:  fling join ' + code);
-  console.log('  Waiting for peer… (Ctrl+C to quit)\n');
-  const { room } = await connectRoom(code);
+  console.log('  On the other device: use this code to send (desktop: 用配对码发送)');
+  console.log('  Waiting for offers… (Ctrl+C to quit)\n');
+
+  const pending: OfferMessage[] = [];
+  let busy = false;
+
+  const lobby = await connectRoom({
+    roomName: await lobbyNameForCode(code),
+    keyMaterial: normalizeCode(code),
+    keyContext: KEY_CTX_LOBBY,
+    events: {
+      onOffer: (offer) => {
+        if (offer.fromDeviceId === myId) return; // our own echo
+        pending.push(offer);
+        console.log(`\n⬇ offer from ${offer.fromDevice}: ${offerSummary(offer)}`);
+        void drainQueue();
+      },
+      onOfferWithdraw: (taskId) => {
+        const i = pending.findIndex((o) => o.taskId === taskId);
+        if (i >= 0) {
+          pending.splice(i, 1);
+          console.log(`\n- offer ${taskId.slice(0, 8)} withdrawn by sender`);
+        }
+      },
+    },
+  });
+
+  async function drainQueue(): Promise<void> {
+    if (busy) return;
+    const offer = pending.shift();
+    if (!offer) return;
+    busy = true;
+    const ans = (await prompt(`Accept transfer from ${offer.fromDevice}? [Y/n]`)).toLowerCase();
+    if (ans === 'n' || ans === 'no') {
+      await lobby.sendOfferRejected(offer.taskId).catch(() => {});
+      console.log('declined.');
+    } else {
+      try {
+        await receiveTask(code, offer);
+      } catch (e) {
+        console.error('receive failed: ' + (e as Error).message);
+      }
+    }
+    busy = false;
+    void drainQueue();
+  }
 
   const shutdown = async () => {
     console.log('\nBye.');
-    await room.close();
+    await lobby.close().catch(() => {});
     process.exit(0);
   };
   process.on('SIGINT', () => void shutdown());
   await new Promise(() => {}); // run forever
 }
 
+// ---------------------------------------------------------------------------
+// Sender (join / send)
+// ---------------------------------------------------------------------------
+
+interface SendItem {
+  kind: 'text' | 'file';
+  text?: string;
+  path?: string;
+  name: string;
+  size: number;
+}
+
+function nodeFileLike(path: string): FileLike {
+  const st = statSync(path);
+  return {
+    name: basename(path),
+    size: st.size,
+    slice: async (start: number, end: number) => {
+      const buf = readFileSync(path).subarray(start, end);
+      return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+    },
+  };
+}
+
+/** One send action = one task = one offer + one dedicated task room. */
+async function runSendTask(code: string, items: SendItem[]): Promise<boolean> {
+  const myId = deviceId();
+  const taskId = 'task-' + randomId(8);
+  const taskRoom = newTaskRoomName();
+  let peerJoined = false;
+  let rejected = false;
+
+  // 1. Sender joins the task room first.
+  const room = await connectRoom({
+    roomName: taskRoom,
+    keyMaterial: normalizeCode(code),
+    keyContext: KEY_CTX_ROOM,
+    events: {
+      onPeerJoined: () => {
+        peerJoined = true;
+      },
+    },
+  });
+
+  // 2. Announce the offer in the lobby.
+  const offer: OfferMessage = {
+    kind: 'offer',
+    taskId,
+    fromDevice: deviceName(),
+    fromDeviceId: myId,
+    taskRoom,
+    taskKey: '',
+    items: items.map((i) => ({ name: i.name, size: i.size, kind: i.kind })),
+  };
+  const lobby = await connectRoom({
+    roomName: await lobbyNameForCode(code),
+    keyMaterial: normalizeCode(code),
+    keyContext: KEY_CTX_LOBBY,
+    events: {
+      onOfferRejected: (tid) => {
+        if (tid === taskId) rejected = true;
+      },
+    },
+  });
+  await lobby.sendOffer(offer);
+  console.log(`offer sent, waiting for peer to accept… (${code})`);
+  const announcer = setInterval(() => {
+    if (peerJoined || rejected) return clearInterval(announcer);
+    lobby.sendOffer(offer).catch(() => {});
+  }, OFFER_REANNOUNCE_MS);
+
+  // 3. Wait for the peer to join the task room.
+  const deadline = Date.now() + WAIT_PEER_MS;
+  while (!peerJoined && !rejected && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  clearInterval(announcer);
+  await lobby.close().catch(() => {});
+  if (rejected) {
+    console.log('✗ peer rejected the transfer.');
+    await room.close().catch(() => {});
+    return false;
+  }
+  if (!peerJoined) {
+    console.log('✗ peer did not join in time.');
+    await room.close().catch(() => {});
+    return false;
+  }
+
+  // 4. Send items.
+  for (const item of items) {
+    if (item.kind === 'text') {
+      const text = item.text ?? '';
+      // chunk like the desktop does
+      for (let i = 0; i < text.length; i += 15000) {
+        await room.sendText(text.slice(i, i + 15000));
+      }
+      console.log(`✓ text sent (${text.length} chars)`);
+    } else {
+      const file = nodeFileLike(item.path!);
+      await room.sendFile(file, (sent, total) => {
+        const pct = total > 0 ? Math.floor((sent / total) * 100) : 100;
+        output.write(`\r  ${item.name}: ${pct}% (${formatBytes(sent)}/${formatBytes(total)})   `);
+      }, 'file');
+      output.write('\n');
+      console.log(`✓ file sent: ${item.name}`);
+    }
+  }
+  await room.sendTaskDone(taskId).catch(() => {});
+  await new Promise((r) => setTimeout(r, 1500));
+  await room.close().catch(() => {});
+  return true;
+}
+
 async function cmdJoin(code: string): Promise<void> {
-  console.log(`Joining with code ${normalizeCode(code)}… (type text + Enter to send, /quit to exit)\n`);
-  const { room } = await connectRoom(code);
+  code = normalizeCode(code);
+  if (!code) {
+    console.error('Empty pairing code.');
+    process.exit(1);
+  }
+  console.log(`Fling v2 — code ${code}. Each line is one transfer task (peer accepts each).`);
+  console.log('Type text + Enter to send, /file <path> for a file, /quit to exit.\n');
 
   const rl = createInterface({ input, output, prompt: '> ' });
-  const shutdown = async () => {
+  const shutdown = () => {
     console.log('\nBye.');
     rl.close();
-    await room.close();
     process.exit(0);
   };
-  process.on('SIGINT', () => void shutdown());
+  process.on('SIGINT', shutdown);
 
   rl.prompt();
   for await (const line of rl) {
@@ -193,19 +418,26 @@ async function cmdJoin(code: string): Promise<void> {
       rl.prompt();
       continue;
     }
-    if (Buffer.byteLength(text, 'utf8') > MAX_TEXT_BYTES) {
-      console.error(`Too long (>${MAX_TEXT_BYTES} bytes), not sent.`);
-    } else {
-      try {
-        await room.sendText(text);
-        console.log('(sent)');
-      } catch (e) {
-        console.error('Send failed: ' + (e as Error).message);
+    if (text.startsWith('/file ')) {
+      const p = text.slice(6).trim();
+      if (!existsSync(p) || !statSync(p).isFile()) {
+        console.error('not a file: ' + p);
+        rl.prompt();
+        continue;
       }
+      const st = statSync(p);
+      await runSendTask(code, [{ kind: 'file', path: p, name: basename(p), size: st.size }]);
+    } else {
+      if (Buffer.byteLength(text, 'utf8') > MAX_TEXT_BYTES) {
+        console.error(`Too long (>${MAX_TEXT_BYTES} bytes), not sent.`);
+        rl.prompt();
+        continue;
+      }
+      await runSendTask(code, [{ kind: 'text', text, name: text.slice(0, 24) || '文本', size: Buffer.byteLength(text, 'utf8') }]);
     }
     rl.prompt();
   }
-  await shutdown();
+  shutdown();
 }
 
 async function readStdin(): Promise<string> {
@@ -225,13 +457,10 @@ async function cmdSend(code: string, args: string[]): Promise<void> {
     console.error(`Too long (>${MAX_TEXT_BYTES} bytes).`);
     process.exit(1);
   }
-  const { room } = await connectRoom(code);
-  // Give the peer a moment to be present; send anyway (server holds nothing,
-  // but the peer's hello loop + our re-announce keep discovery live).
-  await new Promise((r) => setTimeout(r, 1500));
-  await room.sendText(text);
-  console.log(`Sent ${text.length} chars.`);
-  await room.close();
+  const ok = await runSendTask(normalizeCode(code), [
+    { kind: 'text', text, name: text.slice(0, 24) || '文本', size: Buffer.byteLength(text, 'utf8') },
+  ]);
+  process.exit(ok ? 0 : 1);
 }
 
 async function main(): Promise<void> {
