@@ -28,6 +28,7 @@ import {
 import { saveHistoryEntry, HIST_IMAGE_LIMIT, settings, type HistoryEntry } from './store.js';
 import { b64encode, toast, uid, utf8bytes } from './ui.js';
 import { P2PLink, type P2PState } from './p2p.js';
+import { log, flushLogs, type LogTag } from './log.js';
 import type { FlingRoom } from '@fling/core';
 
 export type ItemKind = 'text' | 'file' | 'clipboard-image';
@@ -154,6 +155,11 @@ export class SendTask {
     try {
       const taskRoom = newTaskRoomName();
       const taskKey = newTaskKey();
+      log('task', 'send start', {
+        taskId: this.taskId,
+        peer: this.peerLabel,
+        items: this.items.map((i) => ({ kind: i.kind, name: i.name, size: i.size })),
+      });
       const offer: OfferMessage = {
         kind: 'offer',
         taskId: this.taskId,
@@ -177,6 +183,7 @@ export class SendTask {
         onP2PSignal: (sig) => {
           void this.p2pLink?.handleSignal(sig);
         },
+        onLog: (tag, msg) => log(tag as LogTag, `[room] ${msg}`),
       });
       if (this.cancelled) return;
 
@@ -222,6 +229,7 @@ export class SendTask {
         const st = this.items[i];
         st.status = 'active';
         this.notify();
+        log('xfer', 'send item start', { taskId: this.taskId, kind: src.kind, name: st.name, size: st.size });
         try {
           if (src.kind === 'text') {
             await this.sendTextItem(src.text ?? '', st);
@@ -236,9 +244,11 @@ export class SendTask {
           st.status = 'done';
           st.doneBytes = st.totalBytes;
           okCount++;
+          log('xfer', 'send item done', { taskId: this.taskId, name: st.name, size: st.size });
         } catch (e) {
           st.status = 'error';
           st.error = (e as Error).message || '发送失败';
+          log('xfer', 'send item error', { taskId: this.taskId, name: st.name, error: st.error });
         }
         this.notify();
       }
@@ -246,12 +256,21 @@ export class SendTask {
       // 5. 收尾
       try {
         await this.room!.sendTaskDone(this.taskId);
+        log('task', 'task-done sent', { taskId: this.taskId });
       } catch { /* 尽力 */ }
       this.phase = this.cancelled ? 'cancelled' : okCount === this.items.length ? 'done' : 'error';
       if (this.phase === 'error') this.error = '部分项目发送失败';
       this.endedAt = Date.now();
       this.notify();
       this.closeP2P();
+      log('task', 'send end', {
+        taskId: this.taskId,
+        phase: this.phase,
+        ok: `${okCount}/${this.items.length}`,
+        p2p: this.p2p,
+        error: this.error,
+      });
+      void flushLogs();
       void this.archive();
       // 对方收到 task-done 后再关房间，留 2s 宽限
       setTimeout(() => this.closeRooms(), 2000);
@@ -293,6 +312,7 @@ export class SendTask {
   private onPeer(): void {
     if (!this.peerJoined) {
       this.peerJoined = true;
+      log('task', 'peer joined', { taskId: this.taskId });
       this.stopAnnounce();
     }
   }
@@ -556,6 +576,13 @@ export class RecvTask {
   async run(): Promise<void> {
     try {
       this.savedDir = await manager.getDownloadDir();
+      log('task', 'recv start', {
+        taskId: this.taskId,
+        peer: this.peerLabel,
+        via: this.via,
+        savedDir: this.savedDir,
+        items: this.items.map((i) => ({ kind: i.kind, name: i.name, size: i.size })),
+      });
       const spec =
         this.via === 'nearby'
           ? nearbyTaskSpecWithRoom(this.offer.taskRoom, this.offer.taskKey)
@@ -567,6 +594,7 @@ export class RecvTask {
         onFileComplete: (id, m, bytes) => void this.onFileComplete(id, m, bytes),
         onFileError: (id, err) => this.onFileError(id, err),
         onP2PSignal: (sig) => this.onP2PSignal(sig),
+        onLog: (tag, msg) => log(tag as LogTag, `[room] ${msg}`),
         onTaskDone: (taskId) => {
           if (taskId === this.taskId) void this.finish(true);
         },
@@ -620,6 +648,14 @@ export class RecvTask {
     item.status = 'active';
     item.totalBytes = m.size;
     this.manifestToItem.set(m.id, item);
+    log('xfer', 'manifest recv', {
+      taskId: this.taskId,
+      name: m.name,
+      size: m.size,
+      chunks: m.totalChunks,
+      chunkSize: m.chunkSize,
+      kind: m.kind,
+    });
     this.notify();
   }
 
@@ -637,6 +673,7 @@ export class RecvTask {
     if (!item) return;
     item.status = 'error';
     item.error = err;
+    log('xfer', 'item failed', { taskId: this.taskId, name: item.name, error: err });
     this.notify();
   }
 
@@ -648,30 +685,34 @@ export class RecvTask {
         // 剪贴板图片存为 PNG 文件，不直接写入系统剪贴板（避免覆盖用户剪贴板内容）；
         // 用户需要时去历史记录里点"复制到剪贴板"
         const name = /\.png$/i.test(m.name) ? m.name : m.name + '.png';
-        await invoke('save_received_file', {
+        const savedPath = (await invoke('save_received_file', {
           dir: this.savedDir,
           name,
           data_b64: b64encode(bytes),
-        });
+        })) as string;
+        log('xfer', 'clipboard image saved', { taskId: this.taskId, name, size: bytes.length, path: savedPath });
         if (bytes.length < HIST_IMAGE_LIMIT) this.clipImages.set(item.uid, bytes);
       } else {
-        await invoke('save_received_file', {
+        const savedPath = (await invoke('save_received_file', {
           dir: this.savedDir,
           name: m.name,
           data_b64: b64encode(bytes),
-        });
+        })) as string;
+        log('xfer', 'item saved', { taskId: this.taskId, name: m.name, size: bytes.length, path: savedPath });
       }
       item.status = 'done';
       item.doneBytes = item.totalBytes;
     } catch (e) {
       item.status = 'error';
       item.error = (e as Error).message || '保存失败';
+      log('xfer', 'item save failed', { taskId: this.taskId, name: item.name, error: item.error });
     }
     this.notify();
   }
 
   private onPeerLeft(): void {
     if (!this.active || this.finished) return;
+    log('task', 'peer left', { taskId: this.taskId });
     // 发送方发完 task-done 后 2s 关房间；若 4s 内没收到 task-done，视为中断
     clearTimeout(this.peerGoneTimer);
     this.peerGoneTimer = setTimeout(() => {
@@ -727,6 +768,15 @@ export class RecvTask {
     if (failed > 0) this.error = `${failed} 项未完成`;
     this.endedAt = Date.now();
     this.notify();
+    log('task', 'recv end', {
+      taskId: this.taskId,
+      completed,
+      phase: this.phase,
+      failed,
+      p2p: this.p2p,
+      items: this.items.map((i) => ({ kind: i.kind, name: i.name, status: i.status, error: i.error })),
+    });
+    void flushLogs();
     await this.archive();
     const r = this.room;
     this.room = undefined;

@@ -80,7 +80,23 @@ export function initSettingsPage(): void {
   paint();
 
   // ---- 关于 ----
-  $('#aboutLine').textContent = 'Fling v0.3.0 · 端到端加密的多任务传输';
+  invoke('app_version')
+    .then((ver) => {
+      $('#aboutLine').textContent = `Fling v${ver} · 端到端加密的多任务传输`;
+    })
+    .catch(() => {
+      $('#aboutLine').textContent = 'Fling · 端到端加密的多任务传输';
+    });
+
+  // ---- 诊断日志 ----
+  $('#openLogDir').onclick = async () => {
+    try {
+      const dir = (await invoke('get_log_dir')) as string;
+      await invoke('open_folder', { path: dir });
+    } catch (e) {
+      toast('打开失败：' + (e as Error).message, true);
+    }
+  };
 
   // ---- 修改服务器设置 ----
   $('#editServerBtn').onclick = () => {

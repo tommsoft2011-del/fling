@@ -120,11 +120,14 @@ async function main(): Promise<void> {
     return origPublishA(p, topic);
   };
 
-  let completed: { id: string; bytes: Uint8Array } | null = null;
+  function freshBox(): { cur: { id: string; bytes: Uint8Array } | null } {
+    return { cur: null };
+  }
+  let done = freshBox();
   const eventsB: FlingRoomEvents = {
     onFileManifest: () => {},
     onFileComplete: (id, _m, bytes) => {
-      completed = { id, bytes };
+      done.cur = { id, bytes };
     },
   };
   const eventsA: FlingRoomEvents = {};
@@ -140,18 +143,19 @@ async function main(): Promise<void> {
   const file = fileLike('hello.bin', 100_000); // 100KB -> 4 chunks of 32KB
   const p1 = roomA.sendFile(file, undefined, 'file');
   // pump: deliver direct messages as they are produced
-  for (let i = 0; i < 50 && !completed; i++) {
+  for (let i = 0; i < 50 && !done.cur; i++) {
     wire();
     await new Promise((r) => setTimeout(r, 5));
   }
   await p1;
   wire();
   await new Promise((r) => setTimeout(r, 20));
-  check(!!completed, 'file completed over direct channel');
+  check(!!done.cur, 'file completed over direct channel');
+  const got1 = done.cur;
   check(
-    completed !== null &&
-      completed.bytes.length === 100_000 &&
-      completed.bytes[99999] === (99999 & 0xff),
+    got1 !== null &&
+      got1.bytes.length === 100_000 &&
+      got1.bytes[99999] === (99999 & 0xff),
     'reassembled bytes identical over direct channel',
   );
   // manifest went via relay (1 publish); chunks did not
@@ -159,23 +163,24 @@ async function main(): Promise<void> {
   check(relayDuringDirect === 1, `chunks bypassed relay (relay publishes: ${relayDuringDirect}, want 1 manifest)`);
 
   // --- 2. direct dies mid-transfer -> transparent relay fallback ------------
-  completed = null;
+  done = freshBox();
   directA.dead = true; // next send throws -> room must fall back
   roomA.setDirectChannel(directA); // re-attach the (now dead) channel
   const file2 = fileLike('world.bin', 70_000);
   const p2 = roomA.sendFile(file2, undefined, 'file');
-  for (let i = 0; i < 50 && !completed; i++) {
+  for (let i = 0; i < 50 && !done.cur; i++) {
     wire();
     await new Promise((r) => setTimeout(r, 5));
   }
   await p2;
   // relay delivery to B happens via hub automatically (async decrypt)
-  for (let i = 0; i < 50 && !completed; i++) {
+  for (let i = 0; i < 50 && !done.cur; i++) {
     await new Promise((r) => setTimeout(r, 5));
   }
-  check(!!completed, 'file completed after direct failure (relay fallback)');
+  check(!!done.cur, 'file completed after direct failure (relay fallback)');
+  const got2 = done.cur;
   check(
-    completed !== null && completed.bytes.length === 70_000,
+    got2 !== null && got2.bytes.length === 70_000,
     'fallback bytes intact',
   );
   check(!roomA.directActive, 'directActive false after failure');
@@ -184,13 +189,12 @@ async function main(): Promise<void> {
   await roomB.close();
 
   if (failures > 0) {
-    console.error(`\n${failures} FAILURES`);
-    process.exit(1);
+    throw new Error(`${failures} FAILURES`);
   }
   console.log('\nALL PASS');
 }
 
 main().catch((e) => {
   console.error('FATAL', e);
-  process.exit(1);
+  throw e;
 });

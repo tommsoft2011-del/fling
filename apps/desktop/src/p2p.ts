@@ -14,6 +14,7 @@ import {
   type FlingMessage,
   type FlingRoom,
 } from '@fling/core';
+import { log } from './log.js';
 
 export type P2PState = 'idle' | 'connecting' | 'open' | 'failed';
 
@@ -88,6 +89,8 @@ export class P2PLink {
   private remoteSet = false;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private _state: P2PState = 'idle';
+  private iceLocal = 0;
+  private iceRemote = 0;
   onstate: ((s: P2PState) => void) | null = null;
 
   constructor(
@@ -111,10 +114,17 @@ export class P2PLink {
     }
   }
 
-  private fail(): void {
+  private fail(reason: string): void {
     if (this._state === 'failed') return;
     // Whether the handshake never completed or an established channel just
     // dropped: detach the direct path so traffic falls back to the relay.
+    log('p2p', `link failed: ${reason}`, {
+      role: this.role,
+      peer: this.peerLabel,
+      was: this._state,
+      iceLocal: this.iceLocal,
+      iceRemote: this.iceRemote,
+    });
     this.setState('failed');
     try {
       this.room.setDirectChannel(null);
@@ -128,13 +138,18 @@ export class P2PLink {
     if (typeof RTCPeerConnection === 'undefined') return null;
     const pc = new RTCPeerConnection({ iceServers: this.iceServers });
     pc.onicecandidate = (e) => {
+      if (e.candidate) this.iceLocal++;
       const candidate = e.candidate ? JSON.stringify(e.candidate.toJSON()) : null;
       void this.room
         .sendSignal({ kind: 'p2p-ice', candidate } as FlingMessage)
         .catch(() => {});
     };
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'failed') this.fail();
+      log('p2p', `pc connectionState -> ${pc.connectionState}`, {
+        role: this.role,
+        peer: this.peerLabel,
+      });
+      if (pc.connectionState === 'failed') this.fail('pc connection failed');
     };
     return pc;
   }
@@ -145,18 +160,24 @@ export class P2PLink {
         clearTimeout(this.timer);
         this.timer = null;
       }
+      log('p2p', 'direct channel open', {
+        role: this.role,
+        peer: this.peerLabel,
+        iceLocal: this.iceLocal,
+        iceRemote: this.iceRemote,
+      });
       this.setState('open');
       try {
         this.room.setDirectChannel(new RTCDirectChannel(dc, this.peerLabel));
-      } catch {
-        this.fail();
+      } catch (e) {
+        this.fail(`setDirectChannel threw: ${(e as Error).message}`);
       }
     };
     dc.onclose = () => {
-      if (this._state === 'open') this.fail();
+      if (this._state === 'open') this.fail('data channel closed');
     };
     dc.onerror = () => {
-      if (this._state !== 'open') this.fail();
+      if (this._state !== 'open') this.fail('data channel error');
     };
   }
 
@@ -164,7 +185,7 @@ export class P2PLink {
     if (this.timer) clearTimeout(this.timer);
     this.timer = setTimeout(() => {
       this.timer = null;
-      if (this._state !== 'open') this.fail();
+      if (this._state !== 'open') this.fail('connect timeout');
     }, P2P_CONNECT_TIMEOUT_MS);
   }
 
@@ -173,20 +194,22 @@ export class P2PLink {
     if (this.role !== 'initiator' || this.pc) return;
     const pc = this.newPc();
     if (!pc) {
-      this.fail();
+      this.fail('RTCPeerConnection unavailable');
       return;
     }
     this.pc = pc;
     this.setState('connecting');
     this.armTimeout();
+    log('p2p', 'initiator start', { peer: this.peerLabel });
     try {
       const dc = pc.createDataChannel(DC_LABEL, { ordered: true });
       this.wireDataChannel(dc);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+      log('p2p', 'offer sent', { sdpBytes: (offer.sdp ?? '').length });
       await this.room.sendSignal({ kind: 'p2p-offer', sdp: offer.sdp ?? '' });
-    } catch {
-      this.fail();
+    } catch (e) {
+      this.fail(`initiator start threw: ${(e as Error).message}`);
     }
   }
 
@@ -195,22 +218,24 @@ export class P2PLink {
     if (this.role !== 'responder' || this.pc) return;
     const pc = this.newPc();
     if (!pc) {
-      this.fail();
+      this.fail('RTCPeerConnection unavailable');
       return;
     }
     this.pc = pc;
     this.setState('connecting');
     this.armTimeout();
     pc.ondatachannel = (e) => this.wireDataChannel(e.channel);
+    log('p2p', 'responder accept', { peer: this.peerLabel, sdpBytes: sdp.length });
     try {
       await pc.setRemoteDescription({ type: 'offer', sdp });
       this.remoteSet = true;
       await this.flushIce();
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
+      log('p2p', 'answer sent', { sdpBytes: (answer.sdp ?? '').length });
       await this.room.sendSignal({ kind: 'p2p-answer', sdp: answer.sdp ?? '' });
-    } catch {
-      this.fail();
+    } catch (e) {
+      this.fail(`responder accept threw: ${(e as Error).message}`);
     }
   }
 
@@ -220,11 +245,13 @@ export class P2PLink {
     if (!pc) return;
     try {
       if (sig.kind === 'p2p-answer' && this.role === 'initiator') {
+        log('p2p', 'answer received');
         await pc.setRemoteDescription({ type: 'answer', sdp: sig.sdp });
         this.remoteSet = true;
         await this.flushIce();
       } else if (sig.kind === 'p2p-ice') {
         if (!sig.candidate) return; // end-of-candidates
+        this.iceRemote++;
         const init = JSON.parse(sig.candidate) as RTCIceCandidateInit;
         if (this.remoteSet) {
           await pc.addIceCandidate(new RTCIceCandidate(init));

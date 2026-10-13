@@ -10,6 +10,7 @@ import { initSendPage } from './send.js';
 import { initRecvPage, blurRecvPage } from './receive.js';
 import { initHistPage, refreshHistPage } from './history.js';
 import { initSettingsPage } from './settings.js';
+import { log } from './log.js';
 
 type Page = 'send' | 'recv' | 'hist' | 'settings';
 let current: Page = 'send';
@@ -103,6 +104,12 @@ async function startMain(): Promise<void> {
     await manager.init();
   } catch (e) {
     toast('传输服务初始化失败：' + (e as Error).message + '（可先检查服务器配置）', true);
+  }
+  try {
+    const ver = (await invoke('app_version')) as string;
+    log('app', 'fling started', { version: ver, device: getDeviceName() });
+  } catch {
+    /* ignore */
   }
   updateBadges();
   switchPage('send');

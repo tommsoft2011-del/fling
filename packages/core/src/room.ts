@@ -32,6 +32,8 @@ export interface FlingRoomEvents {
   onTaskDone?(taskId: string, from: string): void;
   /** P2P handshake signaling (SDP / ICE), carried over the encrypted relay. */
   onP2PSignal?(sig: Extract<FlingMessage, { kind: `p2p-${string}` }>, from: string): void;
+  /** Optional diagnostics sink (the app wires this to its log file). */
+  onLog?(tag: string, msg: string): void;
 }
 
 const enc = new TextEncoder();
@@ -78,14 +80,20 @@ export class FlingRoom {
     }
     this.direct = ch;
     if (ch) {
+      this.events.onLog?.('p2p', `direct channel attached (${ch.label})`);
       ch.onmessage = (data) => {
         this.handleQueue = this.handleQueue
           .then(() => this.handleDirectData(data, ch.label))
           .catch((e) => console.error('fling: direct payload handling failed:', e));
       };
       ch.onclose = () => {
-        if (this.direct === ch) this.direct = null;
+        if (this.direct === ch) {
+          this.events.onLog?.('p2p', 'direct channel closed by peer');
+          this.direct = null;
+        }
       };
+    } else {
+      this.events.onLog?.('p2p', 'direct channel detached (relay mode)');
     }
   }
 
@@ -187,6 +195,7 @@ export class FlingRoom {
         dc.send(enc.encode(JSON.stringify(msg)));
         return;
       } catch {
+        this.events.onLog?.('p2p', `direct send failed for chunk ${msg.seq}, falling back to relay`);
         this.setDirectChannel(null);
       }
     }

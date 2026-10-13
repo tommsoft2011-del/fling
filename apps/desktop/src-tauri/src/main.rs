@@ -620,6 +620,84 @@ fn open_folder(path: String) -> Result<(), String> {
     Ok(())
 }
 
+// ============================================================= diagnostics ==
+
+/// 应用版本号（供前端展示/日志）。
+#[tauri::command]
+fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// 日志目录：<app_log_dir>/fling
+fn log_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+    let base = app
+        .path()
+        .app_log_dir()
+        .map_err(|e| format!("日志目录不可用: {e}"))?;
+    let dir = base.join("fling");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {e}"))?;
+    Ok(dir)
+}
+
+#[tauri::command]
+fn get_log_dir(app: tauri::AppHandle) -> Result<String, String> {
+    Ok(log_dir(&app)?.to_string_lossy().into_owned())
+}
+
+/// 追加日志行（前端批量调用）。文件名由前端按天生成，
+/// 这里只做严格校验；每次写入后清理，只保留最近 7 天。
+#[tauri::command]
+fn append_log(app: tauri::AppHandle, file: String, lines: Vec<String>) -> Result<(), String> {
+    if file.len() > 32
+        || !file.starts_with("fling-")
+        || !file.ends_with(".log")
+        || !file
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+    {
+        return Err("非法日志文件名".into());
+    }
+    let dir = log_dir(&app)?;
+    let path = dir.join(&file);
+    let mut content = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
+    for l in &lines {
+        // 单行截断，防止异常大行撑爆文件
+        let t = l.chars().take(2000).collect::<String>();
+        content.push_str(&t);
+        content.push('\n');
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("写日志失败: {e}"))?;
+    f.write_all(content.as_bytes())
+        .map_err(|e| format!("写日志失败: {e}"))?;
+
+    // 保留最近 7 个日志文件
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut logs: Vec<_> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("fling-") && n.ends_with(".log"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        logs.sort();
+        if logs.len() > 7 {
+            for old in logs.iter().take(logs.len() - 7) {
+                let _ = std::fs::remove_file(old);
+            }
+        }
+    }
+    Ok(())
+}
+
 // ================================================================== main ==
 
 fn main() {
@@ -658,7 +736,10 @@ fn main() {
             discovery_set_discoverable,
             write_image_clipboard,
             read_file_bytes,
-            open_folder
+            open_folder,
+            app_version,
+            get_log_dir,
+            append_log
         ])
         .run(tauri::generate_context!())
         .expect("error while running fling");
