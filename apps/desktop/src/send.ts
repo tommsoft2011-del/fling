@@ -4,7 +4,8 @@ import { manager, type ComposeItem, type SendTarget } from './tasks.js';
 import { createTaskCard, type CardHandle } from './taskcard.js';
 import { openPairDialog } from './pairdialog.js';
 
-let composeItems: ComposeItem[] = [];
+let clipItems: ComposeItem[] = []; // 输入框里的剪贴板图片（chip）
+let fileItems: ComposeItem[] = []; // 下方文件列表里的文件
 let selectedTarget: SendTarget | null = null;
 const cards = new Map<string, CardHandle>();
 let inited = false;
@@ -16,7 +17,7 @@ export function initSendPage(): void {
   const composeBox = $('#composeBox');
   const textarea = $('#composeText') as HTMLTextAreaElement;
 
-  // --- Ctrl+V 粘贴：文本走 textarea 默认行为；图片/文件拦截成 chip ---
+  // --- Ctrl+V 粘贴：文本走 textarea 默认行为；剪贴板图片进输入框 chip；文件进下方文件列表 ---
   composeBox.addEventListener('paste', (e: ClipboardEvent) => {
     const cd = e.clipboardData;
     if (!cd) return;
@@ -25,10 +26,9 @@ export function initSendPage(): void {
       if (item.kind !== 'file') continue;
       const f = item.getAsFile();
       if (!f) continue;
-      if (item.type.startsWith('image/')) {
-        // Chrome 把截图/网页复制的位图命名为 image.png；资源管理器复制的图片文件带真实文件名
-        if (f.name === 'image.png') addClipItem(f);
-        else addFileItem(f);
+      if (item.type.startsWith('image/') && f.name === 'image.png') {
+        // Chrome 给剪贴板位图默认起名 image.png；资源管理器复制的图片文件带真实文件名，走文件列表
+        addClipItem(f);
       } else {
         addFileItem(f);
       }
@@ -38,11 +38,27 @@ export function initSendPage(): void {
     refreshSendBtn();
   });
 
-  // --- 拖拽文件 ---
-  composeBox.addEventListener('dragover', (e) => e.preventDefault());
-  composeBox.addEventListener('drop', (e) => {
+  // --- 拖拽文件到发送页任意位置 → 文件列表 ---
+  const pageSend = $('#page-send');
+  const fileCard = $('#fileCard');
+  let dragDepth = 0;
+  const hasFiles = (e: DragEvent) =>
+    !!e.dataTransfer && Array.from(e.dataTransfer.types).includes('Files');
+  pageSend.addEventListener('dragenter', (e) => {
+    if (!hasFiles(e as DragEvent)) return;
+    dragDepth++;
+    fileCard.classList.add('dragover');
+  });
+  pageSend.addEventListener('dragleave', () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) fileCard.classList.remove('dragover');
+  });
+  pageSend.addEventListener('dragover', (e) => e.preventDefault());
+  pageSend.addEventListener('drop', (e) => {
     e.preventDefault();
-    const files = e.dataTransfer?.files;
+    dragDepth = 0;
+    fileCard.classList.remove('dragover');
+    const files = (e as DragEvent).dataTransfer?.files;
     if (files) {
       for (const f of Array.from(files)) addFileItem(f);
       refreshSendBtn();
@@ -88,6 +104,7 @@ export function initSendPage(): void {
   });
   renderNearby();
   renderChips();
+  renderFileList();
   refreshSendBtn();
 }
 
@@ -99,18 +116,18 @@ export function setComposeText(text: string): void {
 }
 
 function addFileItem(file: File): void {
-  composeItems.push({
+  fileItems.push({
     uid: uid('c'),
     kind: 'file',
     name: file.name,
     size: file.size,
     blob: file,
   });
-  renderChips();
+  renderFileList();
 }
 
 function addClipItem(blob: Blob): void {
-  composeItems.push({
+  clipItems.push({
     uid: uid('c'),
     kind: 'clipboard-image',
     name: '剪贴板图片',
@@ -121,10 +138,19 @@ function addClipItem(blob: Blob): void {
   renderChips();
 }
 
-function removeComposeItem(uid_: string): void {
-  const i = composeItems.findIndex((c) => c.uid === uid_);
+function removeFileItem(uid_: string): void {
+  const i = fileItems.findIndex((c) => c.uid === uid_);
   if (i >= 0) {
-    const [c] = composeItems.splice(i, 1);
+    fileItems.splice(i, 1);
+    renderFileList();
+    refreshSendBtn();
+  }
+}
+
+function removeComposeItem(uid_: string): void {
+  const i = clipItems.findIndex((c) => c.uid === uid_);
+  if (i >= 0) {
+    const [c] = clipItems.splice(i, 1);
     if (c.previewUrl) URL.revokeObjectURL(c.previewUrl);
     renderChips();
     refreshSendBtn();
@@ -134,9 +160,9 @@ function removeComposeItem(uid_: string): void {
 function renderChips(): void {
   const row = $('#chipRow');
   row.innerHTML = '';
-  for (const c of composeItems) {
-    const chip = el('div', 'chip' + (c.kind === 'clipboard-image' ? ' clip' : ''));
-    if (c.kind === 'clipboard-image' && c.previewUrl) {
+  for (const c of clipItems) {
+    const chip = el('div', 'chip clip');
+    if (c.previewUrl) {
       const img = document.createElement('img');
       img.src = c.previewUrl;
       chip.appendChild(img);
@@ -152,12 +178,35 @@ function renderChips(): void {
     row.appendChild(chip);
   }
   $('#composeHint').textContent =
-    composeItems.length > 0 ? `${composeItems.length} 个附件` : '';
+    clipItems.length > 0 ? `${clipItems.length} 张剪贴板图片` : '';
+}
+
+function renderFileList(): void {
+  const host = $('#fileList');
+  host.innerHTML = '';
+  if (fileItems.length === 0) {
+    host.appendChild(el('div', 'empty', '还没有文件 — 点「添加文件」，或直接把文件拖进来'));
+  } else {
+    for (const c of fileItems) {
+      const row = el('div', 'frow');
+      const nm = el('span', 'fname', c.name);
+      nm.title = c.name;
+      row.append(nm, el('span', 'fsize', fmtSize(c.size)));
+      const x = el('button', 'fx', '✕') as HTMLButtonElement;
+      x.title = '移除';
+      x.onclick = () => removeFileItem(c.uid);
+      row.appendChild(x);
+      host.appendChild(row);
+    }
+  }
+  const total = fileItems.reduce((a, c) => a + c.size, 0);
+  $('#fileCountHint').textContent =
+    fileItems.length > 0 ? `${fileItems.length} 个文件 · 共 ${fmtSize(total)}` : '';
 }
 
 function snapshotItems(): ComposeItem[] {
   const text = ($('#composeText') as HTMLTextAreaElement).value.trim();
-  const items = [...composeItems];
+  const items = [...clipItems, ...fileItems];
   if (text) {
     items.unshift({ uid: uid('t'), kind: 'text', name: '文本', size: utf8bytes(text), text });
   }
@@ -175,10 +224,12 @@ function doSend(items: ComposeItem[], target: SendTarget): void {
     toast('创建任务失败：' + (e as Error).message, true);
   } finally {
     ($('#composeText') as HTMLTextAreaElement).value = '';
-    for (const c of composeItems) if (c.previewUrl) URL.revokeObjectURL(c.previewUrl);
-    composeItems = [];
+    for (const c of clipItems) if (c.previewUrl) URL.revokeObjectURL(c.previewUrl);
+    clipItems = [];
+    fileItems = [];
     if (target.type === 'remote') selectedTarget = null;
     renderChips();
+    renderFileList();
     renderNearby();
     btn.textContent = '发送';
     refreshSendBtn();
@@ -189,7 +240,7 @@ function refreshSendBtn(): void {
   const btn = $('#sendBtn') as HTMLButtonElement;
   if (btn.textContent === '准备中…') return;
   const text = ($('#composeText') as HTMLTextAreaElement).value.trim();
-  const hasContent = text !== '' || composeItems.length > 0;
+  const hasContent = text !== '' || clipItems.length > 0 || fileItems.length > 0;
   btn.disabled = !hasContent || !selectedTarget;
 }
 

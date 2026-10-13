@@ -181,6 +181,23 @@ button { font: inherit; cursor: pointer; }
 .dev .dname { font-weight: 600; }
 .dev .dsub { color: var(--muted); font-size: 12px; margin-left: auto; }
 #sendTasks { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+/* ---------- 待发送文件列表 ---------- */
+#fileList { display: flex; flex-direction: column; gap: 8px; }
+.frow {
+  display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+  border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2);
+}
+.frow .fname {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-weight: 600;
+}
+.frow .fsize { color: var(--muted); font-size: 12px; flex-shrink: 0; }
+.frow .fx {
+  border: none; background: none; color: var(--muted); font-size: 14px;
+  padding: 0 2px; flex-shrink: 0;
+}
+.frow .fx:hover { color: var(--danger); }
+#fileCard.dragover { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
 /* 暂无任务时的占位提示（任务卡出现后自动消失） */
 #sendTasks:empty::after {
   content: '暂无传输任务，发送后这里会显示进度';

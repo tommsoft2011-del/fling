@@ -50,14 +50,21 @@
             <div class="split">
               <div class="split-main">
                 <div class="card">
-                  <div class="card-t">发送内容 <span class="hint">可输入文字，Ctrl+V 粘贴文本 / 图片 / 文件</span></div>
+                  <div class="card-t">发送内容 <span class="hint">可输入文字，Ctrl+V 粘贴文本 / 图片</span></div>
                   <div id="composeBox" tabindex="0">
                     <div id="chipRow"></div>
                     <textarea id="composeText" rows="3" placeholder="输入文字，或 Ctrl+V 粘贴…"></textarea>
                   </div>
                   <div class="compose-actions">
-                    <label class="filebtn">＋ 添加文件<input type="file" id="fileInput" multiple hidden /></label>
                     <span class="hint" id="composeHint"></span>
+                  </div>
+                </div>
+                <div class="card" id="fileCard">
+                  <div class="card-t">待发送文件 <span class="hint" id="fileCountHint"></span></div>
+                  <div id="fileList"><div class="empty">还没有文件 — 点「添加文件」，或直接把文件拖进来</div></div>
+                  <div class="compose-actions" style="margin-top:10px">
+                    <label class="filebtn">＋ 添加文件<input type="file" id="fileInput" multiple hidden /></label>
+                    <span class="hint">支持拖放文件到本页任意位置</span>
                   </div>
                 </div>
                 <div class="card">
