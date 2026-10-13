@@ -26,7 +26,7 @@ import {
   KEY_CTX,
 } from './net.js';
 import { saveHistoryEntry, HIST_IMAGE_LIMIT, settings, type HistoryEntry } from './store.js';
-import { b64encode, toast, uid, utf8bytes } from './ui.js';
+import { b64encode, b64decode, toast, uid, utf8bytes } from './ui.js';
 import { P2PLink, type P2PState } from './p2p.js';
 import { log, flushLogs, type LogTag } from './log.js';
 import type { FlingRoom } from '@fling/core';
@@ -58,6 +58,10 @@ export interface ComposeItem {
   blob?: Blob;
   text?: string;
   previewUrl?: string;
+  /** 文件夹发送时的相对路径，如 "docs/report.pdf" */
+  relPath?: string;
+  /** Tauri 下文件的绝对路径（懒加载：发送时才读文件内容，避免大文件夹提前占内存） */
+  filePath?: string;
 }
 
 export type SendTarget =
@@ -89,6 +93,7 @@ function toOfferItem(c: ComposeItem): OfferItem {
     name: c.kind === 'text' ? (c.text ?? '').slice(0, 24) || '文本' : c.name,
     size: c.size,
     kind: c.kind,
+    path: c.relPath,
   };
 }
 
@@ -136,7 +141,7 @@ export class SendTask {
     this.items = source.map((c) => ({
       uid: c.uid,
       kind: c.kind,
-      name: c.kind === 'text' ? (c.text ?? '').slice(0, 24) || '文本' : c.name,
+      name: c.kind === 'text' ? (c.text ?? '').slice(0, 24) || '文本' : (c.relPath ?? c.name),
       size: c.size,
       status: 'waiting',
       doneBytes: 0,
@@ -304,8 +309,14 @@ export class SendTask {
           if (src.kind === 'text') {
             await this.sendTextItem(src.text ?? '', st);
           } else {
-            const blob = src.blob!;
-            await this.room!.sendFile(wrapWebFile(blob, src.name), (sent) => {
+            // 文件夹/大文件可能是懒加载：发送时才从磁盘读
+            let blob = src.blob;
+            if (!blob && src.filePath) {
+              const b64 = (await invoke('read_file_bytes', { path: src.filePath })) as string;
+              blob = new Blob([b64decode(b64) as BlobPart]);
+            }
+            if (!blob) throw new Error('文件内容不可用');
+            await this.room!.sendFile(wrapWebFile(blob, src.name, src.relPath), (sent) => {
               st.doneBytes = sent;
               this.trackSpeed(this.doneBytes);
               this.notify();
@@ -842,6 +853,7 @@ export class RecvTask {
           dir: this.savedDir,
           name,
           dataB64: b64encode(bytes),
+          relPath: null,
         })) as string;
         log('xfer', 'clipboard image saved', { taskId: this.taskId, name, size: bytes.length, path: savedPath });
         item.savedPath = savedPath;
@@ -851,6 +863,7 @@ export class RecvTask {
           dir: this.savedDir,
           name: m.name,
           dataB64: b64encode(bytes),
+          relPath: m.path ?? null,
         })) as string;
         log('xfer', 'item saved', { taskId: this.taskId, name: m.name, size: bytes.length, path: savedPath });
         item.savedPath = savedPath;

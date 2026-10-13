@@ -1,6 +1,7 @@
 // 发送页：原生工作台 — 内容区 + 设备选择 + 底部发送栏 + 任务抽屉
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { $, el, fmtSize, toast, uid, utf8bytes } from './ui.js';
 import { manager, type ComposeItem, type SendTarget } from './tasks.js';
 import { createTaskRow, type CardHandle } from './taskcard.js';
@@ -69,31 +70,50 @@ export function initSendPage(): void {
     setDropHint(false);
     const files = (e as DragEvent).dataTransfer?.files;
     if (files) {
-      for (const f of Array.from(files)) addFileItem(f);
+      addFileItems(Array.from(files));
       refreshSendBtn();
     }
   });
 
   // --- Tauri 原生拖放事件：wry 会在 OS 层拦截文件拖放（此时 DOM drop 收不到文件），
   // 用 tauri://drag-drop 兜底，经 Rust 命令读文件内容（不受 fs scope 限制）---
+  // 悬停反馈：同样原因 DOM dragenter 可能收不到，用 tauri://drag-enter/leave 显示"可松开"提示
+  const showDropHint = (count?: number) => {
+    const box = dropOverlay.querySelector('.box');
+    if (box) {
+      box.innerHTML = '';
+      box.append(
+        document.createTextNode(count ? `松开鼠标添加 ${count} 个文件` : '松开鼠标添加文件'),
+        (() => { const s = el('span', 'sub', '文件将加入本次发送内容'); return s; })(),
+      );
+    }
+    setDropHint(true);
+  };
+  listen<{ paths?: string[] }>('tauri://drag-enter', (e) => {
+    if (!$('#page-send').classList.contains('active')) return;
+    showDropHint(e.payload?.paths?.length);
+  }).catch(() => { /* 非 Tauri 环境忽略 */ });
+  listen('tauri://drag-leave', () => setDropHint(false)).catch(() => { /* 非 Tauri 环境忽略 */ });
   listen<unknown>('tauri://drag-drop', async (e) => {
     if (!$('#page-send').classList.contains('active')) return;
     // 兼容不同版本 payload：{ paths: string[] } 或直接 string[]
     const pl = e.payload as { paths?: string[] } | string[];
     const paths = Array.isArray(pl) ? pl : (pl.paths ?? []);
     if (paths.length === 0) return;
-    let added = 0;
+    const batch: File[] = [];
     for (const p of paths) {
       try {
         const b64 = (await invoke('read_file_bytes', { path: p })) as string;
         const bin = b64ToBytes(b64);
         const name = p.split(/[/\\]/).pop() || '文件';
-        addFileItem(new File([bin as unknown as BlobPart], name));
-        added++;
+        batch.push(new File([bin as unknown as BlobPart], name));
       } catch (err) {
         toast(`读取拖放文件失败：${err}`, true);
       }
     }
+    const before = fileItems.length;
+    addFileItems(batch);
+    const added = fileItems.length - before;
     if (added > 0) toast(`已添加 ${added} 个文件`);
     refreshSendBtn();
   }).catch(() => { /* 非 Tauri 环境忽略 */ });
@@ -101,7 +121,32 @@ export function initSendPage(): void {
   ($('#fileInput') as HTMLInputElement).addEventListener('change', (e) => {
     const files = (e.target as HTMLInputElement).files;
     if (files) {
-      for (const f of Array.from(files)) addFileItem(f);
+      addFileItems(Array.from(files));
+      (e.target as HTMLInputElement).value = '';
+      refreshSendBtn();
+    }
+  });
+
+  // --- 添加文件夹：Tauri 用系统对话框多选；纯浏览器用 webkitdirectory 兜底 ---
+  $('#addFolderBtn').onclick = () => {
+    if (isTauri) {
+      pickFoldersTauri().catch((err) => toast(`选择文件夹失败：${err}`, true));
+    } else {
+      ($('#folderInput') as HTMLInputElement).click();
+    }
+  };
+  ($('#folderInput') as HTMLInputElement).addEventListener('change', (e) => {
+    const files = (e.target as HTMLInputElement).files;
+    if (files) {
+      let added = 0;
+      let skipped = 0;
+      for (const f of Array.from(files)) {
+        const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
+        if (addFolderFileItem(f.name, rel, f.size, undefined, f)) added++;
+        else skipped++;
+      }
+      if (added > 0) toast(`已添加 ${added} 个文件`);
+      if (skipped > 0) toast(`已跳过 ${skipped} 个重复文件`);
       (e.target as HTMLInputElement).value = '';
       refreshSendBtn();
     }
@@ -163,16 +208,10 @@ function b64ToBytes(b64: string): Uint8Array {
   return out;
 }
 
-/** 防重复：DOM drop 和 tauri://drag-drop 可能对同一次拖放各触发一次 */
-let lastAddKey = '';
-let lastAddAt = 0;
-
-function addFileItem(file: File): void {
-  const key = `${file.name}\n${file.size}`;
-  const now = Date.now();
-  if (key === lastAddKey && now - lastAddAt < 3000) return;
-  lastAddKey = key;
-  lastAddAt = now;
+/** 防重复：同名同大小的文件已在列表中则跳过（DOM drop 和 tauri://drag-drop 可能对同一次拖放各触发一次；用户也可能重复选择同一文件） */
+function addFileItem(file: File): boolean {
+  const dup = fileItems.some((c) => (c.relPath ?? c.name) === file.name && c.size === file.size);
+  if (dup) return false;
   fileItems.push({
     uid: uid('c'),
     kind: 'file',
@@ -181,6 +220,63 @@ function addFileItem(file: File): void {
     blob: file,
   });
   renderFileList();
+  refreshSendBtn();
+  return true;
+}
+
+/** 批量添加，跳过重复并提示 */
+function addFileItems(files: File[]): void {
+  let skipped = 0;
+  for (const f of files) {
+    if (!addFileItem(f)) skipped++;
+  }
+  if (skipped > 0) toast(`已跳过 ${skipped} 个重复文件`);
+}
+
+/** 添加文件夹中的单个文件（relPath 如 "docs/report.pdf"） */
+function addFolderFileItem(
+  name: string,
+  relPath: string,
+  size: number,
+  filePath?: string,
+  blob?: Blob,
+): boolean {
+  const dup = fileItems.some((c) => (c.relPath ?? c.name) === relPath && c.size === size);
+  if (dup) return false;
+  fileItems.push({ uid: uid('c'), kind: 'file', name, size, blob, relPath, filePath });
+  renderFileList();
+  refreshSendBtn();
+  return true;
+}
+
+const isTauri = typeof window !== 'undefined' && !!(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+
+/** Tauri：系统对话框选文件夹 → Rust 递归列文件（懒加载内容，发送时才读） */
+async function pickFoldersTauri(): Promise<void> {
+  const picked = await openDialog({ directory: true, multiple: true, title: '选择要发送的文件夹' });
+  if (!picked) return;
+  const dirs = Array.isArray(picked) ? picked : [picked];
+  let added = 0;
+  let skipped = 0;
+  for (const dir of dirs) {
+    const base = dir.split(/[/\\]/).filter(Boolean).pop() || '文件夹';
+    let entries: { rel_path: string; size: number }[];
+    try {
+      entries = (await invoke('list_dir_recursive', { dir })) as { rel_path: string; size: number }[];
+    } catch (err) {
+      toast(`读取文件夹失败：${err}`, true);
+      continue;
+    }
+    for (const e of entries) {
+      const relPath = `${base}/${e.rel_path}`;
+      const filePath = dir.replace(/[/\\]$/, '') + '/' + e.rel_path;
+      const name = e.rel_path.split('/').pop() || e.rel_path;
+      if (addFolderFileItem(name, relPath, e.size, filePath)) added++;
+      else skipped++;
+    }
+  }
+  if (added > 0) toast(`已添加 ${added} 个文件`);
+  if (skipped > 0) toast(`已跳过 ${skipped} 个重复文件`);
   refreshSendBtn();
 }
 
@@ -249,9 +345,11 @@ function renderFileList(): void {
   } else {
     for (const c of fileItems) {
       const row = el('div', 'frow');
-      const nm = el('span', 'fname', c.name);
-      nm.title = c.name;
-      row.append(nm, el('span', 'fsize', fmtSize(c.size)));
+      const label = c.relPath ?? c.name;
+      const icon = el('span', 'fic', c.relPath ? '\u{1F4C1}' : '\u{1F4C4}');
+      const nm = el('span', 'fname', label);
+      nm.title = label;
+      row.append(icon, nm, el('span', 'fsize', fmtSize(c.size)));
       const x = el('button', 'fx', '✕') as HTMLButtonElement;
       x.title = '移除';
       x.onclick = () => removeFileItem(c.uid);

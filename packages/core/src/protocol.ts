@@ -36,12 +36,16 @@ export interface FileManifest {
   totalChunks: number;
   /** 'file' -> save to disk; 'clipboard-image' -> copy into clipboard */
   kind: FileKind;
+  /** 文件夹发送时的相对路径，如 "docs/report.pdf"；普通文件为空 */
+  path?: string;
 }
 
 export interface OfferItem {
   name: string;
   size: number;
   kind: 'text' | 'file' | 'clipboard-image';
+  /** 文件夹发送时的相对路径，如 "docs/report.pdf"；普通文件为空 */
+  path?: string;
 }
 
 /**

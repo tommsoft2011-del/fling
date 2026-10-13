@@ -12,14 +12,17 @@ export interface FileLike {
   readonly name: string;
   readonly size: number;
   slice(start: number, end: number): Promise<Uint8Array>;
+  /** 文件夹发送时的相对路径，如 "docs/report.pdf"；普通文件为空 */
+  readonly path?: string;
 }
 
 /** Wrap a browser File/Blob. */
-export function wrapWebFile(f: Blob & { name?: string }, name?: string): FileLike {
+export function wrapWebFile(f: Blob & { name?: string }, name?: string, path?: string): FileLike {
   return {
     name: name ?? f.name ?? 'file',
     size: f.size,
     slice: async (s, e) => new Uint8Array(await f.slice(s, e).arrayBuffer()),
+    path,
   };
 }
 
@@ -58,6 +61,7 @@ export async function buildManifest(file: FileLike, kind: FileKind = 'file'): Pr
     chunkSize,
     totalChunks: Math.max(1, Math.ceil(file.size / chunkSize)),
     kind,
+    path: file.path,
   };
 }
 

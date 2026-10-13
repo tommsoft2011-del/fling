@@ -251,8 +251,15 @@ fn write_binary_file(path: String, data_b64: String) -> Result<(), String> {
 
 /// Save a received file into `dir`: sanitizes the name, never overwrites
 /// (appends " (1)", " (2)", … on collision), returns the final path.
+/// `rel_path`: 文件夹发送时的相对路径（如 "docs/report.pdf"），按此重建子目录；
+/// 为空时保持旧行为（直接存 dir 下）。
 #[tauri::command]
-fn save_received_file(dir: String, name: String, data_b64: String) -> Result<String, String> {
+fn save_received_file(
+    dir: String,
+    name: String,
+    data_b64: String,
+    rel_path: Option<String>,
+) -> Result<String, String> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&data_b64)
@@ -270,10 +277,37 @@ fn save_received_file(dir: String, name: String, data_b64: String) -> Result<Str
     let clean = clean.trim();
     let clean = if clean.is_empty() { "file".to_string() } else { clean.to_string() };
 
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
-
     let dir_path = std::path::PathBuf::from(&dir);
-    let mut candidate = dir_path.join(&clean);
+    // 相对路径：逐段清洗，拒绝 ".." 与绝对路径，防止目录穿越
+    let target_dir = match rel_path.as_deref() {
+        Some(rel) if !rel.trim().is_empty() => {
+            let mut sub = std::path::PathBuf::new();
+            for comp in rel.replace('\\', "/").split('/') {
+                let c = comp.trim();
+                if c.is_empty() || c == "." || c == ".." {
+                    continue;
+                }
+                let safe: String = c
+                    .chars()
+                    .filter(|ch| !matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+                    .collect();
+                let safe = safe.trim();
+                if !safe.is_empty() {
+                    sub.push(safe);
+                }
+            }
+            sub.pop(); // 去掉最后一段（文件名用 clean），剩下的是子目录
+            let d = dir_path.join(&sub);
+            std::fs::create_dir_all(&d).map_err(|e| format!("创建目录失败: {e}"))?;
+            d
+        }
+        _ => {
+            std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+            dir_path
+        }
+    };
+
+    let mut candidate = target_dir.join(&clean);
     if candidate.exists() {
         let (stem, ext) = match clean.rfind('.') {
             Some(i) if i > 0 => (clean[..i].to_string(), clean[i..].to_string()),
@@ -281,7 +315,7 @@ fn save_received_file(dir: String, name: String, data_b64: String) -> Result<Str
         };
         let mut i = 1u32;
         loop {
-            candidate = dir_path.join(format!("{stem} ({i}){ext}"));
+            candidate = target_dir.join(format!("{stem} ({i}){ext}"));
             if !candidate.exists() || i >= 9999 {
                 break;
             }
@@ -608,6 +642,45 @@ fn read_file_bytes(path: String) -> Result<String, String> {
     Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
 }
 
+/// 递归列出目录下所有文件：返回 [{ rel_path, size }]，rel_path 用 "/" 分隔、
+/// 相对于 dir。供"添加文件夹"发送用（发送时再按需读文件内容）。
+#[tauri::command]
+fn list_dir_recursive(dir: String) -> Result<Vec<serde_json::Value>, String> {
+    fn walk(
+        base: &std::path::Path,
+        cur: &std::path::Path,
+        out: &mut Vec<serde_json::Value>,
+    ) -> Result<(), String> {
+        let rd = std::fs::read_dir(cur).map_err(|e| format!("读取目录失败: {e}"))?;
+        for ent in rd {
+            let ent = ent.map_err(|e| format!("读取目录项失败: {e}"))?;
+            let path = ent.path();
+            if path.is_dir() {
+                if path.is_symlink() {
+                    continue; // 跳过符号链接目录，避免循环
+                }
+                walk(base, &path, out)?;
+            } else if path.is_file() {
+                let rel = path
+                    .strip_prefix(base)
+                    .map_err(|e| format!("路径处理失败: {e}"))?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let size = ent.metadata().map(|m| m.len()).unwrap_or(0);
+                out.push(serde_json::json!({ "rel_path": rel, "size": size }));
+            }
+        }
+        Ok(())
+    }
+    let base = std::path::PathBuf::from(&dir);
+    if !base.is_dir() {
+        return Err("不是有效目录".to_string());
+    }
+    let mut out = Vec::new();
+    walk(&base, &base, &mut out)?;
+    Ok(out)
+}
+
 #[tauri::command]
 fn write_image_clipboard(data_b64: String) -> Result<(), String> {
     use base64::Engine;
@@ -756,6 +829,7 @@ fn main() {
             discovery_set_discoverable,
             write_image_clipboard,
             read_file_bytes,
+            list_dir_recursive,
             open_folder,
             app_version,
             get_log_dir,

@@ -391,8 +391,8 @@ button { font: inherit; cursor: pointer; }
 .trow.fading { opacity: 0; }
 .trow .tdir { color: var(--accent); font-weight: 700; flex-shrink: 0; }
 .trow .tpeer { font-weight: 600; flex-shrink: 0; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.trow .tsum { color: var(--muted); flex-shrink: 0; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.trow .pbar { flex: 1; margin-top: 0; }
+.trow .tsum { color: var(--muted); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trow .pbar { flex: none; width: clamp(160px, 28%, 320px); margin-top: 0; }
 .trow .tpct { flex-shrink: 0; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 110px; text-align: right; }
 .trow .tpct.ok { color: var(--accent); font-weight: 600; }
 .trow .tpct.bad { color: var(--danger); }
@@ -465,4 +465,33 @@ button { font: inherit; cursor: pointer; }
 .waitanim .wt { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
 @media (prefers-reduced-motion: reduce) {
   .waitanim .rings span { animation: none; opacity: .25; }
+}
+
+/* ================= v0.5.13 美化 ================= */
+/* 设备磁贴图标：柔和圆底 */
+.devtile .pic {
+  width: 52px; height: 52px; border-radius: 50%;
+  background: var(--surface-2); border: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 24px; line-height: 1;
+}
+.devtile.selected .pic { background: var(--accent-soft); border-color: var(--accent); }
+.devtile .dname { margin-top: 8px; }
+/* 添加文件/文件夹按钮：实底小按钮，替代虚线框 */
+.filebtn {
+  color: var(--text); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 7px;
+  font-size: 13px; padding: 7px 14px; cursor: pointer;
+  display: inline-flex; align-items: center;
+}
+.filebtn:hover { border-color: var(--accent); color: var(--accent); }
+label.filebtn { cursor: pointer; }
+/* 文件列表图标 */
+.frow .fic { flex-shrink: 0; font-size: 15px; }
+/* 任务行：hover 反馈 */
+.trow:hover { border-color: var(--accent); }
+.trow .tpct { font-variant-numeric: tabular-nums; }
+/* 输入框聚焦微光 */
+#composeBox:focus-within, .devtile.pair input:focus, .codeinput:focus {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent);
 }
