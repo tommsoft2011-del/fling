@@ -12,7 +12,7 @@ export const PROTOCOL_VERSION = 2;
 export const MAX_TEXT_BYTES = 60 * 1024;
 
 /** Raw chunk size for file transfer; base64 + encryption overhead still fits. */
-export const FILE_CHUNK_SIZE = 32 * 1024;
+export const FILE_CHUNK_SIZE = 256 * 1024;
 
 /** What the bytes of a transferred item mean to the receiver. */
 export type FileKind = 'file' | 'clipboard-image';

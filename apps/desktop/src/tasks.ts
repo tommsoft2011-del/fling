@@ -560,6 +560,10 @@ export class RecvTask {
     if (this.textItem.doneBytes > this.textItem.totalBytes) {
       this.textItem.totalBytes = this.textItem.doneBytes;
     }
+    // 文本收齐就打 ✓（不用等整个任务结束；写剪贴板仍在 finish 里统一做）
+    if (this.textItem.doneBytes >= this.textItem.totalBytes) {
+      this.textItem.status = 'done';
+    }
     this.trackSpeed();
     this.notify();
   }
@@ -604,9 +608,15 @@ export class RecvTask {
     if (!item) return;
     try {
       if (m.kind === 'clipboard-image') {
-        await invoke('write_image_clipboard', { data_b64: b64encode(bytes) });
-        this.clipImages.set(item.uid, bytes);
-        toast('图片已复制到剪贴板');
+        // 剪贴板图片存为 PNG 文件，不直接写入系统剪贴板（避免覆盖用户剪贴板内容）；
+        // 用户需要时去历史记录里点"复制到剪贴板"
+        const name = /\.png$/i.test(m.name) ? m.name : m.name + '.png';
+        await invoke('save_received_file', {
+          dir: this.savedDir,
+          name,
+          data_b64: b64encode(bytes),
+        });
+        if (bytes.length < HIST_IMAGE_LIMIT) this.clipImages.set(item.uid, bytes);
       } else {
         await invoke('save_received_file', {
           dir: this.savedDir,
@@ -719,12 +729,32 @@ class TransferManager {
   private inboxRoom?: FlingRoom;
   private lobbies = new Map<string, { room: FlingRoom; refs: number }>();
   private downloadDir = '';
+  /**
+   * 高频进度回调（每分块一次）会触发全量 UI 重渲染；在慢机器上不加节流会
+   * 拖垮事件循环，进而拖垮传输。这里把渲染上限压到 4 次/秒（首尾都触发）。
+   */
+  private notifyTimer?: ReturnType<typeof setTimeout>;
+  private notifyQueued = false;
 
   onChange(fn: ChangeFn): () => void {
     this.listeners.add(fn);
     return () => this.listeners.delete(fn);
   }
   notify(): void {
+    if (this.notifyTimer) {
+      this.notifyQueued = true;
+      return;
+    }
+    this.emitNotify();
+    this.notifyTimer = setTimeout(() => {
+      this.notifyTimer = undefined;
+      if (this.notifyQueued) {
+        this.notifyQueued = false;
+        this.emitNotify();
+      }
+    }, 250);
+  }
+  private emitNotify(): void {
     for (const fn of this.listeners) {
       try {
         fn();

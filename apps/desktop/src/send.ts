@@ -1,4 +1,6 @@
 // 发送页：统一发送框 + 目标选择 + 进行中的发送
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { $, el, fmtSize, toast, uid, utf8bytes } from './ui.js';
 import { manager, type ComposeItem, type SendTarget } from './tasks.js';
 import { createTaskCard, type CardHandle } from './taskcard.js';
@@ -65,6 +67,23 @@ export function initSendPage(): void {
     }
   });
 
+  // --- Tauri 原生拖放事件：wry 会在 OS 层拦截文件拖放（此时 DOM drop 收不到文件），
+  // 用 tauri://drag-drop 兜底，经 Rust 命令读文件内容（不受 fs scope 限制）---
+  listen<{ paths: string[] }>('tauri://drag-drop', async (e) => {
+    if (!$('#page-send').classList.contains('active')) return;
+    for (const p of e.payload.paths) {
+      try {
+        const b64 = (await invoke('read_file_bytes', { path: p })) as string;
+        const bin = b64ToBytes(b64);
+        const name = p.split(/[/\\]/).pop() || '文件';
+        addFileItem(new File([bin as unknown as BlobPart], name));
+      } catch (err) {
+        toast(`读取拖放文件失败：${err}`, true);
+      }
+    }
+    refreshSendBtn();
+  }).catch(() => { /* 非 Tauri 环境忽略 */ });
+
   ($('#fileInput') as HTMLInputElement).addEventListener('change', (e) => {
     const files = (e.target as HTMLInputElement).files;
     if (files) {
@@ -115,7 +134,24 @@ export function setComposeText(text: string): void {
   $('#composeText').focus();
 }
 
+/** base64 → Uint8Array（分段解码，避免大文件栈溢出） */
+function b64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/** 防重复：DOM drop 和 tauri://drag-drop 可能对同一次拖放各触发一次 */
+let lastAddKey = '';
+let lastAddAt = 0;
+
 function addFileItem(file: File): void {
+  const key = `${file.name}\n${file.size}`;
+  const now = Date.now();
+  if (key === lastAddKey && now - lastAddAt < 3000) return;
+  lastAddKey = key;
+  lastAddAt = now;
   fileItems.push({
     uid: uid('c'),
     kind: 'file',

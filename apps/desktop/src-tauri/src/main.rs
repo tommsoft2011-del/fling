@@ -575,6 +575,19 @@ fn discovery_set_discoverable(app: tauri::AppHandle, on: bool) -> Result<(), Str
 
 /// Write a base64-encoded PNG to the system clipboard as an image
 /// (used for received clipboard-images; they must NOT become files).
+/// 读取拖放进来的文件内容（base64）。走 Rust 命令而不是 fs 插件，
+/// 避免 fs scope 挡住用户文件目录的任意路径。
+#[tauri::command]
+fn read_file_bytes(path: String) -> Result<String, String> {
+    use base64::Engine;
+    let meta = std::fs::metadata(&path).map_err(|e| format!("读取文件失败: {e}"))?;
+    if !meta.is_file() {
+        return Err("仅支持拖入文件，暂不支持文件夹".into());
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("读取文件失败: {e}"))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+}
+
 #[tauri::command]
 fn write_image_clipboard(data_b64: String) -> Result<(), String> {
     use base64::Engine;
@@ -644,6 +657,7 @@ fn main() {
             discovery_set_browsing,
             discovery_set_discoverable,
             write_image_clipboard,
+            read_file_bytes,
             open_folder
         ])
         .run(tauri::generate_context!())
