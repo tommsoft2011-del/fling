@@ -209,7 +209,10 @@ export class FlingRoom {
     // Everything else (signaling, small messages) uses the relay.
     // A failing direct channel falls back to the relay for this chunk.
     const dc = this.direct;
-    if ((msg.kind === 'file-chunk' || msg.kind === 'file-manifest') && dc && dc.readyState === 'open') {
+    // file-chunk / file-manifest / task-progress 走直连：进度上报虽小，
+    // 但走慢速中继会滞后数秒，发送端看到的"对方已接收"永远是旧数字。
+    const directKinds = msg.kind === 'file-chunk' || msg.kind === 'file-manifest' || msg.kind === 'task-progress';
+    if (directKinds && dc && dc.readyState === 'open') {
       try {
         if (dc.bufferedAmount > P2P_DRAIN_THRESHOLD) {
           await dc.waitForDrain(P2P_DRAIN_THRESHOLD);

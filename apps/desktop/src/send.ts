@@ -69,18 +69,25 @@ export function initSendPage(): void {
 
   // --- Tauri 原生拖放事件：wry 会在 OS 层拦截文件拖放（此时 DOM drop 收不到文件），
   // 用 tauri://drag-drop 兜底，经 Rust 命令读文件内容（不受 fs scope 限制）---
-  listen<{ paths: string[] }>('tauri://drag-drop', async (e) => {
+  listen<unknown>('tauri://drag-drop', async (e) => {
     if (!$('#page-send').classList.contains('active')) return;
-    for (const p of e.payload.paths) {
+    // 兼容不同版本 payload：{ paths: string[] } 或直接 string[]
+    const pl = e.payload as { paths?: string[] } | string[];
+    const paths = Array.isArray(pl) ? pl : (pl.paths ?? []);
+    if (paths.length === 0) return;
+    let added = 0;
+    for (const p of paths) {
       try {
         const b64 = (await invoke('read_file_bytes', { path: p })) as string;
         const bin = b64ToBytes(b64);
         const name = p.split(/[/\\]/).pop() || '文件';
         addFileItem(new File([bin as unknown as BlobPart], name));
+        added++;
       } catch (err) {
         toast(`读取拖放文件失败：${err}`, true);
       }
     }
+    if (added > 0) toast(`已添加 ${added} 个文件`);
     refreshSendBtn();
   }).catch(() => { /* 非 Tauri 环境忽略 */ });
 

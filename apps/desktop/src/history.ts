@@ -207,7 +207,7 @@ async function copyItem(it: HistoryItem): Promise<void> {
     if (it.kind === 'text') {
       await writeClipboardText(it.text ?? '');
     } else if (it.kind === 'clipboard-image' && it.imageB64) {
-      await invoke('write_image_clipboard', { data_b64: it.imageB64 });
+      await invoke('write_image_clipboard', { dataB64: it.imageB64 });
     } else {
       return;
     }
