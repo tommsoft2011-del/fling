@@ -6,4 +6,5 @@ export * from './protocol.js';
 export * from './files.js';
 export * from './transport.js';
 export * from './token.js';
+export * from './p2p.js';
 export * from './room.js';

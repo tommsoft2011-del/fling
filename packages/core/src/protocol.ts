@@ -75,7 +75,12 @@ export type FlingMessage =
   | OfferMessage
   | { kind: 'offer-withdraw'; taskId: string }
   | { kind: 'offer-rejected'; taskId: string }
-  | { kind: 'task-done'; taskId: string };
+  | { kind: 'task-done'; taskId: string }
+  // P2P 直连信令：经 LiveKit 中继通道（端到端加密）交换 SDP / ICE，
+  // 文件数据本身走直连的 RTCDataChannel，不经过 LiveKit SFU。
+  | { kind: 'p2p-offer'; sdp: string }
+  | { kind: 'p2p-answer'; sdp: string }
+  | { kind: 'p2p-ice'; candidate: string | null };
 
 export function isFlingMessage(o: unknown): o is FlingMessage {
   if (typeof o !== 'object' || o === null) return false;
@@ -89,7 +94,10 @@ export function isFlingMessage(o: unknown): o is FlingMessage {
     k === 'offer' ||
     k === 'offer-withdraw' ||
     k === 'offer-rejected' ||
-    k === 'task-done'
+    k === 'task-done' ||
+    k === 'p2p-offer' ||
+    k === 'p2p-answer' ||
+    k === 'p2p-ice'
   );
 }
 

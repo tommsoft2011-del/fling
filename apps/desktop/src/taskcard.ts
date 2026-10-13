@@ -110,6 +110,11 @@ export function createTaskCard(task: AnyTask, dir: 'send' | 'recv'): CardHandle 
     let metaHtml = '';
     if (task.active && task.speedBps > 0) metaHtml += `<span>${fmtSpeed(task.speedBps)}</span>`;
     metaHtml += `<span>共 ${fmtSize(task.totalBytes)}</span><span>用时 ${fmtDur(secs)}</span>`;
+    // P2P 直连状态（方便确认走的是直连还是中继）
+    const p2p = task.p2p;
+    if (p2p === 'open') metaHtml += `<span class="done-check">⚡P2P直连</span>`;
+    else if (p2p === 'connecting') metaHtml += `<span>正在建立直连…</span>`;
+    else if (p2p === 'failed') metaHtml += `<span>中转</span>`;
     if (phase === 'done') metaHtml += `<span class="done-check">✓ 完成</span>`;
     if (phase === 'error') metaHtml += `<span style="color:var(--danger)">✗ ${task.error ?? '失败'}</span>`;
     if (phase === 'cancelled') metaHtml += `<span>已取消</span>`;

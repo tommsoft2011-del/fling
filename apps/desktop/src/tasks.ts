@@ -6,6 +6,7 @@ import { writeText as writeClipboardText } from '@tauri-apps/plugin-clipboard-ma
 import {
   wrapWebFile,
   type FileManifest,
+  type FlingMessage,
   type OfferItem,
   type OfferMessage,
 } from '@fling/core';
@@ -26,6 +27,7 @@ import {
 } from './net.js';
 import { saveHistoryEntry, HIST_IMAGE_LIMIT, settings, type HistoryEntry } from './store.js';
 import { b64encode, toast, uid, utf8bytes } from './ui.js';
+import { P2PLink, type P2PState } from './p2p.js';
 import type { FlingRoom } from '@fling/core';
 
 export type ItemKind = 'text' | 'file' | 'clipboard-image';
@@ -85,8 +87,11 @@ export class SendTask {
   speedBps = 0;
   error?: string;
   onChange: () => void = () => {};
+  /** P2P 直连状态：idle=未尝试 connecting=握手中 open=直连传输中 failed=已回退中继 */
+  p2p: P2PState = 'idle';
 
   private room?: FlingRoom;
+  private p2pLink: P2PLink | null = null;
   private lobbyLeave?: () => void;
   private announceTimer?: ReturnType<typeof setInterval>;
   private waitTimer?: ReturnType<typeof setTimeout>;
@@ -169,6 +174,9 @@ export class SendTask {
         onPeerLeft: () => {
           /* 接收方提前离开：若还没发完，传输会失败并标记 */
         },
+        onP2PSignal: (sig) => {
+          void this.p2pLink?.handleSignal(sig);
+        },
       });
       if (this.cancelled) return;
 
@@ -199,6 +207,10 @@ export class SendTask {
       });
       if (this.cancelled) return;
       this.stopAnnounce();
+
+      // 3.5 尝试 P2P 直连：SDP/ICE 走加密中继做信令，文件走直连；
+      // 握手失败或超时则无缝回退中继，不阻塞发送。
+      this.startP2P();
 
       // 4. 逐项发送
       this.phase = 'sending';
@@ -239,6 +251,7 @@ export class SendTask {
       if (this.phase === 'error') this.error = '部分项目发送失败';
       this.endedAt = Date.now();
       this.notify();
+      this.closeP2P();
       void this.archive();
       // 对方收到 task-done 后再关房间，留 2s 宽限
       setTimeout(() => this.closeRooms(), 2000);
@@ -257,6 +270,7 @@ export class SendTask {
       }
       this.endedAt = Date.now();
       this.notify();
+      this.closeP2P();
       void this.archive();
       this.closeRooms();
     }
@@ -283,6 +297,23 @@ export class SendTask {
     }
   }
 
+  /** 发起 P2P 直连（发送方做 initiator）。 */
+  private startP2P(): void {
+    if (this.p2pLink || !this.room || this.cancelled) return;
+    const link = new P2PLink(this.room, 'initiator', this.peerLabel);
+    this.p2pLink = link;
+    link.onstate = (s) => {
+      this.p2p = s;
+      this.notify();
+    };
+    void link.start();
+  }
+
+  private closeP2P(): void {
+    this.p2pLink?.close();
+    this.p2pLink = null;
+  }
+
   /** 接收方拒绝（经 inbox / lobby 回来） */
   onRejected(): void {
     if (!this.active) return;
@@ -299,6 +330,7 @@ export class SendTask {
     clearTimeout(this.waitTimer);
     this.stopAnnounce();
     this.notify();
+    this.closeP2P();
     void this.archive();
     this.closeRooms();
   }
@@ -464,6 +496,9 @@ export class RecvTask {
   private lastT = 0;
   private peerGoneTimer?: ReturnType<typeof setTimeout>;
   private savedDir = '';
+  /** P2P 直连状态：idle=未尝试 connecting=握手中 open=直连传输中 failed=已回退中继 */
+  p2p: P2PState = 'idle';
+  private p2pLink: P2PLink | null = null;
   /** 收到的剪贴板图片（供"另存为文件"） */
   clipImages = new Map<string, Uint8Array>();
 
@@ -531,6 +566,7 @@ export class RecvTask {
         onFileProgress: (id, r, t) => this.onProgress(id, r, t),
         onFileComplete: (id, m, bytes) => void this.onFileComplete(id, m, bytes),
         onFileError: (id, err) => this.onFileError(id, err),
+        onP2PSignal: (sig) => this.onP2PSignal(sig),
         onTaskDone: (taskId) => {
           if (taskId === this.taskId) void this.finish(true);
         },
@@ -548,6 +584,7 @@ export class RecvTask {
       }
       this.endedAt = Date.now();
       this.notify();
+      this.closeP2P();
       void this.archive();
     }
   }
@@ -642,10 +679,33 @@ export class RecvTask {
     }, 4000);
   }
 
+  /** P2P 信令：发送方发来 offer 则以 responder 身份应答，其余转给已建的链路。 */
+  private onP2PSignal(sig: Extract<FlingMessage, { kind: `p2p-${string}` }>): void {
+    if (this.finished) return;
+    if (sig.kind === 'p2p-offer') {
+      if (this.p2pLink || !this.room) return;
+      const link = new P2PLink(this.room, 'responder', this.peerLabel);
+      this.p2pLink = link;
+      link.onstate = (s) => {
+        this.p2p = s;
+        this.notify();
+      };
+      void link.acceptOffer(sig.sdp);
+      return;
+    }
+    void this.p2pLink?.handleSignal(sig);
+  }
+
+  private closeP2P(): void {
+    this.p2pLink?.close();
+    this.p2pLink = null;
+  }
+
   private async finish(completed: boolean): Promise<void> {
     if (this.finished) return;
     this.finished = true;
     clearTimeout(this.peerGoneTimer);
+    this.closeP2P();
     // 文本：拼起来写剪贴板
     if (this.textItem && this.textParts.length > 0) {
       const full = this.textParts.join('');

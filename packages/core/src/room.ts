@@ -4,6 +4,7 @@
 
 import { deriveRoomKey, openText, sealText } from './crypto.js';
 import { FileReceiver, type FileLike, buildManifest } from './files.js';
+import { P2P_DRAIN_THRESHOLD, type DirectChannel } from './p2p.js';
 import {
   FLING_TOPIC,
   isFlingMessage,
@@ -29,6 +30,8 @@ export interface FlingRoomEvents {
   onOfferWithdraw?(taskId: string, from: string): void;
   onOfferRejected?(taskId: string, from: string): void;
   onTaskDone?(taskId: string, from: string): void;
+  /** P2P handshake signaling (SDP / ICE), carried over the encrypted relay. */
+  onP2PSignal?(sig: Extract<FlingMessage, { kind: `p2p-${string}` }>, from: string): void;
 }
 
 const enc = new TextEncoder();
@@ -42,6 +45,12 @@ export class FlingRoom {
   // Data channels are ordered, but decrypt+parse is async — serialize
   // handling so a chunk can never overtake its manifest.
   private handleQueue: Promise<void> = Promise.resolve();
+  /**
+   * Direct P2P channel to the peer (set by the app after a successful
+   * WebRTC handshake). While open, file-chunk messages take this path
+   * instead of the LiveKit relay. Null/absent = relay everything.
+   */
+  private direct: DirectChannel | null = null;
 
   constructor(
     private transport: FlingTransport,
@@ -50,6 +59,39 @@ export class FlingRoom {
 
   get isConnected(): boolean {
     return this.transport.isConnected;
+  }
+
+  /** True while a direct P2P channel is open (file bytes bypass the relay). */
+  get directActive(): boolean {
+    return !!this.direct && this.direct.readyState === 'open';
+  }
+
+  /**
+   * Attach/detach the direct channel. The room routes file-chunk messages
+   * through it while open and feeds inbound direct messages into the same
+   * receive pipeline. Safe to call at any time (per-chunk routing).
+   */
+  setDirectChannel(ch: DirectChannel | null): void {
+    if (this.direct) {
+      this.direct.onmessage = null;
+      this.direct.onclose = null;
+    }
+    this.direct = ch;
+    if (ch) {
+      ch.onmessage = (data) => {
+        this.handleQueue = this.handleQueue
+          .then(() => this.handleDirectData(data, ch.label))
+          .catch((e) => console.error('fling: direct payload handling failed:', e));
+      };
+      ch.onclose = () => {
+        if (this.direct === ch) this.direct = null;
+      };
+    }
+  }
+
+  /** Publish a signaling message over the encrypted relay (e.g. P2P SDP/ICE). */
+  async sendSignal(msg: FlingMessage): Promise<void> {
+    await this.send(msg);
   }
 
   async connect(
@@ -132,6 +174,22 @@ export class FlingRoom {
   }
 
   private async send(msg: FlingMessage): Promise<void> {
+    // File bytes prefer the direct P2P channel when it's open: the DTLS-SCTP
+    // data channel is already encrypted, so no AES-GCM envelope needed here.
+    // Everything else (signaling, manifests, small messages) uses the relay.
+    // A failing direct channel falls back to the relay for this chunk.
+    const dc = this.direct;
+    if (msg.kind === 'file-chunk' && dc && dc.readyState === 'open') {
+      try {
+        if (dc.bufferedAmount > P2P_DRAIN_THRESHOLD) {
+          await dc.waitForDrain(P2P_DRAIN_THRESHOLD);
+        }
+        dc.send(enc.encode(JSON.stringify(msg)));
+        return;
+      } catch {
+        this.setDirectChannel(null);
+      }
+    }
     const sealed = await sealText(this.roomKey, JSON.stringify(msg));
     await this.transport.publish(enc.encode(sealed), FLING_TOPIC);
   }
@@ -150,7 +208,22 @@ export class FlingRoom {
       return;
     }
     if (!isFlingMessage(msg)) return;
+    this.dispatchMessage(msg, from);
+  }
 
+  /** Inbound message from the direct P2P channel (already DTLS-encrypted). */
+  private async handleDirectData(data: Uint8Array, from: string): Promise<void> {
+    let msg: unknown;
+    try {
+      msg = JSON.parse(dec.decode(data));
+    } catch {
+      return;
+    }
+    if (!isFlingMessage(msg)) return;
+    this.dispatchMessage(msg, from);
+  }
+
+  private dispatchMessage(msg: FlingMessage, from: string): void {
     switch (msg.kind) {
       case 'text':
         this.events.onText?.(msg.text, from);
@@ -210,6 +283,11 @@ export class FlingRoom {
       case 'task-done':
         this.events.onTaskDone?.(msg.taskId, from);
         break;
+      case 'p2p-offer':
+      case 'p2p-answer':
+      case 'p2p-ice':
+        this.events.onP2PSignal?.(msg, from);
+        break;
     }
   }
 
@@ -232,6 +310,14 @@ export class FlingRoom {
 
   async close(): Promise<void> {
     if (this.helloTimer) clearInterval(this.helloTimer);
+    if (this.direct) {
+      try {
+        this.direct.close();
+      } catch {
+        /* best effort */
+      }
+      this.direct = null;
+    }
     try {
       if (this.transport.isConnected) {
         await this.send({ kind: 'bye', device: this.deviceName });
