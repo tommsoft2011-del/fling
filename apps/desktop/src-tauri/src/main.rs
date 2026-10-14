@@ -81,6 +81,7 @@ fn default_config() -> FlingConfig {
         turn_url: None,
         turn_username: None,
         turn_password: None,
+        remote_config_url: None,
     }
 }
 
@@ -280,6 +281,7 @@ fn save_config(app: tauri::AppHandle, cfg: FlingConfig) -> Result<(), String> {
                     turn_url: cfg.turn_url.filter(|s| !s.trim().is_empty()).or(old.turn_url),
                     turn_username: cfg.turn_username.filter(|s| !s.trim().is_empty()).or(old.turn_username),
                     turn_password: cfg.turn_password.filter(|s| !s.trim().is_empty()).or(old.turn_password),
+                    remote_config_url: cfg.remote_config_url.filter(|s| !s.trim().is_empty()).or(old.remote_config_url),
                 },
                 Err(_) => cfg,
             },
