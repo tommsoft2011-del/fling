@@ -130,6 +130,8 @@ export class SendTask {
   private waitTimer?: ReturnType<typeof setTimeout>;
   private peerJoined = false;
   private cancelled = false;
+  /** 接收方中途取消（收到 task-cancel）：不再标成功 */
+  private peerCancelled = false;
   private lastBytes = 0;
   private lastT = 0;
   private doneNotified = false;
@@ -242,6 +244,13 @@ export class SendTask {
             this.ackResolve?.(true);
           }
         },
+        onTaskCancel: (taskId) => {
+          if (taskId === this.taskId) {
+            log('task', 'task-cancel received', { taskId });
+            this.peerCancelled = true;
+            this.ackResolve?.(false);
+          }
+        },
         onTaskProgress: (taskId, doneBytes, totalBytes) => {
           if (taskId === this.taskId) {
             this.peerDoneBytes = doneBytes;
@@ -342,9 +351,24 @@ export class SendTask {
         log('task', 'task-done sent', { taskId: this.taskId });
       } catch { /* 尽力 */ }
       const acked = await this.waitForAck(30_000);
-      log('task', acked ? 'ack ok, closing' : 'ack timeout, closing anyway', { taskId: this.taskId });
-      this.phase = this.cancelled ? 'cancelled' : okCount === this.items.length ? 'done' : 'error';
-      if (this.phase === 'error') this.error = '部分项目发送失败';
+      log('task', acked ? 'ack ok, closing' : 'ack timeout, closing anyway', {
+        taskId: this.taskId,
+        peerCancelled: this.peerCancelled,
+      });
+      // 成功判定必须以接收方确认为准：对方取消 / 未确认（超时）都不算成功。
+      // 以前 acked 被完全忽略，"字节发出去了"就标成功——这就是"接收方点了取消，
+      // 发送方还显示成功"的根因。
+      if (this.cancelled || this.peerCancelled) {
+        this.phase = 'cancelled';
+      } else if (!acked) {
+        this.phase = 'error';
+        this.error = '对方未确认接收';
+      } else if (okCount === this.items.length) {
+        this.phase = 'done';
+      } else {
+        this.phase = 'error';
+        this.error = '部分项目发送失败';
+      }
       this.endedAt = Date.now();
       this.notify();
       this.closeP2P();
@@ -1022,9 +1046,22 @@ export class RecvTask {
     if (r) await r.close().catch(() => {});
   }
 
-  cancel(): void {
+  async cancel(): Promise<void> {
     if (!this.active) return;
     this.cancelled = true;
+    // 先告诉发送方"我取消了"再拆连接；flush 保证取消信令发出去，
+    // 否则发送方等 ack 超时（以前还会误标"成功"）。
+    try {
+      await this.room?.sendTaskCancel(this.taskId);
+    } catch {
+      /* 忽略 */
+    }
+    try {
+      await this.room?.flush();
+    } catch {
+      /* 忽略 */
+    }
+    log('task', 'recv cancelled, task-cancel sent', { taskId: this.taskId });
     void this.finish(false).then(() => {
       this.phase = 'cancelled';
       this.notify();

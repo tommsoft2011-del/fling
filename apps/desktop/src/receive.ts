@@ -40,7 +40,7 @@ export function initRecvPage(): void {
   const confirmListen = async () => {
     const code = normalizeCode(codeInput.value);
     if (!code) {
-      toast('请输入 6 位配对码', true);
+      toast('请输入 8 位配对码', true);
       codeInput.focus();
       return;
     }

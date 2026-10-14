@@ -83,6 +83,8 @@ export type FlingMessage =
   // 接收方全部收齐并落盘后发送：发送方收到前不得拆除连接，
   // 否则"发送成功"只是数据进了发送缓冲，接收方实际没收完。
   | { kind: 'task-ack'; taskId: string }
+  // 接收方中途取消：发送方收到后不得再标"成功"，应标"已取消"。
+  | { kind: 'task-cancel'; taskId: string }
   // 接收方周期性上报真实接收进度（发送端的"已发送"只是进了缓冲，
   // 用接收端的数字才是用户真正关心的"对方收到了多少"）。
   | { kind: 'task-progress'; taskId: string; doneBytes: number; totalBytes: number }
@@ -106,6 +108,7 @@ export function isFlingMessage(o: unknown): o is FlingMessage {
     k === 'offer-rejected' ||
     k === 'task-done' ||
     k === 'task-ack' ||
+    k === 'task-cancel' ||
     k === 'task-progress' ||
     k === 'p2p-offer' ||
     k === 'p2p-answer' ||

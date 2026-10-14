@@ -386,8 +386,11 @@ button { font: inherit; cursor: pointer; }
 .recv-actions { margin: 14px 0 4px; }
 #recvDrawer {
   border-top: 1px solid var(--border); background: var(--surface-2);
-  margin: 18px -26px -40px; padding: 0 26px;
+  /* 停靠在接收页底部：内容不足一屏时 margin-top:auto 把它推到底部 */
+  margin: auto -26px -40px; padding: 0 26px;
 }
+/* 接收页用 flex 列布局，让抽屉能贴底（v0.5.17 定稿：等待确认在内容区，接收任务底部停靠） */
+#page-recv.active { display: flex; flex-direction: column; min-height: 100%; }
 #recvStrip {
   display: flex; align-items: center; gap: 8px; width: 100%;
   background: none; border: none; color: var(--text);

@@ -4,9 +4,9 @@
 import { randomId } from './protocol.js';
 
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O, 1/I/L
-export const CODE_LENGTH = 6;
+export const CODE_LENGTH = 8;
 
-/** Generate a human-friendly pairing code, e.g. "K7Q2M9". */
+/** Generate a human-friendly pairing code, e.g. "K7Q2M9X4". */
 export function generatePairingCode(length: number = CODE_LENGTH): string {
   const buf = new Uint8Array(length);
   crypto.getRandomValues(buf);

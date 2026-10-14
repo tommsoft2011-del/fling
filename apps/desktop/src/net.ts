@@ -1,5 +1,6 @@
 // LiveKit 连接 helpers：token 签发走 Rust（secret 不进 webview）
 import { invoke } from '@tauri-apps/api/core';
+import { log } from './log.js';
 import {
   FlingRoom,
   deriveRoomKey,
@@ -38,9 +39,15 @@ export async function initNet(): Promise<void> {
           credential: cfg.turn_password ?? '',
         },
       ]);
+      // 诊断：只记 TURN 主机（不记用户名/密码），确认配置真的进了 ICE 列表
+      const host = /^(?:turns?:)?([^/:;]+)/.exec(cfg.turn_url)?.[1] ?? '?';
+      log('p2p', 'ice servers: STUN x2 + TURN', { turnHost: host });
+    } else {
+      log('p2p', 'ice servers: STUN x2 only (no TURN configured)', {});
     }
   } catch {
     /* 无 TURN 配置就只用 STUN */
+    log('p2p', 'ice servers: STUN x2 only (get_config failed)', {});
   }
 }
 

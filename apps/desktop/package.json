@@ -1,6 +1,6 @@
 {
   "name": "@fling/desktop",
-  "version": "0.5.18",
+  "version": "0.5.20",
   "private": true,
   "type": "module",
   "scripts": {

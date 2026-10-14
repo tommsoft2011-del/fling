@@ -100,6 +100,9 @@ export class P2PLink {
   private _state: P2PState = 'idle';
   private iceLocal = 0;
   private iceRemote = 0;
+  /** 诊断用：收集到的本地/远端 candidate 类型（host/srflx/relay + 协议） */
+  private iceLocalTypes = new Set<string>();
+  private iceRemoteTypes = new Set<string>();
   /** 正常关闭（任务结束）时不报 failed，避免日志误导 */
   private closed = false;
   onstate: ((s: P2PState) => void) | null = null;
@@ -113,6 +116,59 @@ export class P2PLink {
 
   get state(): P2PState {
     return this._state;
+  }
+
+  /** 从 candidate SDP 行提取 "类型/协议"，如 "host/udp"、"relay/tcp"。失败不抛错。 */
+  private static candKind(cand: string): string {
+    try {
+      const t = /typ (host|srflx|prflx|relay)/.exec(cand)?.[1] ?? '?';
+      const p = /\s(udp|tcp)\s/i.exec(cand)?.[1]?.toLowerCase() ?? '?';
+      return `${t}/${p}`;
+    } catch {
+      return '?/?';
+    }
+  }
+
+  /**
+   * 诊断：直连建立后，从 getStats 里找出选中的 candidate pair 并记日志。
+   * 这是判断"到底走了直连/host、srflx 打洞还是 TURN 中转"的唯一可靠证据。
+   */
+  private logSelectedPair(pc: RTCPeerConnection): void {
+    void (async () => {
+      try {
+        const stats = await pc.getStats();
+        const locals = new Map<string, any>();
+        const remotes = new Map<string, any>();
+        let pair: any = null;
+        stats.forEach((s: any) => {
+          if (s.type === 'local-candidate') locals.set(s.id, s);
+          else if (s.type === 'remote-candidate') remotes.set(s.id, s);
+          else if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s;
+        });
+        if (!pair) {
+          stats.forEach((s: any) => {
+            if (s.type === 'candidate-pair' && s.state === 'succeeded' && (!pair || s.priority > pair.priority))
+              pair = s;
+          });
+        }
+        if (pair) {
+          const l = locals.get(pair.localCandidateId);
+          const r = remotes.get(pair.remoteCandidateId);
+          const relayed = l?.candidateType === 'relay' || r?.candidateType === 'relay';
+          log('p2p', 'selected pair', {
+            role: this.role,
+            peer: this.peerLabel,
+            local: `${l?.candidateType ?? '?'}/${l?.protocol ?? '?'}`,
+            remote: `${r?.candidateType ?? '?'}/${r?.protocol ?? '?'}`,
+            relayed,
+          });
+        } else {
+          log('p2p', 'no selected pair in stats', { role: this.role, peer: this.peerLabel });
+        }
+      } catch {
+        /* 诊断失败不影响传输 */
+      }
+    })();
   }
 
   private setState(s: P2PState): void {
@@ -135,6 +191,11 @@ export class P2PLink {
       was: this._state,
       iceLocal: this.iceLocal,
       iceRemote: this.iceRemote,
+      // 诊断关键：两端各收集到了什么类型的 candidate。
+      // 若本地没有 relay/udp，说明 TURN 没生效（配置未加载/凭证错/端口不通）；
+      // 若远端类型为空，说明对端 candidate 没送达（信令问题）。
+      iceLocalTypes: [...this.iceLocalTypes],
+      iceRemoteTypes: [...this.iceRemoteTypes],
     });
     this.setState('failed');
     try {
@@ -149,7 +210,10 @@ export class P2PLink {
     if (typeof RTCPeerConnection === 'undefined') return null;
     const pc = new RTCPeerConnection({ iceServers: this.iceServers });
     pc.onicecandidate = (e) => {
-      if (e.candidate) this.iceLocal++;
+      if (e.candidate) {
+        this.iceLocal++;
+        this.iceLocalTypes.add(P2PLink.candKind(e.candidate.candidate));
+      }
       const candidate = e.candidate ? JSON.stringify(e.candidate.toJSON()) : null;
       void this.room
         .sendSignal({ kind: 'p2p-ice', candidate } as FlingMessage)
@@ -176,7 +240,11 @@ export class P2PLink {
         peer: this.peerLabel,
         iceLocal: this.iceLocal,
         iceRemote: this.iceRemote,
+        iceLocalTypes: [...this.iceLocalTypes],
+        iceRemoteTypes: [...this.iceRemoteTypes],
       });
+      // 诊断关键：记录最终选中的链路（host 直连 / srflx 打洞 / relay 中转）
+      if (this.pc) this.logSelectedPair(this.pc);
       this.setState('open');
       try {
         this.room.setDirectChannel(new RTCDirectChannel(dc, this.peerLabel));
@@ -265,6 +333,7 @@ export class P2PLink {
         if (!sig.candidate) return; // end-of-candidates
         this.iceRemote++;
         const init = JSON.parse(sig.candidate) as RTCIceCandidateInit;
+        if (init.candidate) this.iceRemoteTypes.add(P2PLink.candKind(init.candidate));
         if (this.remoteSet) {
           await pc.addIceCandidate(new RTCIceCandidate(init));
         } else {
@@ -280,6 +349,7 @@ export class P2PLink {
   addRemoteIce(init: RTCIceCandidateInit): void {
     this.pendingIce.push(init);
     this.iceRemote++;
+    if (init.candidate) this.iceRemoteTypes.add(P2PLink.candKind(init.candidate));
   }
 
   private async flushIce(): Promise<void> {

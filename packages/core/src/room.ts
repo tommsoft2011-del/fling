@@ -34,6 +34,8 @@ export interface FlingRoomEvents {
   onP2PSignal?(sig: Extract<FlingMessage, { kind: `p2p-${string}` }>, from: string): void;
   /** Receiver confirms all items received AND saved (see task-ack). */
   onTaskAck?(taskId: string, from: string): void;
+  /** Receiver cancelled mid-transfer (see task-cancel). */
+  onTaskCancel?(taskId: string, from: string): void;
   /** Receiver's periodic real progress report (see task-progress). */
   onTaskProgress?(taskId: string, doneBytes: number, totalBytes: number, from: string): void;
   /** Optional diagnostics sink (the app wires this to its log file). */
@@ -195,6 +197,11 @@ export class FlingRoom {
     await this.send({ kind: 'task-ack', taskId });
   }
 
+  /** v2: receiver cancelled the transfer midway; sender must not report success. */
+  async sendTaskCancel(taskId: string): Promise<void> {
+    await this.send({ kind: 'task-cancel', taskId });
+  }
+
   /** v2: receiver reports real receive progress (throttled by caller). */
   async sendTaskProgress(taskId: string, doneBytes: number, totalBytes: number): Promise<void> {
     await this.send({ kind: 'task-progress', taskId, doneBytes, totalBytes });
@@ -341,6 +348,9 @@ export class FlingRoom {
         break;
       case 'task-ack':
         this.events.onTaskAck?.(msg.taskId, from);
+        break;
+      case 'task-cancel':
+        this.events.onTaskCancel?.(msg.taskId, from);
         break;
       case 'task-progress':
         this.events.onTaskProgress?.(msg.taskId, msg.doneBytes, msg.totalBytes, from);
