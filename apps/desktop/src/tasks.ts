@@ -61,6 +61,8 @@ export interface ComposeItem {
   previewUrl?: string;
   /** 文件夹发送时的相对路径，如 "docs/report.pdf" */
   relPath?: string;
+  /** 所属顶层文件夹名（用于发送框折叠显示；单文件为空） */
+  folder?: string;
   /** Tauri 下文件的绝对路径（懒加载：发送时才读文件内容，避免大文件夹提前占内存） */
   filePath?: string;
 }
@@ -222,7 +224,12 @@ export class SendTask {
         fromDeviceId: getDeviceId(),
         taskRoom,
         taskKey,
-        items: this.source.map(toOfferItem),
+        // LiveKit 单包 64KB 上限：文件多了 items 必须截断（1232 个文件时曾报
+        // "cannot publish data packet larger than 64000 bytes"），只保留前 30 个做预览；
+        // 接收端用 totalItems 做 expectedManifests，缺的条目由 manifest 到达时补建。
+        items: this.source.slice(0, 30).map(toOfferItem),
+        totalItems: this.source.length,
+        totalBytes: this.source.reduce((a, c) => a + c.size, 0),
       };
 
       // 1. 建任务房间（发送方先进）
@@ -694,7 +701,9 @@ export class RecvTask {
     }));
     this.textItem = this.items.find((i) => i.kind === 'text');
     this.fileQueue = this.items.filter((i) => i.kind !== 'text');
-    this.expectedManifests = this.fileQueue.length;
+    // offer.items 可能被截断（64KB 上限），用 totalItems 做真正的期望数；
+    // 老版本发送方无 totalItems 时回退 items.length。
+    this.expectedManifests = offer.totalItems ?? this.fileQueue.length;
   }
 
   get peerLabel(): string {
@@ -817,7 +826,19 @@ export class RecvTask {
   private onManifest(m: FileManifest): void {
     // 按 offer 顺序匹配（data channel 有序可靠），辅以 文件名+大小 兜底
     let item = this.fileQueue.shift();
-    if (!item) return;
+    if (!item) {
+      // offer.items 被截断时：manifest 对应的条目不在预览里，按 manifest 现场补建
+      item = {
+        uid: uid('ri'),
+        kind: m.kind,
+        name: m.name,
+        size: m.size,
+        status: 'waiting',
+        doneBytes: 0,
+        totalBytes: m.size,
+      };
+      this.items.push(item);
+    }
     if (item.name !== m.name || item.size !== m.size) {
       const alt = this.fileQueue.find((i) => i.name === m.name && i.size === m.size);
       if (alt) {

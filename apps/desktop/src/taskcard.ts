@@ -30,17 +30,28 @@ function summarizeItems(task: AnyTask): string {
 
 export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
   const root = el('div', 'trow');
+  // 上行：基本信息
+  const top = el('div', 'trow-top');
   const arrow = el('span', 'tdir', dir === 'send' ? '→' : '←');
   const peer = el('span', 'tpeer', task.peerLabel);
   const sum = el('span', 'tsum', summarizeItems(task));
-  const bar = el('div', 'pbar');
-  const fill = el('div', 'pfill');
-  bar.appendChild(fill);
   const pct = el('span', 'tpct', '');
   const closeBtn = el('button', 'x', '✕') as HTMLButtonElement;
   closeBtn.title = '取消';
-  closeBtn.onclick = () => task.cancel();
-  root.append(arrow, peer, sum, bar, pct, closeBtn);
+  top.append(arrow, peer, sum, pct, closeBtn);
+  // 下行：双进度条（当前文件 + 总计）与预计剩余时间
+  const bars = el('div', 'trow-bars');
+  const fileLabel = el('span', 'tfile', '');
+  const fileBar = el('div', 'pbar thin');
+  const fileFill = el('div', 'pfill');
+  fileBar.appendChild(fileFill);
+  const filePct = el('span', 'tfpct', '');
+  const totalBar = el('div', 'pbar thin');
+  const totalFill = el('div', 'pfill');
+  totalBar.appendChild(totalFill);
+  const eta = el('span', 'teta', '');
+  bars.append(fileLabel, fileBar, filePct, totalBar, eta);
+  root.append(top, bars);
 
   let dismissTimer: ReturnType<typeof setTimeout> | undefined;
   let gone = false;
@@ -65,8 +76,32 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
       }
     }
     const pctNum = phase === 'done' ? 100 : totalB > 0 ? Math.min(100, Math.round((doneB / totalB) * 100)) : 0;
-    fill.style.width = pctNum + '%';
-    bar.classList.toggle('live', active && (phase === 'sending' || (phase as string) === 'receiving'));
+    totalFill.style.width = pctNum + '%';
+    totalBar.classList.toggle('live', active && (phase === 'sending' || (phase as string) === 'receiving'));
+
+    // 当前文件：找正在传输的条目（active），没有则找第一个未完成的
+    const cur = task.items.find((i) => i.status === 'active')
+      ?? task.items.find((i) => i.status === 'waiting');
+    if (cur && active) {
+      const fp = cur.totalBytes > 0 ? Math.min(100, Math.round((cur.doneBytes / cur.totalBytes) * 100)) : 0;
+      fileLabel.textContent = cur.name.length > 28 ? '…' + cur.name.slice(-27) : cur.name;
+      fileLabel.title = cur.name;
+      fileFill.style.width = fp + '%';
+      filePct.textContent = fp + '%';
+      bars.style.display = '';
+    } else {
+      bars.style.display = 'none';
+    }
+
+    // 预计剩余时间：按当前速度估算
+    const effSpeedForEta = task.speedBps > 0 ? task.speedBps : 0;
+    if (active && effSpeedForEta > 0 && totalB > doneB) {
+      const sec = Math.ceil((totalB - doneB) / effSpeedForEta);
+      eta.textContent = '剩余 ' + (sec >= 3600 ? `${Math.floor(sec / 3600)}:${String(Math.floor(sec / 60) % 60).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`
+        : sec >= 60 ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}` : `${sec}秒`);
+    } else {
+      eta.textContent = '';
+    }
 
     let status: string;
     let statusCls = '';
@@ -103,15 +138,21 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
     pct.textContent = status;
     pct.className = 'tpct ' + statusCls;
     sum.textContent = summarizeItems(task) + ` · ${fmtSize(totalB)}`;
-    closeBtn.style.visibility = active ? 'visible' : 'hidden';
+    // 进行中显示取消按钮；失败/完成/取消后显示为消除按钮（之前 error 状态按钮隐藏，失败任务卡死消不掉）
+    closeBtn.style.visibility = 'visible';
+    closeBtn.title = active ? '取消' : '消除';
+    closeBtn.onclick = () => {
+      if (active) task.cancel();
+      else destroy();
+    };
 
     // P2P 直连标记（紧凑：加到 peer 后）
     const p2p = task.p2p;
     peer.textContent = task.peerLabel + (p2p === 'open' ? ' ⚡' : p2p === 'failed' ? ' (中转)' : '');
     peer.title = p2p === 'open' ? 'P2P 直连' : p2p === 'failed' ? '经服务器中转' : p2p === 'connecting' ? '正在建立直连…' : '';
 
-    // 完成/取消/拒绝后 5s 自动淡出
-    if ((phase === 'done' || phase === 'cancelled' || (phase as string) === 'rejected') && !dismissTimer) {
+    // 完成/失败/取消/拒绝后 5s 自动淡出
+    if ((phase === 'done' || phase === 'error' || phase === 'cancelled' || (phase as string) === 'rejected') && !dismissTimer) {
       dismissTimer = setTimeout(() => {
         root.classList.add('fading');
         setTimeout(() => {

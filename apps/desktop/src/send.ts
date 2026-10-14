@@ -166,7 +166,8 @@ export function initSendPage(): void {
       let skipped = 0;
       for (const f of Array.from(files)) {
         const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
-        if (addFolderFileItem(f.name, rel, f.size, undefined, f)) added++;
+        const folder = rel.split('/')[0] || undefined;
+        if (addFolderFileItem(f.name, rel, f.size, undefined, f, folder)) added++;
         else skipped++;
       }
       if (added > 0) toast(`已添加 ${added} 个文件`);
@@ -257,10 +258,11 @@ function addFolderFileItem(
   size: number,
   filePath?: string,
   blob?: Blob,
+  folder?: string,
 ): boolean {
   const dup = fileItems.some((c) => (c.relPath ?? c.name) === relPath && c.size === size);
   if (dup) return false;
-  fileItems.push({ uid: uid('c'), kind: 'file', name, size, blob, relPath, filePath });
+  fileItems.push({ uid: uid('c'), kind: 'file', name, size, blob, relPath, filePath, folder });
   renderFileList();
   refreshSendBtn();
   return true;
@@ -271,6 +273,7 @@ const isTauri = typeof window !== 'undefined' && !!(window as unknown as { __TAU
 /** 把一个目录递归加入文件列表（懒加载内容，发送时才读） */
 async function addDirAsFolder(dir: string): Promise<{ added: number; skipped: number }> {
   const base = dir.split(/[/\\]/).filter(Boolean).pop() || '文件夹';
+  toast(`正在读取文件夹 ${base}…`);
   const entries = (await invoke('list_dir_recursive', { dir })) as { rel_path: string; size: number }[];
   let added = 0;
   let skipped = 0;
@@ -278,7 +281,7 @@ async function addDirAsFolder(dir: string): Promise<{ added: number; skipped: nu
     const relPath = `${base}/${e.rel_path}`;
     const filePath = dir.replace(/[/\\]$/, '') + '/' + e.rel_path;
     const name = e.rel_path.split('/').pop() || e.rel_path;
-    if (addFolderFileItem(name, relPath, e.size, filePath)) added++;
+    if (addFolderFileItem(name, relPath, e.size, filePath, undefined, base)) added++;
     else skipped++;
   }
   return { added, skipped };
@@ -392,16 +395,34 @@ function renderFileList(): void {
   if (fileItems.length === 0) {
     host.appendChild(el('div', 'empty', '还没有文件 — 点「添加文件」，或把文件拖到这里'));
   } else {
+    // 按文件夹折叠：同文件夹的显示为一行「📁 文件夹名（共 N 个文件）」，不展开
+    const singles: typeof fileItems = [];
+    const folders = new Map<string, typeof fileItems>();
     for (const c of fileItems) {
-      const row = el('div', 'frow');
-      const label = c.relPath ?? c.name;
-      const icon = el('span', 'fic', c.relPath ? '\u{1F4C1}' : fileIcon(c.name));
-      const nm = el('span', 'fname', label);
-      nm.title = label;
-      row.append(icon, nm, el('span', 'fsize', fmtSize(c.size)));
+      if (c.folder) {
+        const g = folders.get(c.folder) ?? [];
+        g.push(c);
+        folders.set(c.folder, g);
+      } else {
+        singles.push(c);
+      }
+    }
+    for (const c of singles) host.appendChild(fileRow(c));
+    for (const [fname, items] of folders) {
+      const row = el('div', 'frow ffolder');
+      const icon = el('span', 'fic', '📁');
+      const total = items.reduce((a, i) => a + i.size, 0);
+      const nm = el('span', 'fname', `${fname}（共 ${items.length} 个文件）`);
+      nm.title = items.map((i) => i.relPath ?? i.name).join('\n');
+      row.append(icon, nm, el('span', 'fsize', fmtSize(total)));
       const x = el('button', 'fx', '✕') as HTMLButtonElement;
-      x.title = '移除';
-      x.onclick = () => removeFileItem(c.uid);
+      x.title = '移除整个文件夹';
+      x.onclick = () => {
+        const uids = new Set(items.map((i) => i.uid));
+        fileItems = fileItems.filter((c) => !uids.has(c.uid));
+        renderFileList();
+        refreshSendBtn();
+      };
       row.appendChild(x);
       host.appendChild(row);
     }
@@ -411,6 +432,21 @@ function renderFileList(): void {
   if (fh) fh.textContent =
     fileItems.length > 0 ? `${fileItems.length} 个文件 · 共 ${fmtSize(total)}` : '';
   ($('#clearFilesBtn') as HTMLButtonElement).hidden = fileItems.length === 0;
+}
+
+/** 单文件行 */
+function fileRow(c: (typeof fileItems)[number]): HTMLElement {
+  const row = el('div', 'frow');
+  const label = c.relPath ?? c.name;
+  const icon = el('span', 'fic', c.relPath ? '📄' : fileIcon(c.name));
+  const nm = el('span', 'fname', label);
+  nm.title = label;
+  row.append(icon, nm, el('span', 'fsize', fmtSize(c.size)));
+  const x = el('button', 'fx', '✕') as HTMLButtonElement;
+  x.title = '移除';
+  x.onclick = () => removeFileItem(c.uid);
+  row.appendChild(x);
+  return row;
 }
 
 function snapshotItems(): ComposeItem[] {

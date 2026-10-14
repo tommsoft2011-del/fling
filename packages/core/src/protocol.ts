@@ -64,7 +64,12 @@ export interface OfferMessage {
    * the receiver then derives the task key from the pairing code instead.
    */
   taskKey: string;
+  /** 预览条目（为避开 LiveKit 64KB 单包上限，只带前 N 个）；完整列表由 manifest 逐个送达 */
   items: OfferItem[];
+  /** 全部条目数（items 被截断时用它做 expectedManifests；老版本发送方无此字段则回退 items.length） */
+  totalItems?: number;
+  /** 全部条目总字节数（items 被截断时预览用） */
+  totalBytes?: number;
 }
 
 export type FlingMessage =

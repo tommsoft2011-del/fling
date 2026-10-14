@@ -187,15 +187,22 @@ function renderPending(): void {
 
 function summarizeOffer(p: PendingOffer): string {
   const items = p.offer.items;
+  const totalN = p.offer.totalItems ?? items.length;
+  const totalB = p.offer.totalBytes ?? items.reduce((a, i) => a + i.size, 0);
+  const truncated = items.length < totalN;
   const parts: string[] = [];
-  const nText = items.filter((i) => i.kind === 'text').length;
-  const nClip = items.filter((i) => i.kind === 'clipboard-image').length;
-  const nFile = items.filter((i) => i.kind === 'file').length;
-  if (nText) parts.push(`${nText} 段文本`);
-  if (nClip) parts.push(`${nClip} 张剪贴板图片`);
-  if (nFile) parts.push(`${nFile} 个文件`);
-  const total = items.reduce((a, i) => a + i.size, 0);
-  return `${parts.join('、')} · 共 ${fmtSize(total)}${p.via === 'remote' ? ` · 配对码 ${p.code}` : ''}`;
+  if (truncated) {
+    // items 被截断只作预览：直接显示总数，不按 kind 细分（细分数字会对不上）
+    parts.push(`${totalN} 项`);
+  } else {
+    const nText = items.filter((i) => i.kind === 'text').length;
+    const nClip = items.filter((i) => i.kind === 'clipboard-image').length;
+    const nFile = items.filter((i) => i.kind === 'file').length;
+    if (nText) parts.push(`${nText} 段文本`);
+    if (nClip) parts.push(`${nClip} 张剪贴板图片`);
+    if (nFile) parts.push(`${nFile} 个文件`);
+  }
+  return `${parts.join('、')} · 共 ${fmtSize(totalB)}${p.via === 'remote' ? ` · 配对码 ${p.code}` : ''}`;
 }
 
 function syncRecvDrawer(): void {
