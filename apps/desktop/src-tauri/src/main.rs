@@ -53,6 +53,12 @@ struct FlingConfig {
     device_name: String,
     #[serde(default = "default_download_dir")]
     download_dir: String,
+    #[serde(default)]
+    turn_url: Option<String>,
+    #[serde(default)]
+    turn_username: Option<String>,
+    #[serde(default)]
+    turn_password: Option<String>,
 }
 
 fn config_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {

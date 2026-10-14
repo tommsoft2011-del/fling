@@ -28,6 +28,15 @@ export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
 
 const DC_LABEL = 'fling-file';
 
+/** 运行时覆盖 ICE（配置文件里配了 TURN 就追加到默认 STUN 后面） */
+let customIce: RTCIceServer[] | null = null;
+export function setCustomIceServers(servers: RTCIceServer[]): void {
+  customIce = servers;
+}
+export function getIceServers(): RTCIceServer[] {
+  return customIce ?? DEFAULT_ICE_SERVERS;
+}
+
 class RTCDirectChannel implements DirectChannel {
   onmessage: ((data: Uint8Array<ArrayBuffer>) => void) | null = null;
   onclose: (() => void) | null = null;
@@ -99,7 +108,7 @@ export class P2PLink {
     private room: FlingRoom,
     private role: 'initiator' | 'responder',
     private peerLabel: string,
-    private iceServers: RTCIceServer[] = DEFAULT_ICE_SERVERS,
+    private iceServers: RTCIceServer[] = getIceServers(),
   ) {}
 
   get state(): P2PState {
