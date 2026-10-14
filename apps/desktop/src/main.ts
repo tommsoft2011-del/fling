@@ -36,6 +36,28 @@ import { initHistPage, refreshHistPage } from './history.js';
 import { initSettingsPage } from './settings.js';
 import { log } from './log.js';
 
+/** 从服务器拉取加密的远程配置并应用（静默失败：用内置/本地配置继续） */
+async function refreshRemoteConfig(): Promise<void> {
+  try {
+    const url = await invoke<string | null>('get_remote_config_url');
+    if (!url) return;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const resp = await fetch(url, { signal: ctrl.signal, cache: 'no-store' });
+      if (!resp.ok) return;
+      const j = await resp.json();
+      if (j.v !== 1 || typeof j.nonce !== 'string' || typeof j.data !== 'string') return;
+      await invoke('apply_remote_config', { nonceB64: j.nonce, dataB64: j.data });
+      log('net', 'remote config applied', { url });
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    /* 离线或服务器不可用：静默忽略 */
+  }
+}
+
 type Page = 'send' | 'recv' | 'hist' | 'settings';
 let current: Page = 'send';
 let started = false;
@@ -121,6 +143,9 @@ async function startMain(): Promise<void> {
   initRecvPage();
   initHistPage();
   initSettingsPage();
+
+  // 远程配置：启动时尝试从服务器拉取加密配置（失败则静默用内置/本地）
+  refreshRemoteConfig().catch(() => {});
 
   manager.onChange(updateBadges);
   try {

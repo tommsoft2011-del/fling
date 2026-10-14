@@ -65,6 +65,8 @@ struct FlingConfig {
     turn_username: Option<String>,
     #[serde(default, alias = "turnPassword")]
     turn_password: Option<String>,
+    #[serde(default, alias = "remoteConfigUrl")]
+    remote_config_url: Option<String>,
 }
 
 /// 默认配置：只有设备身份，没有服务器凭据（用户需在设置页填写或手写 config.json）
@@ -174,6 +176,17 @@ fn ensure_config(app: &tauri::AppHandle) -> Result<(std::path::PathBuf, FlingCon
 /// 本地已有凭据优先（用户手动覆盖）；本地缺失则用嵌入的补。
 fn effective_config(app: &tauri::AppHandle) -> Result<FlingConfig, String> {
     let (_, mut cfg) = ensure_config(app)?;
+    // 远程配置（服务器下发）优先于嵌入配置，低于本地手动配置
+    if let Ok(remote) = app.state::<RemoteConfig>().0.lock() {
+        if let Some(r) = remote.as_ref() {
+            if cfg.server_url.trim().is_empty() { cfg.server_url = r.server_url.clone(); }
+            if cfg.api_key.trim().is_empty() { cfg.api_key = r.api_key.clone(); }
+            if cfg.api_secret.trim().is_empty() { cfg.api_secret = r.api_secret.clone(); }
+            if cfg.turn_url.is_none() { cfg.turn_url = r.turn_url.clone(); }
+            if cfg.turn_username.is_none() { cfg.turn_username = r.turn_username.clone(); }
+            if cfg.turn_password.is_none() { cfg.turn_password = r.turn_password.clone(); }
+        }
+    }
     if let Ok(e) = decrypt_embedded_config() {
         if cfg.server_url.trim().is_empty() { cfg.server_url = e.server_url; }
         if cfg.api_key.trim().is_empty() { cfg.api_key = e.api_key; }
@@ -183,6 +196,39 @@ fn effective_config(app: &tauri::AppHandle) -> Result<FlingConfig, String> {
         if cfg.turn_password.is_none() { cfg.turn_password = e.turn_password; }
     }
     Ok(cfg)
+}
+
+/// 远程下发的加密配置（内存缓存，不写盘）
+struct RemoteConfig(Mutex<Option<FlingConfig>>);
+
+/// 获取嵌入配置中的远程配置 URL（前端用它拉取服务器配置）
+#[tauri::command]
+fn get_remote_config_url(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    match decrypt_embedded_config() {
+        Ok(cfg) => Ok(cfg.remote_config_url.filter(|u| !u.trim().is_empty())),
+        Err(_) => Ok(None),
+    }
+}
+
+/// 应用从服务器拉取的加密配置（前端 fetch 后传 nonce/data，Rust 解密并缓存）
+#[tauri::command]
+fn apply_remote_config(app: tauri::AppHandle, nonce_b64: String, data_b64: String) -> Result<(), String> {
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+    use aes_gcm::aead::{Aead, KeyInit};
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    if !embedded_config::HAS_EMBEDDED {
+        return Err("no embedded key".into());
+    }
+    let nonce = B64.decode(nonce_b64.trim()).map_err(|e| format!("nonce: {e}"))?;
+    let data = B64.decode(data_b64.trim()).map_err(|e| format!("data: {e}"))?;
+    let key = Key::<Aes256Gcm>::from_slice(&embedded_config::CONFIG_KEY);
+    let cipher = Aes256Gcm::new(key);
+    let pt = cipher
+        .decrypt(Nonce::from_slice(&nonce), data.as_slice())
+        .map_err(|e| format!("decrypt remote config: {e}"))?;
+    let cfg: FlingConfig = serde_json::from_slice(&pt).map_err(|e| format!("parse: {e}"))?;
+    *app.state::<RemoteConfig>().0.lock().map_err(|e| format!("lock: {e}"))? = Some(cfg);
+    Ok(())
 }
 
 /// 解密编译时嵌入的服务器凭据（AES-256-GCM）。
@@ -883,6 +929,7 @@ fn main() {
             let (_, cfg) = ensure_config(app.handle())?;
             let (tx, rx) = mpsc::channel::<DiscoveryCmd>();
             app.manage(ConfigLock(Mutex::new(())));
+            app.manage(RemoteConfig(Mutex::new(None)));
             app.manage(DiscoveryState { tx });
             let handle = app.handle().clone();
             let (device_id, device_name) = (cfg.device_id, cfg.device_name);
@@ -916,7 +963,9 @@ fn main() {
             app_version,
             get_log_dir,
             append_log,
-            append_history
+            append_history,
+            get_remote_config_url,
+            apply_remote_config
         ])
         .run(tauri::generate_context!())
         .expect("error while running fling");
