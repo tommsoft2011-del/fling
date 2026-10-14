@@ -73,11 +73,13 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
       const r = el('div', 'tdetail-row');
       const st = it.status === 'done' ? '✓' : it.status === 'error' ? '✗' : it.status === 'active' ? '…' : '○';
       const p = it.totalBytes > 0 ? Math.min(100, Math.round((it.doneBytes / it.totalBytes) * 100)) : 0;
+      const ptxt = it.status === 'done' ? '100%' : it.status === 'error' ? (it.error ?? '失败') : p + '%';
       r.append(
         el('span', 'tdot ' + it.status, st),
         el('span', 'tname', it.name),
+        // 进度紧跟文件名后面
+        el('span', 'tprog', ptxt),
         el('span', 'tsize', fmtSize(it.size)),
-        el('span', 'tp', it.status === 'done' ? '完成' : it.status === 'error' ? (it.error ?? '失败') : p + '%'),
       );
       (r.querySelector('.tname') as HTMLElement).title = it.name;
       detail.appendChild(r);

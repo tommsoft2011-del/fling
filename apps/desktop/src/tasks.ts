@@ -675,6 +675,10 @@ export class RecvTask {
   private p2pLink: P2PLink | null = null;
   /** 正在落盘的 promise（task-done 到达时需等它们完成再发 task-ack） */
   private pendingSaves = new Set<Promise<void>>();
+  /** ack 重试定时器（ack 可能丢包，重发直到发送方离开或超时） */
+  private ackTimer: ReturnType<typeof setInterval> | null = null;
+  /** 发送方已离开（收到 ack 后关闭房间，ack 重试可停） */
+  private peerGone = false;
   /** 已收到 manifest 但还没落盘完成的个数（在途分块计数） */
   private pendingFiles = 0;
   /** 期望收到的 manifest 总数（offer 里 file/clipboard-image 的个数） */
@@ -967,6 +971,16 @@ export class RecvTask {
   }
 
   private onPeerLeft(): void {
+    // ack 已发出、房间保持打开等发送方确认：发送方离开 = 收到了 ack，停重试关房间
+    if (this.finished && this.ackTimer) {
+      this.peerGone = true;
+      if (this.ackTimer) {
+        clearInterval(this.ackTimer);
+        this.ackTimer = null;
+      }
+      void this.closeRoom();
+      return;
+    }
     if (!this.active || this.finished) return;
     log('task', 'peer left', { taskId: this.taskId });
     // 发送方发完 task-done 后 2s 关房间；若 4s 内没收到 task-done，视为中断
@@ -1052,17 +1066,6 @@ export class RecvTask {
     }
     this.phase = failed === 0 ? 'done' : 'error';
     if (failed > 0) this.error = `${failed} 项未完成`;
-    // 全部收齐并落盘：告诉发送方可以拆连接了（发送方收到前不会主动断开）
-    if (completed && failed === 0 && this.room) {
-      try {
-        // 先发最终进度（100%），再发 ack：避免发送端停留在过期的百分比上
-        await this.room.sendTaskProgress(this.taskId, this.doneBytes, this.totalBytes).catch(() => {});
-        await this.room.sendTaskAck(this.taskId);
-        log('task', 'task-ack sent', { taskId: this.taskId });
-      } catch {
-        /* 忽略 */
-      }
-    }
     this.endedAt = Date.now();
     this.notify();
     // 系统通知（纯加法，不影响传输逻辑）
@@ -1078,6 +1081,47 @@ export class RecvTask {
     });
     void flushLogs();
     await this.archive();
+
+    // 全部收齐并落盘：告诉发送方可以拆连接了（发送方收到前不会主动断开）
+    // ack 走中继但仍可能丢包（接收端发完就关房间）：flush 后每 3s 重发，
+    // 直到发送方离开（onPeerLeft）或 30s 超时，保证"接收成功但发送端未确认"不再发生。
+    // 注意：房间此时不关，等发送方确认后离开再关。
+    if (completed && failed === 0 && this.room) {
+      const room = this.room;
+      const sendAck = () => {
+        room.sendTaskAck(this.taskId).catch(() => {});
+        log('task', 'task-ack sent', { taskId: this.taskId });
+      };
+      try {
+        // 先发最终进度（100%），再发 ack：避免发送端停留在过期的百分比上
+        await room.sendTaskProgress(this.taskId, this.doneBytes, this.totalBytes).catch(() => {});
+        sendAck();
+        await room.flush().catch(() => {});
+      } catch {
+        /* 忽略 */
+      }
+      let retries = 0;
+      this.ackTimer = setInterval(() => {
+        if (this.peerGone || retries >= 10) {
+          if (this.ackTimer) clearInterval(this.ackTimer);
+          this.ackTimer = null;
+          void this.closeRoom();
+          return;
+        }
+        retries++;
+        sendAck();
+      }, 3000);
+      return;
+    }
+    await this.closeRoom();
+  }
+
+  /** 关闭房间（ack 重试结束或发送方已离开时调用） */
+  private async closeRoom(): Promise<void> {
+    if (this.ackTimer) {
+      clearInterval(this.ackTimer);
+      this.ackTimer = null;
+    }
     const r = this.room;
     this.room = undefined;
     if (r) await r.close().catch(() => {});
