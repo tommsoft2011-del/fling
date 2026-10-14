@@ -7,7 +7,6 @@ import { normalizeCode } from '@fling/core';
 
 let inited = false;
 const rows = new Map<string, CardHandle>();
-let drawerOpen = false;
 
 // 配对码监听状态（同时只保留一个）
 let lobbyLeave: (() => void) | null = null;
@@ -52,12 +51,6 @@ export function initRecvPage(): void {
     if (e.key === 'Enter') void confirmListen();
   });
 
-  // 抽屉折叠
-  $('#recvStrip').onclick = () => {
-    drawerOpen = !drawerOpen;
-    $('#recvCar').textContent = drawerOpen ? '▾' : '▴';
-    syncRecvDrawer();
-  };
 
   // 待确认超过 15 分钟自动清理
   setInterval(() => {
@@ -240,5 +233,6 @@ function syncRecvDrawer(): void {
   cnt.textContent = String(activeN);
   const firstActive = tasks.find((t) => t.active);
   $('#recvMini').textContent = firstActive ? `← ${firstActive.peerLabel}` : '';
-  list.hidden = !drawerOpen;
+  // 常驻面板：始终显示
+  list.hidden = false;
 }

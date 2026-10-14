@@ -64,7 +64,7 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
         totalB = pt;
       }
     }
-    const pctNum = totalB > 0 ? Math.min(100, Math.round((doneB / totalB) * 100)) : 0;
+    const pctNum = phase === 'done' ? 100 : totalB > 0 ? Math.min(100, Math.round((doneB / totalB) * 100)) : 0;
     fill.style.width = pctNum + '%';
     bar.classList.toggle('live', active && (phase === 'sending' || (phase as string) === 'receiving'));
 

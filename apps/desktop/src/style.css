@@ -364,13 +364,16 @@ button { font: inherit; cursor: pointer; }
 
 /* ---------- 底部任务抽屉 ---------- */
 #taskDrawer {
-  border-top: 1px solid var(--border); background: var(--surface-2);
-  margin: 18px -26px -40px; padding: 0 26px;
+  border: 1px solid var(--border); background: var(--surface);
+  border-radius: 8px; margin: 18px 0 0; padding: 0 16px;
+  min-height: 200px; display: flex; flex-direction: column;
+  flex: 1 1 auto;
 }
 #taskStrip {
   display: flex; align-items: center; gap: 8px; width: 100%;
   background: none; border: none; color: var(--text);
   padding: 9px 0; font-size: 13px; text-align: left;
+  cursor: default;
 }
 #taskStrip .car { color: var(--muted); font-size: 10px; }
 #taskStrip .cnt {
@@ -380,22 +383,23 @@ button { font: inherit; cursor: pointer; }
 }
 #taskStrip .cnt[hidden] { display: none; }
 #taskStrip .mini { margin-left: auto; color: var(--muted); font-size: 12px; }
-#taskRows { padding-bottom: 10px; }
-#taskRows[hidden] { display: none; }
+#taskRows { padding-bottom: 10px; flex: 1 1 auto; overflow-y: auto; min-height: 120px; }
 /* ---------- 接收页：底部任务抽屉（与发送页同构） ---------- */
 .recv-actions { margin: 14px 0 4px; }
 #recvDrawer {
-  border-top: 1px solid var(--border); background: var(--surface-2);
-  /* 停靠在接收页底部：内容不足一屏时 margin-top:auto 把它推到底部 */
-  margin: auto -26px -40px; padding: 0 26px;
+  border: 1px solid var(--border); background: var(--surface);
+  border-radius: 8px; margin: 18px 0 0; padding: 0 16px;
+  min-height: 200px; display: flex; flex-direction: column;
+  flex: 1 1 auto;
 }
 /* 接收页用 flex 列布局，让抽屉能贴底（v0.5.17 定稿：等待确认在内容区，接收任务底部停靠） */
 #page-recv.active { display: flex; flex-direction: column; min-height: 100%; }
 #recvStrip {
   display: flex; align-items: center; gap: 8px; width: 100%;
-  background: none; border: none; color: var(--text);
-  padding: 9px 0; font-size: 13px; text-align: left; cursor: pointer;
+  color: var(--text);
+  padding: 9px 0; font-size: 13px; text-align: left;
 }
+#recvTaskList { flex: 1 1 auto; overflow-y: auto; min-height: 120px; padding-bottom: 10px; }
 #recvStrip .car { color: var(--muted); font-size: 10px; }
 #recvStrip .cnt {
   background: var(--accent); color: var(--accent-text); font-size: 11px; font-weight: 700;

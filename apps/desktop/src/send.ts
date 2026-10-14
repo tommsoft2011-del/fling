@@ -13,7 +13,6 @@ let selectedTarget: SendTarget | null = null;
 let remoteCode: string | null = null; // 已配对的远程设备（一次一个，新的替换旧的）
 const rows = new Map<string, CardHandle>();
 let inited = false;
-let drawerOpen = false;
 
 export function initSendPage(): void {
   if (inited) return;
@@ -197,13 +196,6 @@ export function initSendPage(): void {
     const items = snapshotItems();
     if (items.length === 0 || !target) return;
     doSend(items, target);
-  };
-
-  // --- 任务抽屉开关 ---
-  $('#taskStrip').onclick = () => {
-    drawerOpen = !drawerOpen;
-    $('#taskRows').hidden = !drawerOpen;
-    $('#taskCar').textContent = drawerOpen ? '▾' : '▴';
   };
 
   manager.onChange(() => {
@@ -598,20 +590,16 @@ function syncTaskRows(): void {
     const firstActive = tasks.find((t) => t.active);
     $('#taskMini').textContent = firstActive ? `→ ${firstActive.peerLabel}` : '';
   }
-  if (!drawerOpen) {
-    list.hidden = true;
-  } else {
-    list.hidden = false;
-    // 展开时若无可见任务行，显示"暂无任务"
-    const hasVisible = [...rows.values()].some((h) => !h.isGone());
-    let emptyEl = list.querySelector('.tempty');
-    if (!hasVisible) {
-      if (!emptyEl) {
-        emptyEl = el('div', 'tempty', '暂无任务');
-        list.appendChild(emptyEl);
-      }
-    } else if (emptyEl) {
-      emptyEl.remove();
+  // 常驻面板：始终显示，无任务时显示"暂无任务"
+  list.hidden = false;
+  const hasVisible = [...rows.values()].some((h) => !h.isGone());
+  let emptyEl = list.querySelector('.tempty');
+  if (!hasVisible) {
+    if (!emptyEl) {
+      emptyEl = el('div', 'tempty', '暂无任务');
+      list.appendChild(emptyEl);
     }
+  } else if (emptyEl) {
+    emptyEl.remove();
   }
 }
