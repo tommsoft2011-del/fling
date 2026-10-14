@@ -642,6 +642,12 @@ fn read_file_bytes(path: String) -> Result<String, String> {
     Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
 }
 
+/// 判断路径是否为目录（供拖放时区分文件/文件夹）。
+#[tauri::command]
+fn is_dir(path: String) -> bool {
+    std::path::Path::new(&path).is_dir()
+}
+
 /// 递归列出目录下所有文件：返回 [{ rel_path, size }]，rel_path 用 "/" 分隔、
 /// 相对于 dir。供"添加文件夹"发送用（发送时再按需读文件内容）。
 #[tauri::command]
@@ -830,6 +836,7 @@ fn main() {
             write_image_clipboard,
             read_file_bytes,
             list_dir_recursive,
+            is_dir,
             open_folder,
             app_version,
             get_log_dir,

@@ -495,3 +495,14 @@ label.filebtn { cursor: pointer; }
 #composeBox:focus-within, .devtile.pair input:focus, .codeinput:focus {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent);
 }
+
+/* ================= v0.5.14 ================= */
+/* 分组内的任务行：去掉自身边框，用分隔线（避免与 .group 双层边框） */
+.group .trow {
+  border: none; border-radius: 0; margin-bottom: 0;
+  border-bottom: 1px solid var(--border);
+}
+.group .trow:last-child { border-bottom: none; }
+.group .trow:hover { background: var(--surface-2); }
+/* 拖放提示层：去掉白卡自身的虚线框，只保留文件区的虚线高亮 */
+#dropOverlay .box { border-style: solid; box-shadow: 0 12px 40px rgba(0,0,0,.18); }

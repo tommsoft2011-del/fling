@@ -101,8 +101,18 @@ export function initSendPage(): void {
     const paths = Array.isArray(pl) ? pl : (pl.paths ?? []);
     if (paths.length === 0) return;
     const batch: File[] = [];
+    let dirAdded = 0;
+    let dirSkipped = 0;
     for (const p of paths) {
       try {
+        // 拖进来的是文件夹 → 按"添加文件夹"处理；文件 → 读内容
+        const dir = (await invoke('is_dir', { path: p })) as boolean;
+        if (dir) {
+          const r = await addDirAsFolder(p);
+          dirAdded += r.added;
+          dirSkipped += r.skipped;
+          continue;
+        }
         const b64 = (await invoke('read_file_bytes', { path: p })) as string;
         const bin = b64ToBytes(b64);
         const name = p.split(/[/\\]/).pop() || '文件';
@@ -113,8 +123,9 @@ export function initSendPage(): void {
     }
     const before = fileItems.length;
     addFileItems(batch);
-    const added = fileItems.length - before;
+    const added = fileItems.length - before + dirAdded;
     if (added > 0) toast(`已添加 ${added} 个文件`);
+    if (dirSkipped > 0) toast(`已跳过 ${dirSkipped} 个重复文件`);
     refreshSendBtn();
   }).catch(() => { /* 非 Tauri 环境忽略 */ });
 
@@ -251,7 +262,23 @@ function addFolderFileItem(
 
 const isTauri = typeof window !== 'undefined' && !!(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
 
-/** Tauri：系统对话框选文件夹 → Rust 递归列文件（懒加载内容，发送时才读） */
+/** 把一个目录递归加入文件列表（懒加载内容，发送时才读） */
+async function addDirAsFolder(dir: string): Promise<{ added: number; skipped: number }> {
+  const base = dir.split(/[/\\]/).filter(Boolean).pop() || '文件夹';
+  const entries = (await invoke('list_dir_recursive', { dir })) as { rel_path: string; size: number }[];
+  let added = 0;
+  let skipped = 0;
+  for (const e of entries) {
+    const relPath = `${base}/${e.rel_path}`;
+    const filePath = dir.replace(/[/\\]$/, '') + '/' + e.rel_path;
+    const name = e.rel_path.split('/').pop() || e.rel_path;
+    if (addFolderFileItem(name, relPath, e.size, filePath)) added++;
+    else skipped++;
+  }
+  return { added, skipped };
+}
+
+/** Tauri：系统对话框选文件夹 → 递归加入 */
 async function pickFoldersTauri(): Promise<void> {
   const picked = await openDialog({ directory: true, multiple: true, title: '选择要发送的文件夹' });
   if (!picked) return;
@@ -259,20 +286,12 @@ async function pickFoldersTauri(): Promise<void> {
   let added = 0;
   let skipped = 0;
   for (const dir of dirs) {
-    const base = dir.split(/[/\\]/).filter(Boolean).pop() || '文件夹';
-    let entries: { rel_path: string; size: number }[];
     try {
-      entries = (await invoke('list_dir_recursive', { dir })) as { rel_path: string; size: number }[];
+      const r = await addDirAsFolder(dir);
+      added += r.added;
+      skipped += r.skipped;
     } catch (err) {
       toast(`读取文件夹失败：${err}`, true);
-      continue;
-    }
-    for (const e of entries) {
-      const relPath = `${base}/${e.rel_path}`;
-      const filePath = dir.replace(/[/\\]$/, '') + '/' + e.rel_path;
-      const name = e.rel_path.split('/').pop() || e.rel_path;
-      if (addFolderFileItem(name, relPath, e.size, filePath)) added++;
-      else skipped++;
     }
   }
   if (added > 0) toast(`已添加 ${added} 个文件`);

@@ -305,6 +305,8 @@ export class FlingRoom {
           totalChunks: m.totalChunks,
           // tolerate missing/unknown kind from older senders
           kind: m.kind === 'clipboard-image' ? 'clipboard-image' : 'file',
+          // 文件夹发送的相对路径（如 "docs/report.pdf"），老版本没有则为 undefined
+          path: typeof m.path === 'string' ? m.path : undefined,
         };
         this.incoming.set(manifest.id, { receiver: new FileReceiver(manifest), from });
         this.events.onFileManifest?.(manifest, from);
