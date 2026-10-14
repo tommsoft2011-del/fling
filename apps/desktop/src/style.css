@@ -415,14 +415,17 @@ button { font: inherit; cursor: pointer; }
 /* 任务详情（展开）：每个文件的状态行 */
 .trow-detail { padding: 4px 0 2px 22px; display: flex; flex-direction: column; gap: 2px; }
 .trow-detail[hidden] { display: none; }
-.tdetail-row { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--muted); }
+.tdetail-hint { font-size: 11px; color: var(--muted); padding: 2px 0 4px 22px; }
+.trow-detail { max-height: 260px; overflow-y: auto; }
+.tdetail-row { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--muted); padding: 2px 0; }
 .tdetail-row .tdot { width: 14px; text-align: center; flex-shrink: 0; }
 .tdetail-row .tdot.done { color: var(--accent); }
 .tdetail-row .tdot.error { color: var(--danger); }
 .tdetail-row .tdot.active { color: var(--accent); }
-.tdetail-row .tname { flex-shrink: 0; max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.tdetail-row .tname { flex-shrink: 0; max-width: 32%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
 .tdetail-row .tprog { flex-shrink: 0; font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 600; min-width: 44px; }
-.tdetail-row .tsize { flex-shrink: 0; font-variant-numeric: tabular-nums; margin-left: auto; }
+.tdetail-row .pbar { flex: 1; min-width: 60px; }
+.tdetail-row .tsize { flex-shrink: 0; font-variant-numeric: tabular-nums; }
 /* ---------- 接收页：底部任务抽屉（与发送页同构，ListView 风格） ---------- */
 .recv-actions { margin: 14px 0 4px; }
 #recvDrawer {

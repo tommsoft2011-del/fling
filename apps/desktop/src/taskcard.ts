@@ -39,15 +39,8 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
   const closeBtn = el('button', 'x', '✕') as HTMLButtonElement;
   closeBtn.title = '取消';
   top.append(arrow, peer, sum, pct, closeBtn);
-  // 下方：双进度条纵向排列（当前文件在上，总进度在下）与预计剩余时间
+  // 总进度条置顶（纵向布局的第一条）
   const bars = el('div', 'trow-bars');
-  const fileRow = el('div', 'tbar-row');
-  const fileLabel = el('span', 'tfile', '');
-  const fileBar = el('div', 'pbar thin');
-  const fileFill = el('div', 'pfill');
-  fileBar.appendChild(fileFill);
-  const filePct = el('span', 'tfpct', '');
-  fileRow.append(fileLabel, fileBar, filePct);
   const totalRow = el('div', 'tbar-row');
   const totalLabel = el('span', 'tfile', '总计');
   const totalBar = el('div', 'pbar thin');
@@ -55,8 +48,8 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
   totalBar.appendChild(totalFill);
   const eta = el('span', 'teta', '');
   totalRow.append(totalLabel, totalBar, eta);
-  bars.append(fileRow, totalRow);
-  // 详情：点击上行展开，显示每个文件的状态/进度
+  bars.append(totalRow);
+  // 文件列表：点击上行展开/收起，每个文件自带进度条
   const detail = el('div', 'trow-detail');
   detail.hidden = true;
   top.style.cursor = 'pointer';
@@ -69,16 +62,36 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
   };
   const renderDetail = () => {
     detail.innerHTML = '';
+    // "正在传送 x/y" 提示
+    const activeIdx = task.items.findIndex((i) => i.status === 'active');
+    const doneCount = task.items.filter((i) => i.status === 'done').length;
+    if (task.active) {
+      const hint = el('div', 'tdetail-hint',
+        activeIdx >= 0 ? `正在传送 ${activeIdx + 1}/${task.items.length}` : `已完成 ${doneCount}/${task.items.length}`);
+      detail.appendChild(hint);
+    }
     for (const it of task.items) {
       const r = el('div', 'tdetail-row');
       const st = it.status === 'done' ? '✓' : it.status === 'error' ? '✗' : it.status === 'active' ? '…' : '○';
-      const p = it.totalBytes > 0 ? Math.min(100, Math.round((it.doneBytes / it.totalBytes) * 100)) : 0;
+      // 发送端按接收/发送比率校准单文件进度，与总进度保持一致
+      let fileDoneB = it.doneBytes;
+      if (dir === 'send' && it.kind !== 'text') {
+        const pd = (task as SendTask).peerDoneBytes ?? 0;
+        if (pd > 0 && task.doneBytes > 0) {
+          fileDoneB = Math.min(it.totalBytes, it.doneBytes * Math.min(1, pd / task.doneBytes));
+        }
+      }
+      const p = it.totalBytes > 0 ? Math.min(100, Math.round((fileDoneB / it.totalBytes) * 100)) : 0;
       const ptxt = it.status === 'done' ? '100%' : it.status === 'error' ? (it.error ?? '失败') : p + '%';
+      const bar = el('div', 'pbar thin');
+      const fill = el('div', 'pfill');
+      fill.style.width = (it.status === 'done' ? 100 : p) + '%';
+      bar.appendChild(fill);
       r.append(
         el('span', 'tdot ' + it.status, st),
         el('span', 'tname', it.name),
-        // 进度紧跟文件名后面
         el('span', 'tprog', ptxt),
+        bar,
         el('span', 'tsize', fmtSize(it.size)),
       );
       (r.querySelector('.tname') as HTMLElement).title = it.name;
@@ -114,30 +127,8 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
     const pctNum = phase === 'done' ? 100 : totalB > 0 ? Math.min(100, Math.round((doneB / totalB) * 100)) : 0;
     totalFill.style.width = pctNum + '%';
     totalBar.classList.toggle('live', active && (phase === 'sending' || (phase as string) === 'receiving'));
-
-    // 当前文件：找正在传输的条目（active），没有则找第一个未完成的；
-    // 若全部发完在等 ack（phase 仍为 sending），用最后一个条目占位，避免进度条消失
-    const cur = task.items.find((i) => i.status === 'active')
-      ?? task.items.find((i) => i.status === 'waiting')
-      ?? (active ? task.items[task.items.length - 1] : undefined);
-    const waitingAck = active && task.items.length > 0 && task.items.every((i) => i.status === 'done' || i.status === 'error');
-    if (cur) {
-      // 发送端：总进度用对方上报的"已收到"，当前文件条也按 接收/发送 比率校准，
-      // 否则两条进度用不同数据源，高速传输时肉眼可见地打架（如 44% vs 46%）
-      let fileDoneB = cur.doneBytes;
-      if (dir === 'send' && pt > 0 && task.doneBytes > 0) {
-        const ratio = Math.min(1, pd / task.doneBytes);
-        fileDoneB = Math.min(cur.totalBytes, cur.doneBytes * ratio);
-      }
-      const fp = cur.totalBytes > 0 ? Math.min(100, Math.round((fileDoneB / cur.totalBytes) * 100)) : 0;
-      fileLabel.textContent = (waitingAck ? '等待对方确认 · ' : '') + (cur.name.length > 28 ? '…' + cur.name.slice(-27) : cur.name);
-      fileLabel.title = cur.name;
-      fileFill.style.width = fp + '%';
-      filePct.textContent = fp + '%';
-      bars.style.display = '';
-    } else {
-      bars.style.display = 'none';
-    }
+    // 右上角总百分比
+    pct.textContent = pctNum + '%';
 
     // 预计剩余时间：按当前速度估算
     const effSpeedForEta = task.speedBps > 0 ? task.speedBps : 0;
