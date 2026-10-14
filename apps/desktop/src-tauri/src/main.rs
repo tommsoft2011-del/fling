@@ -44,8 +44,12 @@ fn default_download_dir() -> String {
 
 #[derive(Serialize, Deserialize, Clone)]
 struct FlingConfig {
+    // 兼容手写配置：CLI/文档用驼峰，桌面端设置页用下划线，两边都接受
+    #[serde(alias = "serverUrl")]
     server_url: String,
+    #[serde(alias = "apiKey")]
     api_key: String,
+    #[serde(alias = "apiSecret")]
     api_secret: String,
     #[serde(default = "new_device_id")]
     device_id: String,
@@ -53,12 +57,27 @@ struct FlingConfig {
     device_name: String,
     #[serde(default = "default_download_dir")]
     download_dir: String,
-    #[serde(default)]
+    #[serde(default, alias = "turnUrl")]
     turn_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "turnUsername")]
     turn_username: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "turnPassword")]
     turn_password: Option<String>,
+}
+
+/// 默认配置：只有设备身份，没有服务器凭据（用户需在设置页填写或手写 config.json）
+fn default_config() -> FlingConfig {
+    FlingConfig {
+        server_url: String::new(),
+        api_key: String::new(),
+        api_secret: String::new(),
+        device_id: new_device_id(),
+        device_name: default_device_name(),
+        download_dir: default_download_dir(),
+        turn_url: None,
+        turn_username: None,
+        turn_password: None,
+    }
 }
 
 fn config_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -132,23 +151,28 @@ fn ensure_config(app: &tauri::AppHandle) -> Result<(std::path::PathBuf, FlingCon
     if p.exists() {
         let s = std::fs::read_to_string(&p).map_err(|e| format!("read: {e}"))?;
         let migrate = needs_migration(&s);
-        let cfg: FlingConfig = serde_json::from_str(&s).map_err(|e| format!("parse: {e}"))?;
+        let cfg: FlingConfig = match serde_json::from_str(&s) {
+            Ok(c) => c,
+            Err(e) => {
+                // 配置文件损坏：备份坏文件后重建默认配置，保证应用能启动
+                //（用户可在 config.json.bak 里找回原来的值）
+                let bak = p.with_extension("json.bak");
+                let _ = std::fs::rename(&p, &bak);
+                let cfg = default_config();
+                write_config_file(&p, &cfg)?;
+                eprintln!(
+                    "config parse failed ({e}); bad file backed up to {}",
+                    bak.display()
+                );
+                return Ok((p, cfg));
+            }
+        };
         if migrate {
             let _ = write_config_file(&p, &cfg);
         }
         return Ok((p, cfg));
     }
-    let cfg = FlingConfig {
-        server_url: String::new(),
-        api_key: String::new(),
-        api_secret: String::new(),
-        device_id: new_device_id(),
-        device_name: default_device_name(),
-        download_dir: default_download_dir(),
-        turn_url: None,
-        turn_username: None,
-        turn_password: None,
-    };
+    let cfg = default_config();
     write_config_file(&p, &cfg)?;
     Ok((p, cfg))
 }
@@ -893,6 +917,21 @@ mod tests {
         assert_eq!(cfg.device_id.len(), 32);
         assert!(!cfg.device_name.is_empty());
         assert!(cfg.download_dir.ends_with("Fling"));
+    }
+
+    #[test]
+    fn camel_case_config_parses() {
+        // 手写配置（CLI/文档格式）用驼峰：必须能解析，不能启动崩溃
+        let cfg: FlingConfig = serde_json::from_str(
+            r#"{"serverUrl":"wss://x","apiKey":"k","apiSecret":"s","turnUrl":"turn:1.2.3.4:3478","turnUsername":"u","turnPassword":"p"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server_url, "wss://x");
+        assert_eq!(cfg.api_key, "k");
+        assert_eq!(cfg.api_secret, "s");
+        assert_eq!(cfg.turn_url.as_deref(), Some("turn:1.2.3.4:3478"));
+        assert_eq!(cfg.turn_username.as_deref(), Some("u"));
+        assert_eq!(cfg.turn_password.as_deref(), Some("p"));
     }
 
     #[test]
