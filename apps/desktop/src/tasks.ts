@@ -920,6 +920,9 @@ export class RecvTask {
     }, 4000);
   }
 
+  /** offer 之前到达的远端 ICE candidate 缓存（发起方局域网 host candidate 极快，经常跑赢 offer，不能丢） */
+  private earlyIce: RTCIceCandidateInit[] = [];
+
   /** P2P 信令：发送方发来 offer 则以 responder 身份应答，其余转给已建的链路。 */
   private onP2PSignal(sig: Extract<FlingMessage, { kind: `p2p-${string}` }>): void {
     if (this.finished) return;
@@ -931,7 +934,22 @@ export class RecvTask {
         this.p2p = s;
         this.notify();
       };
+      // 把 offer 之前到达的 candidate 补上
+      const early = this.earlyIce;
+      this.earlyIce = [];
+      for (const init of early) link.addRemoteIce(init);
       void link.acceptOffer(sig.sdp);
+      return;
+    }
+    if (sig.kind === 'p2p-ice' && !this.p2pLink) {
+      // offer 还没到：先缓存，不能丢弃
+      if (sig.candidate) {
+        try {
+          this.earlyIce.push(JSON.parse(sig.candidate) as RTCIceCandidateInit);
+        } catch {
+          /* ignore */
+        }
+      }
       return;
     }
     void this.p2pLink?.handleSignal(sig);

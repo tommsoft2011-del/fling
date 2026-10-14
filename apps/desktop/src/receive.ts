@@ -1,5 +1,5 @@
-// 接收页：等待动画 / 配对码按钮 / 底部任务抽屉（等待确认 + 接收中，可折叠）
-// （"允许被发现"开关已移到设置页）
+// 接收页：等待动画 / 配对码按钮 / 等待确认（页面内分组）/ 接收任务（底部抽屉）
+// 配对监听作为"等待确认"的一行：配对码大字 + 倒计时 + 取消
 import { $, el, fmtSize, toast } from './ui.js';
 import { manager, type PendingOffer } from './tasks.js';
 import { createTaskRow, type CardHandle } from './taskcard.js';
@@ -9,10 +9,12 @@ let inited = false;
 const rows = new Map<string, CardHandle>();
 let drawerOpen = false;
 
-// 配对码监听状态
+// 配对码监听状态（同时只保留一个）
 let lobbyLeave: (() => void) | null = null;
 let lobbyCode: string | null = null;
 let lobbyTimer: ReturnType<typeof setTimeout> | null = null;
+let lobbyDeadline = 0;
+let countdownTimer: ReturnType<typeof setInterval> | null = null;
 const LOBBY_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟无请求自动停止
 
 export function initRecvPage(): void {
@@ -71,6 +73,13 @@ export function initRecvPage(): void {
   }, 60_000);
 
   manager.onChange(() => {
+    // 监听中收到 offer → 自动停止监听（行会变成接收/拒绝）
+    if (lobbyCode && manager.pending.size > 0) {
+      const viaThisCode = [...manager.pending.values()].some(
+        (p) => p.via === 'remote' && p.code === lobbyCode,
+      );
+      if (viaThisCode) stopListen(true);
+    }
     renderPending();
     syncRecvDrawer();
   });
@@ -78,41 +87,60 @@ export function initRecvPage(): void {
   syncRecvDrawer();
 }
 
-/** 开始配对码监听：在等待确认列表里加一个"监听中"伪行，超时自动删除 */
+/** 开始配对码监听：在等待确认列表加一行（配对码大字 + 倒计时） */
 async function startListen(code: string): Promise<void> {
   try {
     if (lobbyLeave) stopListen();
     lobbyLeave = await manager.joinLobby(code);
     lobbyCode = code;
-    // 5 分钟超时：无请求则自动停止并删除
+    lobbyDeadline = Date.now() + LOBBY_TIMEOUT_MS;
     if (lobbyTimer) clearTimeout(lobbyTimer);
     lobbyTimer = setTimeout(() => {
       stopListen();
       toast(`配对码 ${code} 等待超时，已停止监听`);
     }, LOBBY_TIMEOUT_MS);
-    // 开始监听时自动展开抽屉，方便看到等待行
-    drawerOpen = true;
-    $('#recvCar').textContent = '▾';
+    // 倒计时每秒刷新
+    if (countdownTimer) clearInterval(countdownTimer);
+    countdownTimer = setInterval(() => {
+      const cd = document.querySelector('.pend.pairing .countdown');
+      if (cd && lobbyCode) {
+        cd.textContent = fmtCountdown(lobbyDeadline - Date.now()) + ' 后自动停止';
+      } else if (countdownTimer) {
+        clearInterval(countdownTimer);
+        countdownTimer = null;
+      }
+    }, 1000);
     renderPending();
-    syncRecvDrawer();
     toast(`正在等待配对码 ${code} 的传输请求…`);
   } catch (e) {
     toast('加入配对房间失败：' + (e as Error).message, true);
   }
 }
 
-function stopListen(): void {
+function fmtCountdown(ms: number): string {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+/** 停止监听（silent=true 时不重复 toast，由调用方提示） */
+function stopListen(silent = false): void {
   if (lobbyTimer) {
     clearTimeout(lobbyTimer);
     lobbyTimer = null;
+  }
+  if (countdownTimer) {
+    clearInterval(countdownTimer);
+    countdownTimer = null;
   }
   if (lobbyLeave) {
     lobbyLeave();
     lobbyLeave = null;
   }
   lobbyCode = null;
-  renderPending();
-  syncRecvDrawer();
+  if (!silent) {
+    renderPending();
+    syncRecvDrawer();
+  }
 }
 
 /** 离开接收页：断开配对码监听（附近 inbox 常驻不受影响） */
@@ -133,15 +161,15 @@ function renderPending(): void {
   }
   cnt.hidden = false;
   cnt.textContent = String(total);
-  // 监听中伪行（虚线）：可手动取消
+  // 配对监听行置顶：配对码大字 + 倒计时 + 取消
   if (lobbyCode) {
-    const row = el('div', 'pend listening');
+    const row = el('div', 'pend pairing');
     const info = el('div', 'pinfo');
-    info.append(
-      el('div', 'pfrom', `🔗 正在等待配对码 ${lobbyCode} 的传输请求…`),
-      el('div', 'pitems', '对方发送后会出现在这里确认，5 分钟无请求自动停止'),
-    );
-    const cancel = el('button', 'btn-no pcancel', '取消') as HTMLButtonElement;
+    const codeLine = el('div', 'pcode', lobbyCode);
+    const cd = el('span', 'countdown', fmtCountdown(lobbyDeadline - Date.now()) + ' 后自动停止');
+    codeLine.appendChild(cd);
+    info.append(codeLine, el('div', 'pstatus', '正在进行配对'));
+    const cancel = el('button', 'btn-ok', '取消') as HTMLButtonElement;
     cancel.onclick = () => stopListen();
     row.append(info, cancel);
     host.appendChild(row);
@@ -205,21 +233,12 @@ function syncRecvDrawer(): void {
     emptyEl.remove();
   }
 
-  // 抽屉状态条：待确认 + 进行中的总数
-  const pendingN = manager.pending.size + (lobbyCode ? 1 : 0);
+  // 抽屉状态条：只统计真正的接收任务（监听不进抽屉）
   const activeN = tasks.filter((t) => t.active).length;
-  const n = pendingN + activeN;
   const cnt = $('#recvCount');
-  cnt.hidden = n === 0;
-  cnt.textContent = String(n);
+  cnt.hidden = activeN === 0;
+  cnt.textContent = String(activeN);
   const firstActive = tasks.find((t) => t.active);
-  const firstPending = [...manager.pending.values()].sort((a, b) => b.at - a.at)[0];
-  $('#recvMini').textContent = firstActive
-    ? `← ${firstActive.peerLabel}`
-    : firstPending
-      ? `待确认：${firstPending.offer.fromDevice}`
-      : lobbyCode
-        ? `监听中：${lobbyCode}`
-        : '';
+  $('#recvMini').textContent = firstActive ? `← ${firstActive.peerLabel}` : '';
   list.hidden = !drawerOpen;
 }

@@ -267,6 +267,12 @@ export class P2PLink {
     }
   }
 
+  /** offer 到达前就收到的远端 ICE candidate（task 层缓存转交），进 pending 队列等 setRemoteDescription 后 flush */
+  addRemoteIce(init: RTCIceCandidateInit): void {
+    this.pendingIce.push(init);
+    this.iceRemote++;
+  }
+
   private async flushIce(): Promise<void> {
     const pc = this.pc;
     if (!pc) return;

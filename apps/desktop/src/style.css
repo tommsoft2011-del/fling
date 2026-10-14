@@ -293,7 +293,7 @@ button { font: inherit; cursor: pointer; }
 #pairStatus { margin-top: 8px; min-height: 18px; }
 
 /* ---------- toast ---------- */
-#toasts { position: fixed; right: 18px; bottom: 18px; z-index: 100; display: flex; flex-direction: column; gap: 8px; }
+#toasts { position: fixed; right: 18px; top: 18px; z-index: 100; display: flex; flex-direction: column; gap: 8px; }
 .toast {
   background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--accent);
   border-radius: 10px; padding: 10px 16px; box-shadow: var(--shadow); font-size: 13px;
@@ -403,9 +403,11 @@ button { font: inherit; cursor: pointer; }
 #recvStrip .mini { margin-left: auto; color: var(--muted); font-size: 12px; }
 #recvTaskList { padding-bottom: 10px; }
 #recvTaskList[hidden] { display: none; }
-/* 监听中伪行 */
-.pend.listening { border-style: dashed; }
-.pend .pcancel { margin-left: auto; }
+/* 配对监听行：配对码大字 + 倒计时 */
+.pend.pairing { align-items: center; }
+.pend.pairing .pcode { font-size: 20px; font-weight: 800; letter-spacing: 2px; }
+.pend.pairing .pcode .countdown { font-size: 12px; font-weight: 400; letter-spacing: 0; color: var(--muted); margin-left: 10px; }
+.pend.pairing .pstatus { color: var(--muted); font-size: 12px; margin-top: 2px; }
 
 /* 紧凑任务行 */
 .trow {
