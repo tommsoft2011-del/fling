@@ -1055,6 +1055,8 @@ export class RecvTask {
     // 全部收齐并落盘：告诉发送方可以拆连接了（发送方收到前不会主动断开）
     if (completed && failed === 0 && this.room) {
       try {
+        // 先发最终进度（100%），再发 ack：避免发送端停留在过期的百分比上
+        await this.room.sendTaskProgress(this.taskId, this.doneBytes, this.totalBytes).catch(() => {});
         await this.room.sendTaskAck(this.taskId);
         log('task', 'task-ack sent', { taskId: this.taskId });
       } catch {

@@ -108,12 +108,12 @@ export function initSendPage(): void {
       toast('请把文件拖到文件区域', true);
       return;
     }
-    const batch: File[] = [];
     let dirAdded = 0;
     let dirSkipped = 0;
+    let fileAdded = 0;
     for (const p of paths) {
       try {
-        // 拖进来的是文件夹 → 按"添加文件夹"处理；文件 → 读内容
+        // 拖进来的是文件夹 → 按"添加文件夹"处理；文件 → 懒加载（只记路径+大小，发送时才读内容）
         const dir = (await invoke('is_dir', { path: p })) as boolean;
         if (dir) {
           const r = await addDirAsFolder(p);
@@ -121,17 +121,14 @@ export function initSendPage(): void {
           dirSkipped += r.skipped;
           continue;
         }
-        const b64 = (await invoke('read_file_bytes', { path: p })) as string;
-        const bin = b64ToBytes(b64);
         const name = p.split(/[/\\]/).pop() || '文件';
-        batch.push(new File([bin as unknown as BlobPart], name));
+        const size = (await invoke('file_size', { path: p })) as number;
+        if (addLazyFileItem(name, size, p)) fileAdded++;
       } catch (err) {
         toast(`读取拖放文件失败：${err}`, true);
       }
     }
-    const before = fileItems.length;
-    addFileItems(batch);
-    const added = fileItems.length - before + dirAdded;
+    const added = fileAdded + dirAdded;
     if (added > 0) toast(`已添加 ${added} 个文件`);
     if (dirSkipped > 0) toast(`已跳过 ${dirSkipped} 个重复文件`);
     refreshSendBtn();
@@ -249,6 +246,19 @@ function addFileItems(files: File[]): void {
     if (!addFileItem(f)) skipped++;
   }
   if (skipped > 0) toast(`已跳过 ${skipped} 个重复文件`);
+}
+
+/**
+ * 懒加载添加（Tauri 拖放）：不读文件内容，只记路径+大小；
+ * 发送时由 tasks.ts 经 read_file_bytes 按需读取，避免大文件拖放卡死。
+ */
+function addLazyFileItem(name: string, size: number, filePath: string): boolean {
+  const dup = fileItems.some((c) => (c.relPath ?? c.name) === name && c.size === size);
+  if (dup) return false;
+  fileItems.push({ uid: uid('c'), kind: 'file', name, size, filePath });
+  renderFileList();
+  refreshSendBtn();
+  return true;
 }
 
 /** 添加文件夹中的单个文件（relPath 如 "docs/report.pdf"） */

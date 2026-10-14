@@ -402,15 +402,26 @@ button { font: inherit; cursor: pointer; }
 .trow:last-child { border-bottom: none; }
 .trow:hover { background: var(--surface-2); border-color: var(--border); }
 .trow-top { display: flex; align-items: center; gap: 10px; }
-/* 下行：双进度条（当前文件 + 总计） */
-.trow-bars { display: flex; align-items: center; gap: 8px; padding-left: 22px; }
+/* 下方：双进度条纵向排列（当前文件在上，总进度在下） */
+.trow-bars { display: flex; flex-direction: column; gap: 3px; padding-left: 22px; }
+.tbar-row { display: flex; align-items: center; gap: 8px; }
 .trow-bars .tfile {
-  flex-shrink: 0; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex-shrink: 0; width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   color: var(--muted); font-size: 11.5px;
 }
 .trow-bars .pbar.thin { height: 4px; flex: 1; min-width: 60px; }
 .trow-bars .tfpct { flex-shrink: 0; font-size: 11px; color: var(--muted); min-width: 34px; font-variant-numeric: tabular-nums; }
 .trow-bars .teta { flex-shrink: 0; font-size: 11px; color: var(--muted); margin-left: auto; font-variant-numeric: tabular-nums; }
+/* 任务详情（展开）：每个文件的状态行 */
+.trow-detail { padding: 4px 0 2px 22px; display: flex; flex-direction: column; gap: 2px; }
+.trow-detail[hidden] { display: none; }
+.tdetail-row { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--muted); }
+.tdetail-row .tdot { width: 14px; text-align: center; flex-shrink: 0; }
+.tdetail-row .tdot.done { color: var(--accent); }
+.tdetail-row .tdot.error { color: var(--danger); }
+.tdetail-row .tdot.active { color: var(--accent); }
+.tdetail-row .tname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.tdetail-row .tsize, .tdetail-row .tp { flex-shrink: 0; font-variant-numeric: tabular-nums; }
 /* ---------- 接收页：底部任务抽屉（与发送页同构，ListView 风格） ---------- */
 .recv-actions { margin: 14px 0 4px; }
 #recvDrawer {

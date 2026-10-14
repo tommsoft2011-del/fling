@@ -39,19 +39,51 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
   const closeBtn = el('button', 'x', '✕') as HTMLButtonElement;
   closeBtn.title = '取消';
   top.append(arrow, peer, sum, pct, closeBtn);
-  // 下行：双进度条（当前文件 + 总计）与预计剩余时间
+  // 下方：双进度条纵向排列（当前文件在上，总进度在下）与预计剩余时间
   const bars = el('div', 'trow-bars');
+  const fileRow = el('div', 'tbar-row');
   const fileLabel = el('span', 'tfile', '');
   const fileBar = el('div', 'pbar thin');
   const fileFill = el('div', 'pfill');
   fileBar.appendChild(fileFill);
   const filePct = el('span', 'tfpct', '');
+  fileRow.append(fileLabel, fileBar, filePct);
+  const totalRow = el('div', 'tbar-row');
+  const totalLabel = el('span', 'tfile', '总计');
   const totalBar = el('div', 'pbar thin');
   const totalFill = el('div', 'pfill');
   totalBar.appendChild(totalFill);
   const eta = el('span', 'teta', '');
-  bars.append(fileLabel, fileBar, filePct, totalBar, eta);
-  root.append(top, bars);
+  totalRow.append(totalLabel, totalBar, eta);
+  bars.append(fileRow, totalRow);
+  // 详情：点击上行展开，显示每个文件的状态/进度
+  const detail = el('div', 'trow-detail');
+  detail.hidden = true;
+  top.style.cursor = 'pointer';
+  top.title = '点击展开/收起文件详情';
+  top.onclick = (e) => {
+    // 点 ✕ 按钮不触发展开
+    if ((e.target as HTMLElement).closest('.x')) return;
+    detail.hidden = !detail.hidden;
+    if (!detail.hidden) renderDetail();
+  };
+  const renderDetail = () => {
+    detail.innerHTML = '';
+    for (const it of task.items) {
+      const r = el('div', 'tdetail-row');
+      const st = it.status === 'done' ? '✓' : it.status === 'error' ? '✗' : it.status === 'active' ? '…' : '○';
+      const p = it.totalBytes > 0 ? Math.min(100, Math.round((it.doneBytes / it.totalBytes) * 100)) : 0;
+      r.append(
+        el('span', 'tdot ' + it.status, st),
+        el('span', 'tname', it.name),
+        el('span', 'tsize', fmtSize(it.size)),
+        el('span', 'tp', it.status === 'done' ? '完成' : it.status === 'error' ? (it.error ?? '失败') : p + '%'),
+      );
+      (r.querySelector('.tname') as HTMLElement).title = it.name;
+      detail.appendChild(r);
+    }
+  };
+  root.append(top, bars, detail);
 
   let dismissTimer: ReturnType<typeof setTimeout> | undefined;
   let gone = false;
@@ -63,6 +95,8 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
     if (gone) return;
     const phase = task.phase;
     const active = task.active;
+    // 详情展开时跟随刷新
+    if (!detail.hidden) renderDetail();
 
     // 进度：发送端优先用对方真实接收进度
     let doneB = task.doneBytes;
@@ -79,12 +113,15 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
     totalFill.style.width = pctNum + '%';
     totalBar.classList.toggle('live', active && (phase === 'sending' || (phase as string) === 'receiving'));
 
-    // 当前文件：找正在传输的条目（active），没有则找第一个未完成的
+    // 当前文件：找正在传输的条目（active），没有则找第一个未完成的；
+    // 若全部发完在等 ack（phase 仍为 sending），用最后一个条目占位，避免进度条消失
     const cur = task.items.find((i) => i.status === 'active')
-      ?? task.items.find((i) => i.status === 'waiting');
-    if (cur && active) {
+      ?? task.items.find((i) => i.status === 'waiting')
+      ?? (active ? task.items[task.items.length - 1] : undefined);
+    const waitingAck = active && task.items.length > 0 && task.items.every((i) => i.status === 'done' || i.status === 'error');
+    if (cur) {
       const fp = cur.totalBytes > 0 ? Math.min(100, Math.round((cur.doneBytes / cur.totalBytes) * 100)) : 0;
-      fileLabel.textContent = cur.name.length > 28 ? '…' + cur.name.slice(-27) : cur.name;
+      fileLabel.textContent = (waitingAck ? '等待对方确认 · ' : '') + (cur.name.length > 28 ? '…' + cur.name.slice(-27) : cur.name);
       fileLabel.title = cur.name;
       fileFill.style.width = fp + '%';
       filePct.textContent = fp + '%';

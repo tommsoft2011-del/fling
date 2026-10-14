@@ -679,6 +679,16 @@ fn read_file_bytes(path: String) -> Result<String, String> {
     Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
 }
 
+/// 取文件大小（不读内容，供拖放时懒加载：只记路径+大小，发送时才读）。
+#[tauri::command]
+fn file_size(path: String) -> Result<u64, String> {
+    let meta = std::fs::metadata(&path).map_err(|e| format!("读取文件失败: {e}"))?;
+    if !meta.is_file() {
+        return Err("不是文件".into());
+    }
+    Ok(meta.len())
+}
+
 /// 判断路径是否为目录（供拖放时区分文件/文件夹）。
 #[tauri::command]
 fn is_dir(path: String) -> bool {
@@ -873,6 +883,7 @@ fn main() {
             discovery_set_discoverable,
             write_image_clipboard,
             read_file_bytes,
+            file_size,
             list_dir_recursive,
             is_dir,
             open_folder,
