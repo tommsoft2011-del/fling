@@ -2,3 +2,7 @@ node_modules/
 dist/
 .local/
 *.log
+# 本地敏感文件：明文配置和加密包，永不提交
+plain-config.json
+bundle.json
+fling-config-encrypted.json
