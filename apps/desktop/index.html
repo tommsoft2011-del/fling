@@ -56,7 +56,7 @@
                 </div>
                 <div id="fileListWrap">
                   <div id="fileDropHint" hidden><span>松开鼠标添加文件</span></div>
-                  <div class="filelist-head"><span class="hint" id="fileCountHint"></span></div>
+                  <div class="filelist-head"><span class="hint" id="fileCountHint"></span><button id="clearFilesBtn" class="linkbtn" hidden>清空</button></div>
                   <div id="fileList"><div class="empty">还没有文件 — 点「添加文件」，或把文件拖到这里</div></div>
                   <div class="compose-actions">
                     <label class="filebtn">＋ 添加文件<input type="file" id="fileInput" multiple hidden /></label>
@@ -93,26 +93,17 @@
               <div class="wt">正在等待接收…</div>
               <div class="hint">对方可通过附近设备或配对码向你发送</div>
             </div>
-            <div class="group">
-              <div class="grow">
-                <div class="lab">配对码接收</div>
-                <div class="right">
-                  <input id="pairRecvInput" class="codeinput" maxlength="8" placeholder="6 位配对码" autocomplete="off" />
-                  <button id="pairRecvBtn" class="nbtn">开始监听</button>
-                </div>
-              </div>
-              <div class="grow" id="lobbyStatusRow" hidden>
-                <div class="lab"><span class="livedot"></span>正在监听 <b id="lobbyCodeLabel"></b></div>
-                <div class="right"><button class="linkbtn" id="lobbyStopBtn">停止</button></div>
-              </div>
+            <div class="recv-actions">
+              <button id="pairRecvBtn" class="nbtn">🔗 配对码接收</button>
             </div>
-            <div class="ghead">等待确认 <span class="cnt" id="pendingCount" hidden></span></div>
-            <div class="group">
-              <div id="pendingList"><div class="empty">暂无待确认的传输</div></div>
-            </div>
-            <div class="ghead">接收中</div>
-            <div class="group">
-              <div id="recvRows"><div class="empty">暂无正在接收的任务</div></div>
+            <div id="recvDrawer">
+              <button id="recvStrip"><span class="car" id="recvCar">▴</span> 接收任务 <span class="cnt" id="recvCount" hidden></span><span class="mini" id="recvMini"></span></button>
+              <div id="recvTaskList" hidden>
+                <div class="ghead">等待确认 <span class="cnt" id="pendingCount" hidden></span></div>
+                <div class="group"><div id="pendingList"><div class="empty">暂无待确认的传输</div></div></div>
+                <div class="ghead">接收中</div>
+                <div class="group"><div id="recvRows"><div class="empty">暂无正在接收的任务</div></div></div>
+              </div>
             </div>
           </section>
 
@@ -182,6 +173,18 @@
 
     <div id="toasts"></div>
 
+    <!-- 配对码接收弹窗（接收页） -->
+    <div id="recvPairModal" class="modal" hidden>
+      <div class="modal-box">
+        <h3>配对码接收</h3>
+        <p class="hint">输入对方告诉你的配对码，开始等待对方的传输请求</p>
+        <input id="recvPairCodeInput" class="textinput big-code" maxlength="8" placeholder="6 位配对码" autocomplete="off" />
+        <div class="modal-actions">
+          <button class="ghostbtn" id="recvPairCancel">取消</button>
+          <button class="primary" id="recvPairOk">开始等待</button>
+        </div>
+      </div>
+    </div>
     <!-- 远程配对弹窗（发送页） -->
     <div id="pairModal" class="modal" hidden>
       <div class="modal-box">

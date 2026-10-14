@@ -9,6 +9,8 @@ export interface CardHandle {
   root: HTMLElement;
   update: () => void;
   destroy: () => void;
+  /** 行是否已被自动消除（5s 淡出后）；sync 循环不应再把它加回 DOM */
+  isGone: () => boolean;
 }
 
 function summarizeItems(task: AnyTask): string {
@@ -42,6 +44,9 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
 
   let dismissTimer: ReturnType<typeof setTimeout> | undefined;
   let gone = false;
+  // 停滞检测：记录字节数最后一次推进的时间
+  let lastDoneB = -1;
+  let lastAdvanceT = Date.now();
 
   const update = () => {
     if (gone) return;
@@ -68,7 +73,19 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
     if (phase === 'preparing' || phase === 'waiting') {
       status = dir === 'send' ? (task as SendTask).waitLabel + '…' : '连接中…';
     } else if (phase === 'sending' || (phase as string) === 'receiving') {
-      status = `${pctNum}%` + (task.speedBps > 0 ? ` · ${fmtSpeed(task.speedBps)}` : '');
+      // 字节推进跟踪：3s 无推进速度显示为 0；15s 无推进显示"停滞"
+      if (doneB !== lastDoneB) {
+        lastDoneB = doneB;
+        lastAdvanceT = Date.now();
+      }
+      const idleMs = Date.now() - lastAdvanceT;
+      const effSpeed = idleMs > 3000 ? 0 : task.speedBps;
+      if (idleMs > 15000 && pctNum < 100) {
+        status = `⚠ 停滞 ${pctNum}%`;
+        statusCls = 'bad';
+      } else {
+        status = `${pctNum}%` + (effSpeed > 0 ? ` · ${fmtSpeed(effSpeed)}` : '');
+      }
     } else if (phase === 'done') {
       status = '✓ 完成';
       statusCls = 'ok';
@@ -119,5 +136,5 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
   };
 
   update();
-  return { root, update, destroy };
+  return { root, update, destroy, isGone: () => gone };
 }

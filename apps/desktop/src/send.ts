@@ -148,6 +148,11 @@ export function initSendPage(): void {
   });
 
   // --- 添加文件夹：Tauri 用系统对话框多选；纯浏览器用 webkitdirectory 兜底 ---
+  ($('#clearFilesBtn') as HTMLButtonElement).onclick = () => {
+    fileItems.length = 0;
+    renderFileList();
+    refreshSendBtn();
+  };
   $('#addFolderBtn').onclick = () => {
     if (isTauri) {
       pickFoldersTauri().catch((err) => toast(`选择文件夹失败：${err}`, true));
@@ -365,16 +370,40 @@ function renderChips(): void {
     clipItems.length > 0 ? `${clipItems.length} 张剪贴板图片` : '';
 }
 
+// 按扩展名给文件配图标（emoji 近似）。真系统图标需走 Shell API
+// （Rust 调 SHGetFileInfo 取图标再转码），成本高，先用扩展名映射。
+function fileIcon(name: string): string {
+  const ext = name.split('.').pop()?.toLowerCase() ?? '';
+  const map: Record<string, string> = {
+    pdf: '\u{1F4D5}',
+    doc: '\u{1F4D8}', docx: '\u{1F4D8}', rtf: '\u{1F4D8}',
+    xls: '\u{1F4CA}', xlsx: '\u{1F4CA}', csv: '\u{1F4CA}',
+    ppt: '\u{1F4CA}', pptx: '\u{1F4CA}',
+    txt: '\u{1F4DD}', md: '\u{1F4DD}', log: '\u{1F4DD}',
+    png: '\u{1F5BC}\uFE0F', jpg: '\u{1F5BC}\uFE0F', jpeg: '\u{1F5BC}\uFE0F',
+    gif: '\u{1F5BC}\uFE0F', bmp: '\u{1F5BC}\uFE0F', webp: '\u{1F5BC}\uFE0F', svg: '\u{1F5BC}\uFE0F',
+    mp4: '\u{1F3AC}', mkv: '\u{1F3AC}', avi: '\u{1F3AC}', mov: '\u{1F3AC}', wmv: '\u{1F3AC}',
+    mp3: '\u{1F3B5}', wav: '\u{1F3B5}', flac: '\u{1F3B5}', ogg: '\u{1F3B5}', m4a: '\u{1F3B5}',
+    zip: '\u{1F4E6}', rar: '\u{1F4E6}', '7z': '\u{1F4E6}', tar: '\u{1F4E6}', gz: '\u{1F4E6}',
+    ino: '\u2699\uFE0F', c: '\u2699\uFE0F', h: '\u2699\uFE0F', cpp: '\u2699\uFE0F',
+    cs: '\u2699\uFE0F', go: '\u2699\uFE0F', rs: '\u2699\uFE0F', java: '\u2615',
+    js: '\u{1F4DC}', ts: '\u{1F4DC}', py: '\u{1F40D}', html: '\u{1F310}', css: '\u{1F3A8}',
+    json: '\u{1F4CB}', xml: '\u{1F4CB}', filters: '\u{1F4CB}', vcxproj: '\u{1F4CB}',
+    exe: '\u2699\uFE0F', msi: '\u2699\uFE0F', apk: '\u{1F4F1}', dmg: '\u{1F4BF}',
+  };
+  return map[ext] ?? '\u{1F4C4}';
+}
+
 function renderFileList(): void {
   const host = $('#fileList');
   host.innerHTML = '';
   if (fileItems.length === 0) {
-    host.appendChild(el('div', 'empty', '还没有文件 — 点「添加文件」，或直接把文件拖进来'));
+    host.appendChild(el('div', 'empty', '还没有文件 — 点「添加文件」，或把文件拖到这里'));
   } else {
     for (const c of fileItems) {
       const row = el('div', 'frow');
       const label = c.relPath ?? c.name;
-      const icon = el('span', 'fic', c.relPath ? '\u{1F4C1}' : '\u{1F4C4}');
+      const icon = el('span', 'fic', c.relPath ? '\u{1F4C1}' : fileIcon(c.name));
       const nm = el('span', 'fname', label);
       nm.title = label;
       row.append(icon, nm, el('span', 'fsize', fmtSize(c.size)));
@@ -389,6 +418,7 @@ function renderFileList(): void {
   const fh = $('#fileCountHint');
   if (fh) fh.textContent =
     fileItems.length > 0 ? `${fileItems.length} 个文件 · 共 ${fmtSize(total)}` : '';
+  ($('#clearFilesBtn') as HTMLButtonElement).hidden = fileItems.length === 0;
 }
 
 function snapshotItems(): ComposeItem[] {
@@ -546,7 +576,7 @@ function syncTaskRows(): void {
       h = createTaskRow(t, 'send');
       rows.set(t.taskId, h);
     }
-    list.appendChild(h.root);
+    if (!h.isGone()) list.appendChild(h.root);
     h.update();
   }
   for (const [id, h] of [...rows]) {
@@ -564,8 +594,24 @@ function syncTaskRows(): void {
     const cnt = $('#taskCount');
     cnt.hidden = activeCount === 0;
     cnt.textContent = String(activeCount);
-    const first = tasks.find((t) => t.active) ?? tasks[0];
-    $('#taskMini').textContent = first.active ? `→ ${first.peerLabel}` : `${first.peerLabel} · 完成`;
+    // 右侧文案只在有进行中任务时显示；全部完成后不保留"xx·完成"
+    const firstActive = tasks.find((t) => t.active);
+    $('#taskMini').textContent = firstActive ? `→ ${firstActive.peerLabel}` : '';
   }
-  if (!drawerOpen) list.hidden = true;
+  if (!drawerOpen) {
+    list.hidden = true;
+  } else {
+    list.hidden = false;
+    // 展开时若无可见任务行，显示"暂无任务"
+    const hasVisible = [...rows.values()].some((h) => !h.isGone());
+    let emptyEl = list.querySelector('.tempty');
+    if (!hasVisible) {
+      if (!emptyEl) {
+        emptyEl = el('div', 'tempty', '暂无任务');
+        list.appendChild(emptyEl);
+      }
+    } else if (emptyEl) {
+      emptyEl.remove();
+    }
+  }
 }

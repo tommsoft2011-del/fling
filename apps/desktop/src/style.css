@@ -109,7 +109,8 @@ button { font: inherit; cursor: pointer; }
   pointer-events: none;
 }
 #fileDropHint[hidden] { display: none; }
-.filelist-head { margin-bottom: 4px; min-height: 18px; }
+.filelist-head { margin-bottom: 4px; min-height: 18px; display: flex; justify-content: space-between; align-items: center; }
+.tempty { padding: 18px; text-align: center; color: var(--muted); font-size: 13px; }
 .filelist-head .hint:empty { display: none; }
 .compose-hint { min-height: 18px; padding: 0 4px; }
 .compose-hint .hint:empty { display: none; }
@@ -381,6 +382,30 @@ button { font: inherit; cursor: pointer; }
 #taskStrip .mini { margin-left: auto; color: var(--muted); font-size: 12px; }
 #taskRows { padding-bottom: 10px; }
 #taskRows[hidden] { display: none; }
+/* ---------- 接收页：底部任务抽屉（与发送页同构） ---------- */
+.recv-actions { margin: 14px 0 4px; }
+#recvDrawer {
+  border-top: 1px solid var(--border); background: var(--surface-2);
+  margin: 18px -26px -40px; padding: 0 26px;
+}
+#recvStrip {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  background: none; border: none; color: var(--text);
+  padding: 9px 0; font-size: 13px; text-align: left; cursor: pointer;
+}
+#recvStrip .car { color: var(--muted); font-size: 10px; }
+#recvStrip .cnt {
+  background: var(--accent); color: var(--accent-text); font-size: 11px; font-weight: 700;
+  min-width: 18px; height: 18px; border-radius: 9px;
+  display: inline-flex; align-items: center; justify-content: center; padding: 0 5px;
+}
+#recvStrip .cnt[hidden] { display: none; }
+#recvStrip .mini { margin-left: auto; color: var(--muted); font-size: 12px; }
+#recvTaskList { padding-bottom: 10px; }
+#recvTaskList[hidden] { display: none; }
+/* 监听中伪行 */
+.pend.listening { border-style: dashed; }
+.pend .pcancel { margin-left: auto; }
 
 /* 紧凑任务行 */
 .trow {
