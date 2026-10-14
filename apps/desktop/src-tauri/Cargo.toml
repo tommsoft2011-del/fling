@@ -1,6 +1,6 @@
 [package]
 name = "fling-desktop"
-version = "0.5.31"
+version = "0.5.32"
 description = "Fling — fling text and files between your devices"
 authors = ["tommsoft2011-del"]
 edition = "2021"

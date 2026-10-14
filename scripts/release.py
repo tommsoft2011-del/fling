@@ -2,9 +2,13 @@
 """发版脚本：升级版本号 → 提交 → 打 tag（一键完成）
 
 用法：
-  python3 scripts/release.py 0.5.31 "提交信息"
-  python3 scripts/release.py patch "提交信息"     # 自动 +0.0.1
-  python3 scripts/release.py minor "提交信息"     # 自动 +0.1.0
+  python3 scripts/release.py 0.5.31 "提交信息" [额外文件...]
+  python3 scripts/release.py patch "提交信息" [额外文件...]     # 自动 +0.0.1
+  python3 scripts/release.py minor "提交信息" [额外文件...]     # 自动 +0.1.0
+
+额外文件：除版本号文件外一起提交的文件（相对仓库根目录路径），
+  用 = 指定目标路径（默认与源相同），例如：
+  python3 scripts/release.py patch "修xx" apps/desktop/src/taskcard.ts
 
 只改版本号和提交、打 tag，不触发构建（tag 推送后 CI 自动构建发版）。
 """
@@ -61,6 +65,7 @@ def main():
         print(__doc__)
         sys.exit(1)
     ver_arg, message = sys.argv[1], sys.argv[2]
+    extra_files = sys.argv[3:]  # 额外一起提交的文件
     cur = current_version()
     new = bump(cur, ver_arg) if ver_arg in ("patch", "minor", "major") else ver_arg
     print(f"{cur} → {new}")
@@ -81,6 +86,8 @@ def main():
         "gh_commit", "/home/hatch/workspace/skills/github/bin/gh_commit.py")
     # gh_commit.py 是 CLI，直接调 subprocess 更稳
     files = [f"{p}={p}" for p in VERSION_FILES]
+    for ef in extra_files:
+        files.append(ef if "=" in ef else f"{ef}={ef}")
     cmd = ["python3", "/home/hatch/workspace/skills/github/bin/gh_commit.py",
            REPO, "--branch", "main", "--message", f"v{new}：{message}"] + files
     out = subprocess.run(cmd, capture_output=True, text=True)

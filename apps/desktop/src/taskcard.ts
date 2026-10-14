@@ -122,7 +122,14 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
       ?? (active ? task.items[task.items.length - 1] : undefined);
     const waitingAck = active && task.items.length > 0 && task.items.every((i) => i.status === 'done' || i.status === 'error');
     if (cur) {
-      const fp = cur.totalBytes > 0 ? Math.min(100, Math.round((cur.doneBytes / cur.totalBytes) * 100)) : 0;
+      // 发送端：总进度用对方上报的"已收到"，当前文件条也按 接收/发送 比率校准，
+      // 否则两条进度用不同数据源，高速传输时肉眼可见地打架（如 44% vs 46%）
+      let fileDoneB = cur.doneBytes;
+      if (dir === 'send' && pt > 0 && task.doneBytes > 0) {
+        const ratio = Math.min(1, pd / task.doneBytes);
+        fileDoneB = Math.min(cur.totalBytes, cur.doneBytes * ratio);
+      }
+      const fp = cur.totalBytes > 0 ? Math.min(100, Math.round((fileDoneB / cur.totalBytes) * 100)) : 0;
       fileLabel.textContent = (waitingAck ? '等待对方确认 · ' : '') + (cur.name.length > 28 ? '…' + cur.name.slice(-27) : cur.name);
       fileLabel.title = cur.name;
       fileFill.style.width = fp + '%';
