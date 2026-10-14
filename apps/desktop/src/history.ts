@@ -9,6 +9,7 @@ import { setComposeText } from './send.js';
 type Filter = 'all' | 'send' | 'recv' | 'clip';
 let inited = false;
 let filter: Filter = 'all';
+let searchKw = '';
 
 export function initHistPage(): void {
   if (inited) return;
@@ -20,6 +21,15 @@ export function initHistPage(): void {
     const btns = $('#histFilters').querySelectorAll('button');
     btns.forEach((x) => x.classList.toggle('active', x === b));
     renderHist();
+  });
+  // 搜索框：按文件名 / 文本内容过滤（输入即搜，300ms 防抖）
+  let deb: ReturnType<typeof setTimeout> | null = null;
+  ($('#histSearch') as HTMLInputElement).addEventListener('input', (e) => {
+    if (deb) clearTimeout(deb);
+    deb = setTimeout(() => {
+      searchKw = (e.target as HTMLInputElement).value.trim().toLowerCase();
+      renderHist();
+    }, 300);
   });
   manager.onChange(() => renderHist());
   renderHist();
@@ -37,13 +47,17 @@ function renderHist(): void {
   const host = $('#histList');
   host.innerHTML = '';
   const list = loadHistory().filter((e) => {
-    if (filter === 'send') return e.dir === 'send';
-    if (filter === 'recv') return e.dir === 'recv';
-    if (filter === 'clip') return e.items.some((i) => i.kind === 'text' || i.kind === 'clipboard-image');
+    if (filter === 'send' && e.dir !== 'send') return false;
+    if (filter === 'recv' && e.dir !== 'recv') return false;
+    if (filter === 'clip' && !e.items.some((i) => i.kind === 'text' || i.kind === 'clipboard-image')) return false;
+    if (searchKw) {
+      const hay = (e.peer + ' ' + e.items.map((i) => i.name + ' ' + (i.text ?? '')).join(' ')).toLowerCase();
+      if (!hay.includes(searchKw)) return false;
+    }
     return true;
   });
   if (list.length === 0) {
-    host.appendChild(el('div', 'empty', '暂无历史记录'));
+    host.appendChild(el('div', 'empty', searchKw ? '没有匹配的历史记录' : '暂无历史记录'));
     return;
   }
   for (const e of list) host.appendChild(renderEntry(e));

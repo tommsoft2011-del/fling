@@ -6,6 +6,25 @@ document.addEventListener('contextmenu', (e) => {
   if (t && t.closest('input, textarea, [contenteditable="true"]')) return;
   e.preventDefault();
 });
+// 全局错误兜底：未捕获的异常/拒绝不再静默（v0.5.8 的 init 中断就是静默失败的教训）
+// 只做 toast + 日志，不干扰正常流程；toast 节流避免刷屏。
+let lastErrToast = 0;
+function reportGlobalError(where: string, err: unknown): void {
+  const msg = err instanceof Error ? err.message : String(err);
+  try {
+    // log 是同步入队，flush 在后台；这里直接记
+    import('./log.js').then((m) => m.log('ui', 'global error: ' + where, { msg })).catch(() => {});
+  } catch { /* ignore */ }
+  const now = Date.now();
+  if (now - lastErrToast > 5000) {
+    lastErrToast = now;
+    try {
+      import('./ui.js').then((m) => m.toast('出错：' + msg.slice(0, 120), true)).catch(() => {});
+    } catch { /* ignore */ }
+  }
+}
+window.addEventListener('unhandledrejection', (e) => reportGlobalError('unhandledrejection', e.reason));
+window.addEventListener('error', (e) => reportGlobalError('window.onerror', e.error ?? e.message));
 import { invoke } from '@tauri-apps/api/core';
 import { $, toast } from './ui.js';
 import { initNet, getDeviceName } from './net.js';

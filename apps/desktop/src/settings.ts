@@ -78,6 +78,13 @@ export function initSettingsPage(): void {
     }
   };
 
+  // ---- 传输完成系统通知 ----
+  const ntgl = $('#notifyToggle') as HTMLInputElement;
+  ntgl.checked = settings.notifyOnDone;
+  ntgl.onchange = () => {
+    settings.notifyOnDone = ntgl.checked;
+  };
+
   // ---- 界面风格 ----
   const seg = $('#themeSeg');
   const paint = () => {

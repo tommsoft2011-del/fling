@@ -114,6 +114,7 @@
               <button data-f="send">我发送的</button>
               <button data-f="recv">我接收的</button>
               <button data-f="clip">剪贴板</button>
+              <input id="histSearch" class="textinput hist-search" placeholder="搜索文件名 / 文本内容…" />
             </div>
             <div id="histList"></div>
           </section>
@@ -127,6 +128,13 @@
                 <div class="hint">关闭后，附近设备列表里看不到这台电脑（不影响配对码）</div>
               </div>
               <label class="switch"><input type="checkbox" id="discoverToggle" checked /><span></span></label>
+            </div>
+            <div class="card row">
+              <div>
+                <div class="card-t">传输完成时系统通知</div>
+                <div class="hint">发送/接收完成或失败时弹出系统通知</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="notifyToggle" checked /><span></span></label>
             </div>
             <div class="card">
               <div class="card-t">设备名称</div>

@@ -224,12 +224,13 @@ button { font: inherit; cursor: pointer; }
 .btn-no { background: var(--surface); border: 1px solid var(--border); color: var(--text); border-radius: 7px; padding: 6px 12px; }
 
 /* ---------- 历史页 ---------- */
-.filters { display: flex; gap: 8px; margin-bottom: 12px; }
+.filters { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; }
 .filters button {
   border: 1px solid var(--border); background: var(--surface); color: var(--text);
-  border-radius: 20px; padding: 6px 16px; font-size: 13px;
+  border-radius: 20px; padding: 6px 16px; font-size: 13px; flex-shrink: 0;
 }
 .filters button.active { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+.hist-search { margin-left: auto; width: 220px; }
 #histList { display: flex; flex-direction: column; gap: 10px; }
 .hitem {
   background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px;
@@ -362,53 +363,67 @@ button { font: inherit; cursor: pointer; }
 .nbtn:hover { filter: brightness(1.06); }
 .nbtn:disabled { opacity: .45; cursor: not-allowed; }
 
-/* ---------- 底部任务抽屉 ---------- */
+/* ---------- 任务列表：WinForm ListView 风格 ---------- */
+/* 容器：无白底卡片，顶部细分隔线，直接铺满剩余高度 */
 #taskDrawer {
-  border: 1px solid var(--border); background: var(--surface);
-  border-radius: 8px; margin: 18px 0 0; padding: 0 16px;
-  min-height: 200px; display: flex; flex-direction: column;
+  border-top: 1px solid var(--border);
+  margin: 14px 0 0; padding: 0;
+  min-height: 160px; display: flex; flex-direction: column;
   flex: 1 1 auto;
+  background: none;
 }
 #taskStrip {
   display: flex; align-items: center; gap: 8px; width: 100%;
   background: none; border: none; color: var(--text);
-  padding: 9px 0; font-size: 13px; text-align: left;
+  padding: 8px 2px; font-size: 13px; font-weight: 600; text-align: left;
   cursor: default;
 }
-#taskStrip .car { color: var(--muted); font-size: 10px; }
 #taskStrip .cnt {
   background: var(--accent); color: var(--accent-text); font-size: 11px; font-weight: 700;
   min-width: 18px; height: 18px; border-radius: 9px;
   display: inline-flex; align-items: center; justify-content: center; padding: 0 5px;
 }
 #taskStrip .cnt[hidden] { display: none; }
-#taskStrip .mini { margin-left: auto; color: var(--muted); font-size: 12px; }
-#taskRows { padding-bottom: 10px; flex: 1 1 auto; overflow-y: auto; min-height: 120px; }
-/* ---------- 接收页：底部任务抽屉（与发送页同构） ---------- */
+#taskStrip .mini { margin-left: auto; color: var(--muted); font-size: 12px; font-weight: 400; }
+/* ListView 本体：细边框、无圆角、透明底 */
+#taskRows {
+  flex: 1 1 auto; overflow-y: auto; min-height: 120px;
+  border: 1px solid var(--border);
+  background: none;
+}
+/* 行：无卡片、无圆角、无间距，底部分隔线；hover 高亮像 ListView 选中 */
+.trow {
+  display: flex; align-items: center; gap: 10px;
+  background: none; border: none; border-bottom: 1px solid var(--border);
+  border-radius: 0; padding: 7px 10px; margin: 0; font-size: 12.5px;
+  transition: opacity .4s, background-color .12s;
+}
+.trow:last-child { border-bottom: none; }
+.trow:hover { background: var(--surface-2); border-color: var(--border); }
+/* ---------- 接收页：底部任务抽屉（与发送页同构，ListView 风格） ---------- */
 .recv-actions { margin: 14px 0 4px; }
 #recvDrawer {
-  border: 1px solid var(--border); background: var(--surface);
-  border-radius: 8px; margin: 18px 0 0; padding: 0 16px;
-  min-height: 200px; display: flex; flex-direction: column;
+  border-top: 1px solid var(--border);
+  margin: 14px 0 0; padding: 0;
+  min-height: 160px; display: flex; flex-direction: column;
   flex: 1 1 auto;
+  background: none;
 }
 /* 接收页用 flex 列布局，让抽屉能贴底（v0.5.17 定稿：等待确认在内容区，接收任务底部停靠） */
 #page-recv.active { display: flex; flex-direction: column; min-height: 100%; }
 #recvStrip {
   display: flex; align-items: center; gap: 8px; width: 100%;
   color: var(--text);
-  padding: 9px 0; font-size: 13px; text-align: left;
+  padding: 8px 2px; font-size: 13px; font-weight: 600; text-align: left;
 }
-#recvTaskList { flex: 1 1 auto; overflow-y: auto; min-height: 120px; padding-bottom: 10px; }
-#recvStrip .car { color: var(--muted); font-size: 10px; }
+#recvTaskList { flex: 1 1 auto; overflow-y: auto; min-height: 120px; }
 #recvStrip .cnt {
   background: var(--accent); color: var(--accent-text); font-size: 11px; font-weight: 700;
   min-width: 18px; height: 18px; border-radius: 9px;
   display: inline-flex; align-items: center; justify-content: center; padding: 0 5px;
 }
 #recvStrip .cnt[hidden] { display: none; }
-#recvStrip .mini { margin-left: auto; color: var(--muted); font-size: 12px; }
-#recvTaskList { padding-bottom: 10px; }
+#recvStrip .mini { margin-left: auto; color: var(--muted); font-size: 12px; font-weight: 400; }
 #recvTaskList[hidden] { display: none; }
 /* 配对监听行：配对码大字 + 倒计时 */
 .pend.pairing { align-items: center; }
@@ -417,12 +432,6 @@ button { font: inherit; cursor: pointer; }
 .pend.pairing .pstatus { color: var(--muted); font-size: 12px; margin-top: 2px; }
 
 /* 紧凑任务行 */
-.trow {
-  display: flex; align-items: center; gap: 10px;
-  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
-  padding: 8px 12px; margin-bottom: 6px; font-size: 12.5px;
-  transition: opacity .4s;
-}
 .trow.fading { opacity: 0; }
 .trow .tdir { color: var(--accent); font-weight: 700; flex-shrink: 0; }
 .trow .tpeer { font-weight: 600; flex-shrink: 0; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -440,8 +449,9 @@ button { font: inherit; cursor: pointer; }
 .pbar .pfill { height: 100%; width: 0%; background: var(--accent); border-radius: 2px; transition: width 0.25s ease; }
 
 /* ---------- 接收页分组列表 ---------- */
+/* 分组列表：ListView 风格（无白底卡片、无圆角） */
 .group {
-  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  background: none; border: 1px solid var(--border); border-radius: 0;
   overflow: hidden; margin-bottom: 6px;
 }
 .group .empty { padding: 11px 16px; }
@@ -524,8 +534,7 @@ button { font: inherit; cursor: pointer; }
 label.filebtn { cursor: pointer; }
 /* 文件列表图标 */
 .frow .fic { flex-shrink: 0; font-size: 15px; }
-/* 任务行：hover 反馈 */
-.trow:hover { border-color: var(--accent); }
+/* 任务行：hover 反馈（ListView 风格只用背景高亮，不用边框变色） */
 .trow .tpct { font-variant-numeric: tabular-nums; }
 /* 输入框聚焦微光 */
 #composeBox:focus-within, .devtile.pair input:focus, .codeinput:focus {

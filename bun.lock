@@ -7,13 +7,14 @@
     },
     "apps/desktop": {
       "name": "@fling/desktop",
-      "version": "0.2.0",
+      "version": "0.5.22",
       "dependencies": {
-        "@fling/core": "0.2.0",
+        "@fling/core": "0.3.0",
         "@tauri-apps/api": "^2.0.0",
         "@tauri-apps/plugin-clipboard-manager": "^2.0.0",
         "@tauri-apps/plugin-dialog": "^2.0.0",
         "@tauri-apps/plugin-fs": "^2.0.0",
+        "@tauri-apps/plugin-notification": "^2.0.0",
         "livekit-client": "^2.0.0",
       },
       "devDependencies": {
@@ -23,18 +24,18 @@
     },
     "packages/cli": {
       "name": "@fling/cli",
-      "version": "0.1.0",
+      "version": "0.3.1",
       "bin": {
         "fling": "src/main.ts",
       },
       "dependencies": {
-        "@fling/core": "0.2.0",
+        "@fling/core": "0.3.0",
         "clipboardy": "^4.0.0",
       },
     },
     "packages/core": {
       "name": "@fling/core",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "dependencies": {
         "@livekit/rtc-node": "1.1.0",
         "@noble/hashes": "^1.8.0",
@@ -188,6 +189,8 @@
     "@tauri-apps/plugin-dialog": ["@tauri-apps/plugin-dialog@2.8.2", "", { "dependencies": { "@tauri-apps/api": "^2.12.0" } }, "sha512-LFqp8OTx0bHOwhKRhMMDyRDlo/2IO5XxoOclpf8+yvjAfM2ytVdbB6tk63dBlicsR8pRw38maj/GxrU6cW8mXw=="],
 
     "@tauri-apps/plugin-fs": ["@tauri-apps/plugin-fs@2.7.0", "", { "dependencies": { "@tauri-apps/api": "^2.12.0" } }, "sha512-8RQbPkuYuLZ2r/IRkmmEoBMbtNA01dknnVSh+tw27/CHvaZkJdk9yfPez3XPaT3pJ81SRqukiGdKJVqDokyDgQ=="],
+
+    "@tauri-apps/plugin-notification": ["@tauri-apps/plugin-notification@2.6.0", "", { "dependencies": { "@tauri-apps/api": "^2.12.0" } }, "sha512-QvpsQ6L6uSGT/7AmIrEUrfOiqjP1S8HtBU1ieaX6bvOFXGjnoxbNMR9V+8PVhLqRdOntqevpUJ3c52S+1afsIw=="],
 
     "@types/dom-mediacapture-record": ["@types/dom-mediacapture-record@1.0.22", "", {}, "sha512-mUMZLK3NvwRLcAAT9qmcK+9p7tpU2FHdDsntR3YI4+GY88XrgG4XiE7u1Q2LAN2/FZOz/tdMDC3GQCR4T8nFuw=="],
 

@@ -82,6 +82,13 @@ export const settings = {
   set discoverable(v: boolean) {
     setStr('fling-discoverable', v ? '1' : '0');
   },
+  /** 任务完成/失败时弹系统通知 */
+  get notifyOnDone(): boolean {
+    return getStr('fling-notify', '1') === '1';
+  },
+  set notifyOnDone(v: boolean) {
+    setStr('fling-notify', v ? '1' : '0');
+  },
 };
 
 export function applyTheme(): void {

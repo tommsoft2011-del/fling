@@ -29,6 +29,7 @@ import { saveHistoryEntry, HIST_IMAGE_LIMIT, settings, type HistoryEntry } from 
 import { b64encode, b64decode, toast, uid, utf8bytes } from './ui.js';
 import { P2PLink, type P2PState } from './p2p.js';
 import { log, flushLogs, type LogTag } from './log.js';
+import { notifyTaskDone } from './notify.js';
 import type { FlingRoom } from '@fling/core';
 
 export type ItemKind = 'text' | 'file' | 'clipboard-image';
@@ -378,6 +379,9 @@ export class SendTask {
       }
       this.endedAt = Date.now();
       this.notify();
+      // 系统通知（纯加法，不影响传输逻辑）
+      notifyTaskDone('send', this.phase === 'done',
+        `${this.peerLabel} · ${this.items.length} 项` + (this.error ? ` · ${this.error}` : ''));
       this.closeP2P();
       log('task', 'send end', {
         taskId: this.taskId,
@@ -1038,6 +1042,9 @@ export class RecvTask {
     }
     this.endedAt = Date.now();
     this.notify();
+    // 系统通知（纯加法，不影响传输逻辑）
+    notifyTaskDone('recv', this.phase === 'done',
+      `${this.peerLabel} · ${this.items.length} 项` + (this.error ? ` · ${this.error}` : ''));
     log('task', 'recv end', {
       taskId: this.taskId,
       completed,

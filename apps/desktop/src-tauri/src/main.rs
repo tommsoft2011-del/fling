@@ -841,6 +841,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // Device identity (created on first run) + mDNS discovery thread.
             let (_, cfg) = ensure_config(app.handle())?;
