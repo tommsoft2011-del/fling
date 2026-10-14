@@ -145,6 +145,9 @@ fn ensure_config(app: &tauri::AppHandle) -> Result<(std::path::PathBuf, FlingCon
         device_id: new_device_id(),
         device_name: default_device_name(),
         download_dir: default_download_dir(),
+        turn_url: None,
+        turn_username: None,
+        turn_password: None,
     };
     write_config_file(&p, &cfg)?;
     Ok((p, cfg))
@@ -179,6 +182,10 @@ fn save_config(app: tauri::AppHandle, cfg: FlingConfig) -> Result<(), String> {
                     } else {
                         cfg.download_dir
                     },
+                    // TURN 字段：新值非空则采用，否则保留旧值（缺省为 None）
+                    turn_url: cfg.turn_url.filter(|s| !s.trim().is_empty()).or(old.turn_url),
+                    turn_username: cfg.turn_username.filter(|s| !s.trim().is_empty()).or(old.turn_username),
+                    turn_password: cfg.turn_password.filter(|s| !s.trim().is_empty()).or(old.turn_password),
                 },
                 Err(_) => cfg,
             },
