@@ -43,6 +43,7 @@ sudo tee /etc/turnserver.conf > /dev/null <<EOF
 listening-port=$TURN_PORT
 external-ip=$EXT_IP
 realm=$TURN_REALM
+lt-cred-mech
 user=$TURN_USER:$TURN_PASS
 min-port=$RELAY_MIN
 max-port=$RELAY_MAX

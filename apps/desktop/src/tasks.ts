@@ -232,8 +232,15 @@ export class SendTask {
       this.room = await connectFlingRoom(spec, {
         onPeerJoined: () => this.onPeer(),
         onPeerLeft: () => {
-          // 接收方提前离开：若还在等 task-ack，直接结束等待
-          this.ackResolve?.(false);
+          // 接收方离开：ack 可能还在路上，给 3 秒宽限期，超时才判失败
+          // （接收方发完 ack 会立刻关房间，直接判失败会误报"对方未确认接收"）
+          // Promise resolve 多次调用只有第一次有效，所以宽限期和 onTaskAck 不会冲突
+          if (this.ackResolve) {
+            const resolve = this.ackResolve;
+            this.ackResolve = null;
+            setTimeout(() => resolve(false), 3000);
+            this.ackResolve = (ok: boolean) => resolve(ok);
+          }
         },
         onP2PSignal: (sig) => {
           void this.p2pLink?.handleSignal(sig);

@@ -433,6 +433,7 @@ button { font: inherit; cursor: pointer; }
 }
 .trow .x:hover { color: var(--danger); }
 .pbar { height: 5px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 3px; overflow: hidden; }
+.pbar .pfill { height: 100%; width: 0%; background: var(--accent); border-radius: 2px; transition: width 0.25s ease; }
 
 /* ---------- 接收页分组列表 ---------- */
 .group {
