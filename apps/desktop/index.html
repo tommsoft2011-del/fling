@@ -55,13 +55,14 @@
                   <div class="compose-hint"><span class="hint" id="composeHint"></span></div>
                 </div>
                 <div id="fileListWrap">
+                  <div id="fileDropHint" hidden><span>松开鼠标添加文件</span></div>
                   <div class="filelist-head"><span class="hint" id="fileCountHint"></span></div>
-                  <div id="fileList"><div class="empty">还没有文件 — 点「添加文件」，或直接把文件拖进来</div></div>
+                  <div id="fileList"><div class="empty">还没有文件 — 点「添加文件」，或把文件拖到这里</div></div>
                   <div class="compose-actions">
                     <label class="filebtn">＋ 添加文件<input type="file" id="fileInput" multiple hidden /></label>
                     <button class="filebtn" id="addFolderBtn" type="button">＋ 添加文件夹</button>
                     <input type="file" id="folderInput" webkitdirectory hidden />
-                    <span class="hint">支持拖放文件到本页任意位置</span>
+                    <span class="hint">把文件拖到上方文件区域即可添加</span>
                   </div>
                 </div>
                 <div class="devsec-label">设备 <span class="hint">点击选择目标，再点下方发送</span></div>
@@ -82,7 +83,6 @@
                 <div id="taskRows" hidden></div>
               </div>
             </div>
-            <div id="dropOverlay"><div class="box">松开鼠标添加文件<span class="sub">文件将加入本次发送内容</span></div></div>
           </section>
 
           <!-- 接收 -->

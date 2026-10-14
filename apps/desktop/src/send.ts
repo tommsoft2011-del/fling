@@ -43,31 +43,39 @@ export function initSendPage(): void {
     refreshSendBtn();
   });
 
-  // --- 拖拽文件到发送页任意位置 → 文件列表 ---
-  const pageSend = $('#page-send');
+  // --- 拖拽文件到文件区 → 加入文件列表 ---
+  // 提示只出现在文件区内部（虚线框高亮 + "松开"文字），不铺满全屏
   const fileCard = $('#fileListWrap');
-  const dropOverlay = $('#dropOverlay');
+  const fileDropHint = $('#fileDropHint') as HTMLElement;
   let dragDepth = 0;
   const hasFiles = (e: DragEvent) =>
     !!e.dataTransfer && Array.from(e.dataTransfer.types).includes('Files');
-  const setDropHint = (on: boolean) => {
+  const setDropHint = (on: boolean, count?: number) => {
     fileCard.classList.toggle('dragover', on);
-    dropOverlay.classList.toggle('show', on);
+    fileDropHint.hidden = !on;
+    if (on) {
+      fileDropHint.querySelector('span')!.textContent =
+        count ? `松开鼠标添加 ${count} 个文件` : '松开鼠标添加文件';
+    }
   };
-  pageSend.addEventListener('dragenter', (e) => {
+  const clearDropHint = () => {
+    dragDepth = 0;
+    setDropHint(false);
+  };
+  fileCard.addEventListener('dragenter', (e) => {
     if (!hasFiles(e as DragEvent)) return;
+    e.preventDefault();
     dragDepth++;
     setDropHint(true);
   });
-  pageSend.addEventListener('dragleave', () => {
+  fileCard.addEventListener('dragleave', () => {
     dragDepth = Math.max(0, dragDepth - 1);
     if (dragDepth === 0) setDropHint(false);
   });
-  pageSend.addEventListener('dragover', (e) => e.preventDefault());
-  pageSend.addEventListener('drop', (e) => {
+  fileCard.addEventListener('dragover', (e) => e.preventDefault());
+  fileCard.addEventListener('drop', (e) => {
     e.preventDefault();
-    dragDepth = 0;
-    setDropHint(false);
+    clearDropHint();
     const files = (e as DragEvent).dataTransfer?.files;
     if (files) {
       addFileItems(Array.from(files));
@@ -76,30 +84,31 @@ export function initSendPage(): void {
   });
 
   // --- Tauri 原生拖放事件：wry 会在 OS 层拦截文件拖放（此时 DOM drop 收不到文件），
-  // 用 tauri://drag-drop 兜底，经 Rust 命令读文件内容（不受 fs scope 限制）---
-  // 悬停反馈：同样原因 DOM dragenter 可能收不到，用 tauri://drag-enter/leave 显示"可松开"提示
-  const showDropHint = (count?: number) => {
-    const box = dropOverlay.querySelector('.box');
-    if (box) {
-      box.innerHTML = '';
-      box.append(
-        document.createTextNode(count ? `松开鼠标添加 ${count} 个文件` : '松开鼠标添加文件'),
-        (() => { const s = el('span', 'sub', '文件将加入本次发送内容'); return s; })(),
-      );
-    }
-    setDropHint(true);
-  };
+  // 用 tauri://drag-* 兜底，经 Rust 命令读文件内容（不受 fs scope 限制）---
   listen<{ paths?: string[] }>('tauri://drag-enter', (e) => {
     if (!$('#page-send').classList.contains('active')) return;
-    showDropHint(e.payload?.paths?.length);
+    setDropHint(true, e.payload?.paths?.length);
   }).catch(() => { /* 非 Tauri 环境忽略 */ });
   listen('tauri://drag-leave', () => setDropHint(false)).catch(() => { /* 非 Tauri 环境忽略 */ });
+  /** tauri 拖放位置是否落在文件区内（只接受文件区的拖放） */
+  const dropInFileCard = (pos: { x: number; y: number }): boolean => {
+    const r = fileCard.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const x = pos.x / dpr;
+    const y = pos.y / dpr;
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  };
   listen<unknown>('tauri://drag-drop', async (e) => {
     if (!$('#page-send').classList.contains('active')) return;
+    clearDropHint(); // drop 后必须清除高亮，否则会卡住
     // 兼容不同版本 payload：{ paths: string[] } 或直接 string[]
-    const pl = e.payload as { paths?: string[] } | string[];
+    const pl = e.payload as { paths?: string[]; position?: { x: number; y: number } } | string[];
     const paths = Array.isArray(pl) ? pl : (pl.paths ?? []);
     if (paths.length === 0) return;
+    if (!Array.isArray(pl) && pl.position && !dropInFileCard(pl.position)) {
+      toast('请把文件拖到文件区域', true);
+      return;
+    }
     const batch: File[] = [];
     let dirAdded = 0;
     let dirSkipped = 0;
@@ -550,9 +559,11 @@ function syncTaskRows(): void {
   const n = tasks.length;
   drawer.hidden = n === 0;
   if (n > 0) {
+    // 角标只显示进行中的任务数，全部完成后隐藏
+    const activeCount = tasks.filter((t) => t.active).length;
     const cnt = $('#taskCount');
-    cnt.hidden = false;
-    cnt.textContent = String(n);
+    cnt.hidden = activeCount === 0;
+    cnt.textContent = String(activeCount);
     const first = tasks.find((t) => t.active) ?? tasks[0];
     $('#taskMini').textContent = first.active ? `→ ${first.peerLabel}` : `${first.peerLabel} · 完成`;
   }

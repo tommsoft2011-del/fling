@@ -1,7 +1,11 @@
 // Fling v0.3 桌面端入口：传输工具（发送 / 接收 / 历史 / 设置）
 import './style.css';
-// 禁用 WebView 右键菜单（桌面端不需要浏览器上下文菜单）
-document.addEventListener('contextmenu', (e) => e.preventDefault());
+// 禁用 WebView 右键菜单，但编辑框（input/textarea）保留原生菜单（复制/粘贴等）
+document.addEventListener('contextmenu', (e) => {
+  const t = e.target as HTMLElement | null;
+  if (t && t.closest('input, textarea, [contenteditable="true"]')) return;
+  e.preventDefault();
+});
 import { invoke } from '@tauri-apps/api/core';
 import { $, toast } from './ui.js';
 import { initNet, getDeviceName } from './net.js';

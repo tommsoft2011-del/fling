@@ -39,6 +39,11 @@ body {
   margin: 0; background: var(--bg); color: var(--text);
   font: 14px/1.5 -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
   overflow: hidden;
+  /* 桌面端：界面文本默认不可选中（编辑框除外） */
+  -webkit-user-select: none; user-select: none;
+}
+input, textarea, [contenteditable="true"] {
+  -webkit-user-select: text; user-select: text;
 }
 #app { height: 100vh; }
 
@@ -89,26 +94,25 @@ button { font: inherit; cursor: pointer; }
 .empty { color: var(--muted); font-size: 13px; padding: 10px 2px; }
 
 /* ---------- 发送页：原生工作台 ---------- */
-#fileListWrap { margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 10px; }
-#fileListWrap.dragover { outline: 2px dashed var(--accent); outline-offset: 4px; border-radius: 8px; }
-/* 全页拖放提示层：文件拖入时高亮，明确可松手 */
-#dropOverlay {
-  position: fixed; inset: 0; z-index: 90; display: none;
-  align-items: center; justify-content: center; pointer-events: none;
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
+/* 文件区：常驻虚线小框；拖入时高亮并显示"松开"提示（只限本区域，不铺满全屏） */
+#fileListWrap {
+  position: relative; margin-top: 10px; padding: 12px 14px;
+  border: 1.5px dashed var(--border); border-radius: 10px;
+  transition: border-color .15s, background .15s;
 }
-#dropOverlay.show { display: flex; }
-#dropOverlay .box {
-  border: 2.5px dashed var(--accent); border-radius: 16px;
-  background: var(--surface); padding: 36px 56px; text-align: center;
-  box-shadow: 0 8px 32px rgba(0,0,0,.18);
-  font-size: 17px; font-weight: 700; color: var(--accent);
+#fileListWrap.dragover { border-color: var(--accent); background: var(--accent-soft); }
+#fileDropHint {
+  position: absolute; inset: 0; z-index: 5; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--surface) 72%, transparent);
+  font-size: 16px; font-weight: 700; color: var(--accent);
+  pointer-events: none;
 }
+#fileDropHint[hidden] { display: none; }
 .filelist-head { margin-bottom: 4px; min-height: 18px; }
 .filelist-head .hint:empty { display: none; }
 .compose-hint { min-height: 18px; padding: 0 4px; }
 .compose-hint .hint:empty { display: none; }
-#dropOverlay .box .sub { display: block; margin-top: 8px; font-size: 13px; font-weight: 400; color: var(--muted); }
 
 /* ---------- 主界面布局 ---------- */
 #mainScreen { flex-direction: row; }
@@ -139,11 +143,8 @@ button { font: inherit; cursor: pointer; }
 .page h2 { margin: 0 0 14px; font-size: 20px; }
 
 /* ---------- 页面宽度 ---------- */
-/* 发送/接收页横向满屏；历史/设置保持收敛宽度 */
-#page-send, #page-recv { max-width: none; }
-@media (min-width: 1200px) {
-  #page-hist, #page-settings { max-width: 1060px; }
-}
+/* 四页全部横向满屏 */
+#page-send, #page-recv, #page-hist, #page-settings { max-width: none; }
 
 /* ---------- 发送页 ---------- */
 #composeBox {
@@ -439,8 +440,8 @@ button { font: inherit; cursor: pointer; }
 
 /* ================= v0.5.11 ================= */
 /* 底部发送栏 */
-.sendbar { margin-top: 18px; }
-.sendbar .primary.big { margin-top: 0; }
+.sendbar { margin-top: 18px; display: flex; justify-content: flex-end; }
+.sendbar .primary.big { margin-top: 0; width: auto; padding: 10px 40px; font-size: 14px; }
 /* 接收页等待动画 */
 .waitanim { text-align: center; padding: 26px 0 20px; }
 .waitanim .rings {
@@ -504,5 +505,3 @@ label.filebtn { cursor: pointer; }
 }
 .group .trow:last-child { border-bottom: none; }
 .group .trow:hover { background: var(--surface-2); }
-/* 拖放提示层：去掉白卡自身的虚线框，只保留文件区的虚线高亮 */
-#dropOverlay .box { border-style: solid; box-shadow: 0 12px 40px rgba(0,0,0,.18); }
