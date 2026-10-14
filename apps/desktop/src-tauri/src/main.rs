@@ -16,6 +16,8 @@ use std::sync::mpsc;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
 
+mod embedded_config;
+
 // ================================================================ config ==
 
 /// 16 random bytes as lowercase hex. Generated once on first run, never rotated.
@@ -148,10 +150,13 @@ fn get_config(app: tauri::AppHandle) -> Result<Option<FlingConfig>, String> {
 /// Load the config, creating it (device identity only) on first run.
 fn ensure_config(app: &tauri::AppHandle) -> Result<(std::path::PathBuf, FlingConfig), String> {
     let p = config_path(app)?;
+    // 优先用嵌入的加密配置补全服务器凭据（用户零配置）；
+    // 本地已有凭据则优先本地（用户手动覆盖）。
+    let embedded = decrypt_embedded_config().ok();
     if p.exists() {
         let s = std::fs::read_to_string(&p).map_err(|e| format!("read: {e}"))?;
         let migrate = needs_migration(&s);
-        let cfg: FlingConfig = match serde_json::from_str(&s) {
+        let mut cfg: FlingConfig = match serde_json::from_str(&s) {
             Ok(c) => c,
             Err(e) => {
                 // 配置文件损坏：备份坏文件后重建默认配置，保证应用能启动
@@ -161,19 +166,55 @@ fn ensure_config(app: &tauri::AppHandle) -> Result<(std::path::PathBuf, FlingCon
                 let cfg = default_config();
                 write_config_file(&p, &cfg)?;
                 eprintln!(
-                    "config parse failed ({e}); bad file backed up to {}",
-                    bak.display()
+                    "config parse failed ({}), backed up to {:?} and recreated default",
+                    e, bak
                 );
                 return Ok((p, cfg));
             }
         };
+        // 本地缺凭据 → 用嵌入配置补
+        if let Some(e) = embedded {
+            if cfg.server_url.trim().is_empty() { cfg.server_url = e.server_url; }
+            if cfg.api_key.trim().is_empty() { cfg.api_key = e.api_key; }
+            if cfg.api_secret.trim().is_empty() { cfg.api_secret = e.api_secret; }
+            if cfg.turn_url.is_none() { cfg.turn_url = e.turn_url; }
+            if cfg.turn_username.is_none() { cfg.turn_username = e.turn_username; }
+            if cfg.turn_password.is_none() { cfg.turn_password = e.turn_password; }
+        }
         if migrate {
             let _ = write_config_file(&p, &cfg);
         }
         return Ok((p, cfg));
     }
-    let cfg = default_config();
+    // 首次运行：设备身份 + 嵌入凭据（若有）
+    let mut cfg = default_config();
+    if let Some(e) = embedded {
+        cfg.server_url = e.server_url;
+        cfg.api_key = e.api_key;
+        cfg.api_secret = e.api_secret;
+        cfg.turn_url = e.turn_url;
+        cfg.turn_username = e.turn_username;
+        cfg.turn_password = e.turn_password;
+    }
     write_config_file(&p, &cfg)?;
+    Ok((p, cfg))
+}
+
+/// 解密编译时嵌入的服务器凭据（AES-256-GCM）。
+/// 返回 FlingConfig（只取其中的服务器字段，设备字段忽略）。
+fn decrypt_embedded_config() -> Result<FlingConfig, String> {
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+    use aes_gcm::aead::{Aead, KeyInit};
+    if !embedded_config::HAS_EMBEDDED || embedded_config::CONFIG_CIPHERTEXT.is_empty() {
+        return Err("no embedded config".into());
+    }
+    let key = Key::<Aes256Gcm>::from_slice(&embedded_config::CONFIG_KEY);
+    let cipher = Aes256Gcm::new(key);
+    let nonce = Nonce::from_slice(&embedded_config::CONFIG_NONCE);
+    let pt = cipher.decrypt(nonce, embedded_config::CONFIG_CIPHERTEXT)
+        .map_err(|e| format!("decrypt embedded config: {e}"))?;
+    serde_json::from_slice::<FlingConfig>(&pt).map_err(|e| format!("parse embedded config: {e}"))
+}
     Ok((p, cfg))
 }
 
