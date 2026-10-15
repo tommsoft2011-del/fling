@@ -66,8 +66,10 @@ export interface OfferMessage {
   taskKey: string;
   /** 预览条目（为避开 LiveKit 64KB 单包上限，只带前 N 个）；完整列表由 manifest 逐个送达 */
   items: OfferItem[];
-  /** 全部条目数（items 被截断时用它做 expectedManifests；老版本发送方无此字段则回退 items.length） */
+  /** 全部条目数（包含 text；用于接收端展示总条目数） */
   totalItems?: number;
+  /** 文件/剪贴板图片条目数（不包含 text；用于接收端等待 manifest） */
+  totalFileItems?: number;
   /** 全部条目总字节数（items 被截断时预览用） */
   totalBytes?: number;
 }
@@ -81,6 +83,8 @@ export type FlingMessage =
   // the message discriminator on the wire.
   | { kind: 'file-manifest'; manifest: FileManifest }
   | { kind: 'file-chunk'; id: string; seq: number; data: string } // base64
+  // Sent over the LiveKit relay after the receiver has accepted a manifest.
+  | { kind: 'file-manifest-ack'; id: string }
   | OfferMessage
   | { kind: 'offer-withdraw'; taskId: string }
   | { kind: 'offer-rejected'; taskId: string }
@@ -108,6 +112,7 @@ export function isFlingMessage(o: unknown): o is FlingMessage {
     k === 'bye' ||
     k === 'file-manifest' ||
     k === 'file-chunk' ||
+    k === 'file-manifest-ack' ||
     k === 'offer' ||
     k === 'offer-withdraw' ||
     k === 'offer-rejected' ||

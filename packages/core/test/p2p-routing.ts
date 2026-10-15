@@ -71,17 +71,31 @@ class FakeDirect implements DirectChannel {
   onclose: (() => void) | null = null;
   sent: Uint8Array[] = [];
   dead = false;
+  /** Simulates a black-holed SCTP path: send() accepts bytes but peer sees nothing. */
+  blackhole = false;
+  /** Drop sends after this many accepted calls while keeping readyState=open. */
+  dropAfter: number | undefined;
+  private sendCount = 0;
+  onSend: ((count: number) => void) | null = null;
   constructor(readonly label: string) {}
   send(data: Uint8Array<ArrayBuffer>): void {
     if (this.dead) throw new Error('channel closed');
-    this.sent.push(data);
+    const count = ++this.sendCount;
+    if (!this.blackhole && (this.dropAfter === undefined || count <= this.dropAfter)) {
+      this.sent.push(data);
+    }
+    this.onSend?.(count);
   }
   close(): void {
     this.dead = true;
     this.onclose?.();
   }
   waitForDrain(): Promise<void> {
-    return Promise.resolve();
+    return this.dead ? Promise.reject(new Error('channel closed')) : Promise.resolve();
+  }
+  resetStats(): void {
+    this.sent = [];
+    this.sendCount = 0;
   }
 }
 
@@ -168,9 +182,23 @@ async function main(): Promise<void> {
   done = freshBox();
   directA.sent = [];
   const fileE = fileLike('early.bin', 100_000); // 4 chunks
-  await roomA.sendFile(fileE, undefined, 'file'); // all via direct; captured, not wired
-  const raws = directA.sent.map((d) => JSON.parse(dec.decode(d)) as { kind: string });
-  directA.sent = [];
+  const captured: Uint8Array[] = [];
+  let earlyManifestDelivered = false;
+  const earlySend = roomA.sendFile(fileE, undefined, 'file'); // capture chunks, deliver only manifest for ack
+  for (let i = 0; i < 100 && !earlyManifestDelivered; i++) {
+    for (const d of directA.sent.splice(0)) {
+      captured.push(d);
+      const raw = JSON.parse(dec.decode(d)) as { kind: string };
+      if (raw.kind === 'file-manifest') {
+        directB.onmessage?.(d as Uint8Array<ArrayBuffer>);
+        earlyManifestDelivered = true;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  await earlySend;
+  captured.push(...directA.sent.splice(0));
+  const raws = captured.map((d) => JSON.parse(dec.decode(d)) as { kind: string });
   check(raws.filter((m) => m.kind === 'file-chunk').length === 4, 'captured 4 direct chunks');
   // deliver chunks FIRST, manifest last (simulates the old relay/direct race)
   const chunksFirst = [
@@ -187,9 +215,45 @@ async function main(): Promise<void> {
     'early chunks buffered and replayed once the manifest arrived',
   );
 
+  // --- 1c. black-hole: open/send-success is not delivery --------------------
+  done = freshBox();
+  directA.blackhole = true;
+  roomA.setDirectChannel(directA);
+  const relayBeforeBlackhole = relayPublishesA;
+  const blackholeStart = Date.now();
+  await roomA.sendFile(fileLike('blackhole.bin', 70_000), undefined, 'file');
+  for (let i = 0; i < 100 && !done.cur; i++) await new Promise((r) => setTimeout(r, 5));
+  const blackholeElapsed = Date.now() - blackholeStart;
+  check(!!done.cur, 'black-holed direct path recovers through relay');
+  check(blackholeElapsed < 10_000, `black-hole fallback completes promptly (${blackholeElapsed}ms)`);
+  check(relayPublishesA > relayBeforeBlackhole, 'black-hole retry publishes manifest/chunks through relay');
+  check(!roomA.directActive, 'black-hole fallback detaches direct channel');
+
+  // --- 1d. partial silent loss -> replay the same manifest through relay ---
+  done = freshBox();
+  directA.resetStats();
+  directA.blackhole = false;
+  directA.dropAfter = 2; // manifest + first chunk arrive, later sends vanish
+  directA.onSend = (count) => {
+    if (count === 3) roomA.fallbackToRelay('test partial silent loss');
+  };
+  roomA.setDirectChannel(directA);
+  const partial = roomA.sendFile(fileLike('partial.bin', 70_000), undefined, 'file');
+  for (let i = 0; i < 200 && !done.cur; i++) {
+    wire();
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  await partial;
+  for (let i = 0; i < 100 && !done.cur; i++) await new Promise((r) => setTimeout(r, 5));
+  check(!!done.cur, 'partial silent loss is repaired by same-file relay replay');
+  check(done.cur?.bytes.length === 70_000, 'partial replay bytes intact');
+  directA.dropAfter = undefined;
+  directA.onSend = null;
+
   // --- 2. direct dies mid-transfer -> transparent relay fallback ------------
   done = freshBox();
   directA.dead = true; // next send throws -> room must fall back
+  directA.blackhole = false;
   roomA.setDirectChannel(directA); // re-attach the (now dead) channel
   const file2 = fileLike('world.bin', 70_000);
   const p2 = roomA.sendFile(file2, undefined, 'file');

@@ -90,6 +90,9 @@ const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const TEXT_CHUNK_CHARS = 15000;
 const OFFER_REANNOUNCE_MS = 5000;
 const WAIT_PEER_TIMEOUT_MS = 5 * 60 * 1000;
+/** Receiver reports are emitted once per second; five seconds is a dead-path watchdog. */
+const DIRECT_PEER_PROGRESS_TIMEOUT_MS = 5000;
+const DIRECT_HEALTH_CHECK_MS = 1000;
 
 function toOfferItem(c: ComposeItem): OfferItem {
   return {
@@ -138,6 +141,8 @@ export class SendTask {
   private lastBytes = 0;
   private lastT = 0;
   private doneNotified = false;
+  private directHealthTimer: ReturnType<typeof setInterval> | null = null;
+  private lastPeerProgressAt = 0;
 
   constructor(
     readonly source: ComposeItem[],
@@ -226,9 +231,10 @@ export class SendTask {
         taskKey,
         // LiveKit 单包 64KB 上限：文件多了 items 必须截断（1232 个文件时曾报
         // "cannot publish data packet larger than 64000 bytes"），只保留前 30 个做预览；
-        // 接收端用 totalItems 做 expectedManifests，缺的条目由 manifest 到达时补建。
+        // 缺的条目由 manifest 到达时补建，totalFileItems 单独统计文件 manifest 数。
         items: this.source.slice(0, 30).map(toOfferItem),
         totalItems: this.source.length,
+        totalFileItems: this.source.filter((item) => item.kind !== 'text').length,
         totalBytes: this.source.reduce((a, c) => a + c.size, 0),
       };
 
@@ -266,8 +272,12 @@ export class SendTask {
             this.ackResolve?.(false);
           }
         },
+        onDirectFallback: (reason) => this.onDirectFallback(reason),
         onTaskProgress: (taskId, doneBytes, totalBytes) => {
           if (taskId === this.taskId) {
+            if (this.phase === 'sending' && this.p2p === 'open' && this.room?.directActive) {
+              this.lastPeerProgressAt = Date.now();
+            }
             // 诊断：对方上报的已收到不应超过我已发送的；倒退/超发都说明计数错乱
             const mySent = this.doneBytes;
             if (doneBytes > mySent + 65536) {
@@ -279,9 +289,19 @@ export class SendTask {
               log('xfer', 'PEER PROGRESS BACKWARDS', {
                 taskId, was: this.peerDoneBytes, now: doneBytes,
               });
+              // Relay delivery and an older direct/relay mix can expose a
+              // stale report after a newer one. Never let the UI or the
+              // direct-file confirmation target move backwards.
+              return;
             }
             this.peerDoneBytes = doneBytes;
-            this.peerTotalBytes = totalBytes;
+            this.peerTotalBytes = Math.max(this.peerTotalBytes, totalBytes);
+            log('xfer', 'peer progress', {
+              taskId,
+              doneBytes: this.peerDoneBytes,
+              totalBytes: this.peerTotalBytes,
+              direct: this.room?.directActive ?? false,
+            });
             this.notify();
           }
         },
@@ -338,6 +358,7 @@ export class SendTask {
             taskId: this.taskId,
           });
         }
+        if (src.kind !== 'text') this.markDirectTransferStart();
         st.status = 'active';
         this.notify();
         log('xfer', 'send item start', { taskId: this.taskId, kind: src.kind, name: st.name, size: st.size });
@@ -353,11 +374,49 @@ export class SendTask {
               blob = new Blob([bytes as BlobPart]);
             }
             if (!blob) throw new Error('文件内容不可用');
-            await this.room!.sendFile(wrapWebFile(blob, src.name, src.relPath), (sent) => {
-              st.doneBytes = sent;
+            const file = wrapWebFile(blob, src.name, src.relPath);
+            const directFileTransfer = this.room?.directActive === true;
+            const onFileProgress = (sent: number) => {
+              // A relay replay uses the same manifest and must not make the
+              // local progress display jump backwards either.
+              st.doneBytes = Math.max(st.doneBytes, sent);
               this.trackSpeed(this.doneBytes);
               this.notify();
+            };
+            const manifest = await this.room!.sendFile(file, (sent) => {
+              onFileProgress(sent);
             }, src.kind);
+
+            // Do not immediately start the next file after only filling the
+            // local SCTP buffer. The receiver's aggregate progress is the
+            // end-to-end confirmation for this file. If it stalls, force the
+            // relay and replay this same manifest once so missing direct
+            // chunks are filled instead of merely routing future chunks.
+            if (directFileTransfer) {
+              const peerTarget = this.items
+                .slice(0, i + 1)
+                .reduce((sum, item) => sum + item.totalBytes, 0);
+              const confirmed = await this.waitForPeerProgress(
+                peerTarget,
+                DIRECT_PEER_PROGRESS_TIMEOUT_MS,
+              );
+              if (!confirmed) {
+                const reason = `file progress stalled at ${this.peerDoneBytes}/${peerTarget}`;
+                log('p2p', 'file confirmation stalled, replaying via relay', {
+                  taskId: this.taskId,
+                  name: st.name,
+                  peerDoneBytes: this.peerDoneBytes,
+                  peerTarget,
+                  direct: this.room?.directActive ?? false,
+                });
+                this.room?.fallbackToRelay(reason);
+                await this.room!.sendFile(file, onFileProgress, src.kind, manifest);
+                await this.waitForPeerProgress(
+                  peerTarget,
+                  DIRECT_PEER_PROGRESS_TIMEOUT_MS * 2,
+                );
+              }
+            }
           }
           st.status = 'done';
           st.doneBytes = st.totalBytes;
@@ -379,6 +438,7 @@ export class SendTask {
         log('task', 'task-done sent', { taskId: this.taskId });
       } catch { /* 尽力 */ }
       const acked = await this.waitForAck(30_000);
+      this.stopDirectHealth();
       log('task', acked ? 'ack ok, closing' : 'ack timeout, closing anyway', {
         taskId: this.taskId,
         peerCancelled: this.peerCancelled,
@@ -479,8 +539,65 @@ export class SendTask {
   }
 
   private closeP2P(): void {
+    this.stopDirectHealth();
     this.p2pLink?.close();
     this.p2pLink = null;
+  }
+
+  /** Begin/refresh the sender-side watchdog for a direct file transfer. */
+  private markDirectTransferStart(): void {
+    if (this.p2p !== 'open' || !this.room?.directActive) return;
+    this.lastPeerProgressAt = Date.now();
+    if (this.directHealthTimer) return;
+    this.directHealthTimer = setInterval(() => {
+      if (this.phase !== 'sending' || this.p2p !== 'open' || !this.room?.directActive) {
+        this.stopDirectHealth();
+        return;
+      }
+      const silentMs = Date.now() - this.lastPeerProgressAt;
+      if (silentMs < DIRECT_PEER_PROGRESS_TIMEOUT_MS) return;
+      const reason = `peer progress timeout (${silentMs}ms)`;
+      log('p2p', 'peer progress stalled, falling back to relay', {
+        taskId: this.taskId,
+        silentMs,
+        sentBytes: this.doneBytes,
+        peerDoneBytes: this.peerDoneBytes,
+      });
+      this.stopDirectHealth();
+      this.room?.fallbackToRelay(reason);
+    }, DIRECT_HEALTH_CHECK_MS);
+  }
+
+  private stopDirectHealth(): void {
+    if (this.directHealthTimer) {
+      clearInterval(this.directHealthTimer);
+      this.directHealthTimer = null;
+    }
+  }
+
+  /** Wait for the receiver to confirm bytes, not just local send-buffering. */
+  private async waitForPeerProgress(target: number, timeoutMs: number): Promise<boolean> {
+    const start = Date.now();
+    while (!this.cancelled && this.peerDoneBytes < target && Date.now() - start < timeoutMs) {
+      await delay(200);
+    }
+    const ok = this.peerDoneBytes >= target;
+    if (!ok) {
+      log('xfer', 'peer file confirmation timeout', {
+        taskId: this.taskId,
+        peerDoneBytes: this.peerDoneBytes,
+        target,
+        timeoutMs,
+        direct: this.room?.directActive ?? false,
+      });
+    }
+    return ok;
+  }
+
+  /** FlingRoom found a direct send/manifest/drain failure. Close the link owner. */
+  private onDirectFallback(reason: string): void {
+    this.stopDirectHealth();
+    this.p2pLink?.fallbackToRelay(reason);
   }
 
   /**
@@ -718,9 +835,14 @@ export class RecvTask {
     }));
     this.textItem = this.items.find((i) => i.kind === 'text');
     this.fileQueue = this.items.filter((i) => i.kind !== 'text');
-    // offer.items 可能被截断（64KB 上限），用 totalItems 做真正的期望数；
-    // 老版本发送方无 totalItems 时回退 items.length。
-    this.expectedManifests = offer.totalItems ?? this.fileQueue.length;
+    // manifest 只对应文件/图片，不对应 text。新版 offer 明确带
+    // totalFileItems；兼容旧版时从未截断的 items 里推导，避免
+    // totalItems 把文本也算进去导致接收端平白等待 30 秒后失败。
+    this.expectedManifests = offer.totalFileItems ?? (
+      offer.totalItems !== undefined && offer.items.length === offer.totalItems
+        ? offer.items.filter((item) => item.kind !== 'text').length
+        : this.fileQueue.length
+    );
   }
 
   get peerLabel(): string {
@@ -800,6 +922,7 @@ export class RecvTask {
           void p.finally(() => this.pendingSaves.delete(p));
         },
         onFileError: (id, err) => this.onFileError(id, err),
+        onDirectFallback: (reason) => this.onDirectFallback(reason),
         onP2PSignal: (sig) => this.onP2PSignal(sig),
         onLog: (tag, msg) => log(tag as LogTag, `[room] ${msg}`),
         onTaskDone: (taskId) => {
@@ -917,9 +1040,9 @@ export class RecvTask {
 
   private lastProgressReport = 0;
   /** 向发送方上报真实接收进度（1s 节流），让发送端显示"对方已接收"而非"已发送" */
-  private reportProgress(): void {
+  private reportProgress(force = false): void {
     const now = Date.now();
-    if (now - this.lastProgressReport < 1000 || this.finished) return;
+    if ((!force && now - this.lastProgressReport < 1000) || this.finished) return;
     this.lastProgressReport = now;
     const room = this.room;
     if (room) {
@@ -948,6 +1071,10 @@ export class RecvTask {
   private async onFileComplete(id: string, m: FileManifest, bytes: Uint8Array): Promise<void> {
     const item = this.manifestToItem.get(id);
     if (!item) return;
+    // A small file may finish within the 1s throttle window. Send its exact
+    // received byte count immediately so the sender can advance to the next
+    // file without relying on the final task-ack.
+    this.reportProgress(true);
     // sha256 已在 assemble() 里校验过（不一致会抛错进 catch），这里记录供历史核对
     item.sha256 = m.sha256;
     try {
@@ -1074,6 +1201,10 @@ export class RecvTask {
   private closeP2P(): void {
     this.p2pLink?.close();
     this.p2pLink = null;
+  }
+
+  private onDirectFallback(reason: string): void {
+    this.p2pLink?.fallbackToRelay(reason);
   }
 
   private async finish(completed: boolean): Promise<void> {

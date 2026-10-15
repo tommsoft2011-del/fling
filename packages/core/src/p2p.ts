@@ -25,7 +25,8 @@ export interface DirectChannel {
   onmessage: ((data: Uint8Array<ArrayBuffer>) => void) | null;
   onclose: (() => void) | null;
   /**
-   * Resolve once bufferedAmount drops to/below threshold.
+   * Resolve once bufferedAmount drops to/below threshold. Reject when the
+   * channel closes or the drain watchdog expires.
    * Used for sender-side backpressure on the direct channel.
    */
   waitForDrain(threshold: number): Promise<void>;
@@ -39,3 +40,9 @@ export const P2P_CONNECT_TIMEOUT_MS = 12_000;
  * Well under any SCTP send-buffer limit; drained via bufferedamountlow.
  */
 export const P2P_DRAIN_THRESHOLD = 256 * 1024;
+
+/** Never wait forever for bufferedamountlow on a wedged SCTP path. */
+export const P2P_DRAIN_TIMEOUT_MS = 3_000;
+
+/** Maximum time to wait for the receiver's relay manifest confirmation. */
+export const P2P_MANIFEST_ACK_TIMEOUT_MS = 3_000;

@@ -10,6 +10,7 @@
 import {
   P2P_CONNECT_TIMEOUT_MS,
   P2P_DRAIN_THRESHOLD,
+  P2P_DRAIN_TIMEOUT_MS,
   type DirectChannel,
   type FlingMessage,
   type FlingRoom,
@@ -74,20 +75,29 @@ class RTCDirectChannel implements DirectChannel {
     }
   }
   waitForDrain(threshold: number): Promise<void> {
-    if (this.dc.bufferedAmount <= threshold || this.dc.readyState !== 'open') {
-      return Promise.resolve();
-    }
-    return new Promise((resolve) => {
-      const done = () => {
-        this.dc.removeEventListener('bufferedamountlow', done);
-        this.dc.removeEventListener('close', done);
-        resolve();
+    if (this.dc.bufferedAmount <= threshold) return Promise.resolve();
+    if (this.dc.readyState !== 'open') return Promise.reject(new Error('direct channel is not open'));
+    return new Promise((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout>;
+      let onLow: () => void;
+      let onClose: () => void;
+      const finish = (error?: Error) => {
+        clearTimeout(timer);
+        this.dc.removeEventListener('bufferedamountlow', onLow);
+        this.dc.removeEventListener('close', onClose);
+        if (error) reject(error);
+        else resolve();
       };
-      this.dc.addEventListener('bufferedamountlow', done);
-      // Never hang if the channel dies while we wait: the send() wrapper
-      // treats a closed channel as "fall back to relay".
-      this.dc.addEventListener('close', done);
-      if (this.dc.bufferedAmount <= threshold || this.dc.readyState !== 'open') done();
+      onLow = () => {
+        if (this.dc.readyState === 'open' && this.dc.bufferedAmount <= threshold) finish();
+        else finish(new Error('direct channel did not drain'));
+      };
+      onClose = () => finish(new Error('direct channel closed while draining'));
+      timer = setTimeout(() => finish(new Error('direct channel drain timeout')), P2P_DRAIN_TIMEOUT_MS);
+      this.dc.addEventListener('bufferedamountlow', onLow);
+      this.dc.addEventListener('close', onClose);
+      if (this.dc.bufferedAmount <= threshold) onLow();
+      else if (this.dc.readyState !== 'open') onClose();
     });
   }
 }
@@ -182,7 +192,7 @@ export class P2PLink {
   }
 
   private fail(reason: string): void {
-    if (this._state === 'failed') return;
+    if (this._state === 'failed' || this.closed) return;
     // Whether the handshake never completed or an established channel just
     // dropped: detach the direct path so traffic falls back to the relay.
     log('p2p', `link failed: ${reason}`, {
@@ -199,11 +209,19 @@ export class P2PLink {
     });
     this.setState('failed');
     try {
-      this.room.setDirectChannel(null);
+      // Route all established-path failures through the room's fallback
+      // transition so file replay, progress health, and the app-level link
+      // owner observe the same generation change.
+      this.room.fallbackToRelay(reason);
     } catch {
       /* ignore */
     }
     this.closePc();
+  }
+
+  /** Force an established but unresponsive path over to the relay. */
+  fallbackToRelay(reason: string): void {
+    this.fail(reason);
   }
 
   private newPc(): RTCPeerConnection | null {

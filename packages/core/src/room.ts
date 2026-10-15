@@ -4,7 +4,11 @@
 
 import { deriveRoomKey, openText, sealText } from './crypto.js';
 import { FileReceiver, type FileLike, buildManifest } from './files.js';
-import { P2P_DRAIN_THRESHOLD, type DirectChannel } from './p2p.js';
+import {
+  P2P_DRAIN_THRESHOLD,
+  P2P_MANIFEST_ACK_TIMEOUT_MS,
+  type DirectChannel,
+} from './p2p.js';
 import {
   FLING_TOPIC,
   isFlingMessage,
@@ -38,6 +42,8 @@ export interface FlingRoomEvents {
   onTaskCancel?(taskId: string, from: string): void;
   /** Receiver's periodic real progress report (see task-progress). */
   onTaskProgress?(taskId: string, doneBytes: number, totalBytes: number, from: string): void;
+  /** A direct path was found unhealthy; callers should close their P2P link. */
+  onDirectFallback?(reason: string): void;
   /** Optional diagnostics sink (the app wires this to its log file). */
   onLog?(tag: string, msg: string): void;
 }
@@ -65,6 +71,12 @@ export class FlingRoom {
    * instead of the LiveKit relay. Null/absent = relay everything.
    */
   private direct: DirectChannel | null = null;
+  /** Resolve functions for manifests sent over a direct channel. */
+  private manifestAckWaiters = new Map<string, (ok: boolean) => void>();
+  /** Prevent a manifest retry from creating a second receiver. */
+  private completedFiles = new Set<string>();
+  /** Changes whenever an established direct path is abandoned. */
+  private directGeneration = 0;
 
   constructor(
     private transport: FlingTransport,
@@ -105,6 +117,21 @@ export class FlingRoom {
       };
     } else {
       this.events.onLog?.('p2p', 'direct channel detached (relay mode)');
+    }
+  }
+
+  /**
+   * Stop using the direct channel immediately. The app-level P2P owner is
+   * notified so it can close the RTCPeerConnection too; all subsequent file
+   * messages then use the LiveKit relay.
+   */
+  fallbackToRelay(reason: string): void {
+    const hadDirect = !!this.direct;
+    this.setDirectChannel(null);
+    if (hadDirect) {
+      this.directGeneration++;
+      this.events.onLog?.('p2p', `direct fallback to relay: ${reason}`);
+      this.events.onDirectFallback?.(reason);
     }
   }
 
@@ -154,23 +181,114 @@ export class FlingRoom {
     file: FileLike,
     onProgress?: (sentBytes: number, totalBytes: number) => void,
     kind: FileKind = 'file',
+    /** Reuse the same id when a partially delivered file must be replayed. */
+    existingManifest?: FileManifest,
   ): Promise<FileManifest> {
-    const manifest = await buildManifest(file, kind);
-    await this.send({ kind: 'file-manifest', manifest });
+    const manifest = existingManifest ?? await buildManifest(file, kind);
+    await this.sendManifestWithAck(manifest);
+    const generationAtChunkStart = this.directGeneration;
     let sent = 0;
-    for (let seq = 0; seq < manifest.totalChunks; seq++) {
-      const start = seq * manifest.chunkSize;
-      const bytes = await file.slice(start, Math.min(start + manifest.chunkSize, file.size));
-      await this.send({
-        kind: 'file-chunk',
-        id: manifest.id,
-        seq,
-        data: FileReceiver.encodeChunk(bytes),
-      });
-      sent += bytes.length;
-      onProgress?.(sent, file.size);
+    let reported = 0;
+    let directChunksSent = false;
+
+    // Keep this loop reusable: if the direct path dies after accepting some
+    // chunks, replay the same manifest's chunks through the relay. The
+    // receiver de-duplicates already present chunks and fills the holes.
+    const sendChunks = async (): Promise<void> => {
+      for (let seq = 0; seq < manifest.totalChunks; seq++) {
+        const start = seq * manifest.chunkSize;
+        const bytes = await file.slice(start, Math.min(start + manifest.chunkSize, file.size));
+        const direct = this.direct?.readyState === 'open';
+        await this.send({
+          kind: 'file-chunk',
+          id: manifest.id,
+          seq,
+          data: FileReceiver.encodeChunk(bytes),
+        });
+        directChunksSent ||= direct;
+        sent += bytes.length;
+        // A replay must not make the sender UI go backwards. The task-level
+        // progress is still the receiver's authoritative value.
+        const nextReported = Math.min(file.size, Math.max(reported, sent));
+        if (nextReported > reported) {
+          reported = nextReported;
+          onProgress?.(reported, file.size);
+        }
+      }
+    };
+
+    await sendChunks();
+    if (directChunksSent && this.directGeneration !== generationAtChunkStart) {
+      this.events.onLog?.('p2p', `direct path changed during ${manifest.name}; replaying chunks via relay`);
+      await sendChunks();
     }
     return manifest;
+  }
+
+  /**
+   * A direct send only means that bytes entered the local SCTP buffer. Wait
+   * for the receiver's relay-side confirmation before putting chunks behind
+   * it. If the confirmation does not arrive, disable direct and send one
+   * relay copy; the task-level ack is the final end-to-end confirmation.
+   */
+  private async sendManifestWithAck(manifest: FileManifest): Promise<void> {
+    // Relay-only transfers already have the task-level ack and should not pay
+    // an extra round trip. This handshake is specifically for direct P2P.
+    const wasDirect = this.direct?.readyState === 'open';
+    if (!wasDirect) {
+      await this.send({ kind: 'file-manifest', manifest });
+      return;
+    }
+
+    const ack = this.waitForManifestAck(manifest.id, P2P_MANIFEST_ACK_TIMEOUT_MS);
+    let route: 'direct' | 'relay';
+    try {
+      route = await this.send({ kind: 'file-manifest', manifest });
+    } catch (e) {
+      this.resolveManifestAck(manifest.id, false);
+      throw e;
+    }
+    if (await ack) return;
+
+    // A direct manifest that was accepted locally but never acknowledged is
+    // exactly the black-hole case. Abandon it before sending any chunks.
+    if (route === 'direct' && this.direct?.readyState === 'open') {
+      this.fallbackToRelay(`manifest ack timeout (${manifest.id.slice(0, 8)})`);
+    }
+
+    // Send at most one relay copy after the direct attempt. Repeating a
+    // manifest is unsafe with pre-0.5.38 receivers that recreate their
+    // FileReceiver on every duplicate; the task-level ack remains the final
+    // end-to-end confirmation if this small control ack is lost.
+    if (route === 'direct') {
+      const relayAck = this.waitForManifestAck(manifest.id, P2P_MANIFEST_ACK_TIMEOUT_MS);
+      await this.send({ kind: 'file-manifest', manifest });
+      if (!(await relayAck)) {
+        this.events.onLog?.('p2p', `relay manifest ack missing for ${manifest.name}; continuing with task ack`);
+      }
+    } else {
+      this.events.onLog?.('p2p', `manifest ack missing for ${manifest.name}; continuing with task ack`);
+    }
+  }
+
+  private waitForManifestAck(id: string, timeoutMs: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      let timer: ReturnType<typeof setTimeout>;
+      const finish = (ok: boolean) => {
+        if (this.manifestAckWaiters.get(id) !== finish) return;
+        this.manifestAckWaiters.delete(id);
+        clearTimeout(timer);
+        resolve(ok);
+      };
+      timer = setTimeout(() => finish(false), timeoutMs);
+      const previous = this.manifestAckWaiters.get(id);
+      previous?.(false);
+      this.manifestAckWaiters.set(id, finish);
+    });
+  }
+
+  private resolveManifestAck(id: string, ok: boolean): void {
+    this.manifestAckWaiters.get(id)?.(ok);
   }
 
   /** v2: announce a new transfer task in a lobby / inbox room. */
@@ -207,7 +325,7 @@ export class FlingRoom {
     await this.send({ kind: 'task-progress', taskId, doneBytes, totalBytes });
   }
 
-  private async send(msg: FlingMessage): Promise<void> {
+  private async send(msg: FlingMessage): Promise<'direct' | 'relay'> {
     // File bytes prefer the direct P2P channel when it's open: the DTLS-SCTP
     // data channel is already encrypted, so no AES-GCM envelope needed here.
     // The manifest goes through the same channel so it can never arrive
@@ -216,23 +334,27 @@ export class FlingRoom {
     // Everything else (signaling, small messages) uses the relay.
     // A failing direct channel falls back to the relay for this chunk.
     const dc = this.direct;
-    // file-chunk / file-manifest / task-progress 走直连：进度上报虽小，
-    // 但走慢速中继会滞后数秒，发送端看到的"对方已接收"永远是旧数字。
-    const directKinds = msg.kind === 'file-chunk' || msg.kind === 'file-manifest' || msg.kind === 'task-progress';
+    // Only file payload/control travels over direct SCTP. Keep task-progress
+    // on the encrypted relay: it is the sender's independent health signal,
+    // and putting it behind a congested ordered data channel makes the
+    // watchdog blind precisely when the direct path becomes a black hole.
+    const directKinds = msg.kind === 'file-chunk' || msg.kind === 'file-manifest';
     if (directKinds && dc && dc.readyState === 'open') {
       try {
         if (dc.bufferedAmount > P2P_DRAIN_THRESHOLD) {
           await dc.waitForDrain(P2P_DRAIN_THRESHOLD);
+          if (dc.readyState !== 'open') throw new Error('direct channel closed while draining');
         }
         dc.send(enc.encode(JSON.stringify(msg)));
-        return;
+        return 'direct';
       } catch {
         this.events.onLog?.('p2p', `direct send failed for ${msg.kind} ${msg.kind === 'file-chunk' ? msg.seq : ''}, falling back to relay`);
-        this.setDirectChannel(null);
+        this.fallbackToRelay(`direct send failed for ${msg.kind}`);
       }
     }
     const sealed = await sealText(this.roomKey, JSON.stringify(msg));
     await this.transport.publish(enc.encode(sealed), FLING_TOPIC);
+    return 'relay';
   }
 
   private async handlePayload(payload: Uint8Array, from: string): Promise<void> {
@@ -315,7 +437,15 @@ export class FlingRoom {
           // 文件夹发送的相对路径（如 "docs/report.pdf"），老版本没有则为 undefined
           path: typeof m.path === 'string' ? m.path : undefined,
         };
+        if (this.incoming.has(manifest.id) || this.completedFiles.has(manifest.id)) {
+          this.events.onLog?.('xfer', `duplicate manifest ${manifest.id.slice(0, 8)}, acknowledging without reset`);
+          void this.send({ kind: 'file-manifest-ack', id: manifest.id }).catch(() => {});
+          break;
+        }
         this.incoming.set(manifest.id, { receiver: new FileReceiver(manifest), from });
+        // The acknowledgement is deliberately not a directKinds message, so
+        // it always travels over LiveKit even while the data channel is sick.
+        void this.send({ kind: 'file-manifest-ack', id: manifest.id }).catch(() => {});
         this.events.onFileManifest?.(manifest, from);
         // Replay any chunks that beat the manifest here.
         const buffered = this.earlyChunks.get(manifest.id);
@@ -334,6 +464,9 @@ export class FlingRoom {
         this.handleChunkMessage(msg);
         break;
       }
+      case 'file-manifest-ack':
+        this.resolveManifestAck(msg.id, true);
+        break;
       case 'offer':
         this.events.onOffer?.(msg, from);
         break;
@@ -371,6 +504,7 @@ export class FlingRoom {
     this.directChunkCounts.delete(id);
     try {
       const bytes = entry.receiver.assemble();
+      this.completedFiles.add(id);
       this.events.onFileComplete?.(id, entry.receiver.manifest, bytes);
     } catch (e) {
       this.events.onFileError?.(id, (e as Error).message);
@@ -379,6 +513,7 @@ export class FlingRoom {
 
   /** Single place that applies a file-chunk to its receiver. */
   private handleChunkMessage(msg: Extract<FlingMessage, { kind: 'file-chunk' }>): void {
+    if (this.completedFiles.has(msg.id)) return;
     const entry = this.incoming.get(msg.id);
     if (!entry) {
       // Manifest not seen yet (chunk beat it on a faster channel): buffer
@@ -412,6 +547,9 @@ export class FlingRoom {
   async close(): Promise<void> {
     if (this.helloTimer) clearInterval(this.helloTimer);
     this.earlyChunks.clear();
+    this.completedFiles.clear();
+    for (const resolve of this.manifestAckWaiters.values()) resolve(false);
+    this.manifestAckWaiters.clear();
     if (this.direct) {
       try {
         this.direct.close();
