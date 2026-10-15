@@ -45,4 +45,4 @@ export const P2P_DRAIN_THRESHOLD = 256 * 1024;
 export const P2P_DRAIN_TIMEOUT_MS = 3_000;
 
 /** Maximum time to wait for the receiver's relay manifest confirmation. */
-export const P2P_MANIFEST_ACK_TIMEOUT_MS = 3_000;
+export const P2P_MANIFEST_ACK_TIMEOUT_MS = 8_000;

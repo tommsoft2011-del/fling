@@ -57,11 +57,22 @@ const dec = new TextDecoder();
  * each window over the independent encrypted relay before we continue.
  */
 const DIRECT_CHUNK_WINDOW = 8;
-const DIRECT_CHUNK_ACK_TIMEOUT_MS = 3_000;
+// The receive ACK travels over LiveKit, not over the RTCDataChannel.  A
+// healthy direct transfer can therefore finish a window before the ACK gets
+// through the relay.  Three seconds turned a delayed final ACK into a false
+// P2P failure (the receiver had already got the complete file).
+const DIRECT_CHUNK_ACK_TIMEOUT_MS = 8_000;
 const RELAY_CHUNK_ACK_TIMEOUT_MS = 5_000;
 const DIRECT_CHUNK_ACK_EVERY = DIRECT_CHUNK_WINDOW;
-const DIRECT_CHUNK_ACK_INTERVAL_MS = 250;
-const DIRECT_REPLAY_OVERLAP_CHUNKS = 64;
+// Report real receive progress often enough to keep a slow relay alive, but
+// do not mirror every duplicate chunk.  The old 250ms cadence produced a
+// large number of duplicate ACKs while the relay was already congested.
+const CHUNK_ACK_PROGRESS_INTERVAL_MS = 500;
+const CHUNK_ACK_RESEND_INTERVAL_MS = 1_000;
+// nextSeq is the first contiguous chunk that the receiver is still missing.
+// Both direct repair and relay retry can therefore resume at that exact
+// position; replaying an arbitrary overlap only adds duplicate payloads.
+const RELAY_REPLAY_OVERLAP_CHUNKS = 0;
 const MAX_RELAY_WINDOW_RETRIES = 2;
 
 interface ManifestSendResult {
@@ -78,6 +89,9 @@ export class FlingRoom {
     from: string;
     lastAckSeq: number;
     lastAckAt: number;
+    ackChain: Promise<void>;
+    ackPending: boolean;
+    pendingAck?: { nextSeq: number; receivedBytes: number; complete: boolean };
   }>();
   /**
    * Chunks that arrived before their manifest. Manifests and chunks can
@@ -301,7 +315,7 @@ export class FlingRoom {
           }
 
           const lastAck = this.chunkAckProgress.get(manifest.id)?.nextSeq ?? windowStart;
-          const replayFrom = Math.max(firstSeq, lastAck - DIRECT_REPLAY_OVERLAP_CHUNKS);
+          const replayFrom = Math.max(firstSeq, lastAck);
           this.events.onLog?.('p2p', `direct chunk ACK timeout for ${manifest.name}; relay repair from ${replayFrom} (ack ${lastAck}, target ${windowEnd})`);
           this.fallbackToRelay(`direct chunk ack timeout (${manifest.id.slice(0, 8)})`);
           directMode = false;
@@ -315,7 +329,7 @@ export class FlingRoom {
         // the next local sequence, because the failed send may have left a
         // hole in the receiver.
         const lastAck = this.chunkAckProgress.get(manifest.id)?.nextSeq ?? windowStart;
-        const replayFrom = Math.max(firstSeq, lastAck - DIRECT_REPLAY_OVERLAP_CHUNKS);
+        const replayFrom = Math.max(firstSeq, lastAck);
         directMode = false;
         await sendRelayManifest();
         nextSeq = replayFrom;
@@ -323,6 +337,15 @@ export class FlingRoom {
       }
 
       await sendRelayManifest();
+      // A late ACK can arrive while a retry is being prepared.  Never send a
+      // window that is already covered by the receiver's contiguous prefix.
+      const acknowledged = this.chunkAckProgress.get(manifest.id)?.nextSeq ?? firstSeq;
+      if (acknowledged > nextSeq) {
+        this.events.onLog?.('xfer', `relay window skipped ${manifest.name} (${manifest.id.slice(0, 8)}): next=${nextSeq}, ack=${acknowledged}`);
+        nextSeq = Math.min(manifest.totalChunks, acknowledged);
+        relayWindowRetries = 0;
+        continue;
+      }
       const windowStart = nextSeq;
       const windowEnd = Math.min(manifest.totalChunks, windowStart + DIRECT_CHUNK_WINDOW);
       const windowNumber = ++relayWindowNumber;
@@ -339,6 +362,10 @@ export class FlingRoom {
         nextSeq = windowEnd;
         continue;
       }
+      // Start the timeout after all chunks have been accepted by the local
+      // LiveKit client.  More importantly, waitForChunkAck treats any ACK
+      // progress as activity and only times out after a period of silence.
+      // A slow but healthy relay must not be mistaken for a dead one.
       const confirmed = await this.waitForChunkAck(
         manifest.id,
         windowEnd,
@@ -348,11 +375,11 @@ export class FlingRoom {
         const ack = this.chunkAckProgress.get(manifest.id);
         this.events.onLog?.('xfer', `relay window ACK confirmed ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber}: next=${ack?.nextSeq ?? 0}, bytes=${ack?.receivedBytes ?? 0}, complete=${Boolean(ack?.complete)}, wait=${Date.now() - windowStartedAt}ms`);
         relayWindowRetries = 0;
-        nextSeq = windowEnd;
+        nextSeq = Math.max(windowEnd, ack?.nextSeq ?? 0);
         continue;
       }
       const lastAck = this.chunkAckProgress.get(manifest.id)?.nextSeq ?? windowStart;
-      const replayFrom = Math.max(firstSeq, lastAck - DIRECT_REPLAY_OVERLAP_CHUNKS);
+      const replayFrom = Math.max(firstSeq, lastAck - RELAY_REPLAY_OVERLAP_CHUNKS);
       relayWindowRetries++;
       this.events.onLog?.('xfer', `relay chunk ACK timeout for ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber} after ${Date.now() - windowStartedAt}ms; retry ${relayWindowRetries}/${MAX_RELAY_WINDOW_RETRIES} from ${replayFrom} (ack ${lastAck}, target ${windowEnd})`);
       if (relayWindowRetries > MAX_RELAY_WINDOW_RETRIES) {
@@ -465,14 +492,33 @@ export class FlingRoom {
     this.manifestAckWaiters.get(id)?.(ok);
   }
 
-  /** Wait for the receiver to confirm a contiguous direct-data window. */
+  /**
+   * Wait for the receiver to confirm a contiguous data window.
+   *
+   * The timeout is a silence timeout, not a total-window deadline.  LiveKit
+   * can deliver a relay ACK several seconds after the first chunk, especially
+   * when the reliable data queue is draining.  As long as the receiver keeps
+   * advancing its contiguous prefix or byte count, retrying would only add
+   * duplicate payloads to that same queue.
+   */
   private async waitForChunkAck(id: string, targetSeq: number, timeoutMs: number): Promise<boolean> {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if ((this.chunkAckProgress.get(id)?.nextSeq ?? 0) >= targetSeq) return true;
+    let lastSeq = this.chunkAckProgress.get(id)?.nextSeq ?? 0;
+    let lastBytes = this.chunkAckProgress.get(id)?.receivedBytes ?? 0;
+    let lastProgressAt = Date.now();
+    while (true) {
+      const progress = this.chunkAckProgress.get(id);
+      if ((progress?.nextSeq ?? 0) >= targetSeq || progress?.complete) return true;
+      if (
+        (progress?.nextSeq ?? 0) > lastSeq ||
+        (progress?.receivedBytes ?? 0) > lastBytes
+      ) {
+        lastSeq = progress?.nextSeq ?? lastSeq;
+        lastBytes = progress?.receivedBytes ?? lastBytes;
+        lastProgressAt = Date.now();
+      }
+      if (Date.now() - lastProgressAt >= timeoutMs) return false;
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    return (this.chunkAckProgress.get(id)?.nextSeq ?? 0) >= targetSeq;
   }
 
   private resolveChunkAck(
@@ -673,6 +719,8 @@ export class FlingRoom {
           from,
           lastAckSeq: 0,
           lastAckAt: 0,
+          ackChain: Promise.resolve(),
+          ackPending: false,
         });
         this.events.onLog?.('xfer', `manifest received ${manifest.name} (${manifest.id.slice(0, 8)}) source=${source}, chunks=${manifest.totalChunks}, size=${manifest.size}`);
         // The acknowledgement is deliberately not a directKinds message, so
@@ -794,37 +842,83 @@ export class FlingRoom {
    */
   private maybeSendChunkAck(
     id: string,
-    entry: { receiver: FileReceiver; lastAckSeq: number; lastAckAt: number },
+    entry: {
+      receiver: FileReceiver;
+      lastAckSeq: number;
+      lastAckAt: number;
+      ackChain: Promise<void>;
+      ackPending: boolean;
+      pendingAck?: { nextSeq: number; receivedBytes: number; complete: boolean };
+    },
     complete: boolean,
     source: 'relay' | 'direct',
   ): void {
     const now = Date.now();
     const nextSeq = entry.receiver.nextSeq;
-    if (
-      !complete &&
-      nextSeq <= entry.lastAckSeq &&
-      now - entry.lastAckAt < DIRECT_CHUNK_ACK_INTERVAL_MS
-    ) {
-      return;
-    }
-    if (
-      !complete &&
+    const progressAck = complete || (
       nextSeq > entry.lastAckSeq &&
-      nextSeq % DIRECT_CHUNK_ACK_EVERY !== 0 &&
-      now - entry.lastAckAt < DIRECT_CHUNK_ACK_INTERVAL_MS
-    ) {
-      return;
-    }
-    entry.lastAckSeq = Math.max(entry.lastAckSeq, nextSeq);
-    entry.lastAckAt = now;
-    void this.send({
-      kind: 'file-chunk-ack',
-      id,
-      nextSeq,
+      nextSeq > 0 &&
+      (
+        nextSeq % DIRECT_CHUNK_ACK_EVERY === 0 ||
+        now - entry.lastAckAt >= CHUNK_ACK_PROGRESS_INTERVAL_MS
+      )
+    );
+    const resendAck = !complete &&
+      entry.lastAckSeq > 0 &&
+      now - entry.lastAckAt >= CHUNK_ACK_RESEND_INTERVAL_MS;
+    if (!progressAck && !resendAck) return;
+
+    // If the receiver has advanced by a non-window amount, resend the last
+    // known contiguous position as a heartbeat.  A sender that did not see
+    // the original ACK can then replay only from that exact position.
+    const ack = {
+      nextSeq: progressAck ? nextSeq : entry.lastAckSeq,
       receivedBytes: entry.receiver.receivedByteCount,
       complete,
-    }).catch(() => {});
-    this.events.onLog?.('xfer', `chunk ACK sent (${id.slice(0, 8)}): source=${source}, next=${nextSeq}, bytes=${entry.receiver.receivedByteCount}, complete=${complete}`);
+    };
+    entry.lastAckSeq = Math.max(entry.lastAckSeq, ack.nextSeq);
+    entry.lastAckAt = now;
+    if (entry.ackPending) {
+      const pending = entry.pendingAck;
+      if (!pending || ack.nextSeq > pending.nextSeq || ack.complete) {
+        entry.pendingAck = ack;
+      }
+    } else {
+      this.enqueueChunkAck(id, entry, ack);
+    }
+    this.events.onLog?.('xfer', `chunk ACK queued (${id.slice(0, 8)}): source=${source}, next=${ack.nextSeq}, bytes=${ack.receivedBytes}, complete=${complete}`);
+  }
+
+  /** Serialize receive ACKs so a slow relay cannot accumulate promises. */
+  private enqueueChunkAck(
+    id: string,
+    entry: {
+      ackChain: Promise<void>;
+      ackPending: boolean;
+      pendingAck?: { nextSeq: number; receivedBytes: number; complete: boolean };
+    },
+    ack: { nextSeq: number; receivedBytes: number; complete: boolean },
+  ): void {
+    entry.ackPending = true;
+    entry.ackChain = entry.ackChain
+      .catch(() => {})
+      .then(async () => {
+        await this.send({
+          kind: 'file-chunk-ack',
+          id,
+          nextSeq: ack.nextSeq,
+          receivedBytes: ack.receivedBytes,
+          complete: ack.complete,
+        });
+        this.events.onLog?.('xfer', `chunk ACK sent (${id.slice(0, 8)}): next=${ack.nextSeq}, bytes=${ack.receivedBytes}, complete=${ack.complete}`);
+      })
+      .catch(() => {})
+      .finally(() => {
+        entry.ackPending = false;
+        const pending = entry.pendingAck;
+        entry.pendingAck = undefined;
+        if (pending) this.enqueueChunkAck(id, entry, pending);
+      });
   }
 
   /** Wait until all received payloads have been processed. */

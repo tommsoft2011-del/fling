@@ -90,8 +90,9 @@ const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const TEXT_CHUNK_CHARS = 15000;
 const OFFER_REANNOUNCE_MS = 5000;
 const WAIT_PEER_TIMEOUT_MS = 5 * 60 * 1000;
-/** Receiver reports are emitted once per second; five seconds is a dead-path watchdog. */
-const DIRECT_PEER_PROGRESS_TIMEOUT_MS = 5000;
+/** Receiver reports are emitted once per second; allow relay ACK jitter without
+ * masking a genuinely silent direct path. */
+const DIRECT_PEER_PROGRESS_TIMEOUT_MS = 8_000;
 const DIRECT_HEALTH_CHECK_MS = 1000;
 /** Progress is an aggregate, throttled lower-bound; replay an overlap to cover interior holes. */
 const DIRECT_REPLAY_OVERLAP_CHUNKS = 64;
