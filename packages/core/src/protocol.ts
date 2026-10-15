@@ -84,7 +84,9 @@ export type FlingMessage =
   | { kind: 'file-manifest'; manifest: FileManifest }
   | { kind: 'file-chunk'; id: string; seq: number; data: string } // base64
   // Sent over the LiveKit relay after the receiver has accepted a manifest.
-  | { kind: 'file-manifest-ack'; id: string }
+  // chunkAck advertises support for receive-confirmed relay windows; it is
+  // optional so older peers can still use the legacy relay stream.
+  | { kind: 'file-manifest-ack'; id: string; chunkAck?: boolean }
   // Application-level receive acknowledgement for direct P2P windows.  This
   // deliberately stays on the encrypted LiveKit relay: an ACK behind the
   // same wedged RTCDataChannel would not be a useful health signal.

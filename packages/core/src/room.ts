@@ -58,9 +58,16 @@ const dec = new TextDecoder();
  */
 const DIRECT_CHUNK_WINDOW = 8;
 const DIRECT_CHUNK_ACK_TIMEOUT_MS = 3_000;
+const RELAY_CHUNK_ACK_TIMEOUT_MS = 5_000;
 const DIRECT_CHUNK_ACK_EVERY = DIRECT_CHUNK_WINDOW;
 const DIRECT_CHUNK_ACK_INTERVAL_MS = 250;
 const DIRECT_REPLAY_OVERLAP_CHUNKS = 64;
+const MAX_RELAY_WINDOW_RETRIES = 2;
+
+interface ManifestSendResult {
+  chunkAckCapable: boolean;
+  relaySent: boolean;
+}
 
 export class FlingRoom {
   private roomKey!: CryptoKey;
@@ -91,6 +98,8 @@ export class FlingRoom {
   private manifestAckWaiters = new Map<string, (ok: boolean) => void>();
   /** Highest contiguous receive position reported for each direct file. */
   private chunkAckProgress = new Map<string, { nextSeq: number; receivedBytes: number; complete: boolean }>();
+  /** Peer capability advertised by the file-manifest acknowledgement. */
+  private chunkAckCapabilities = new Set<string>();
   /** Prevent a manifest retry from creating a second receiver. */
   private completedFiles = new Set<string>();
 
@@ -210,11 +219,11 @@ export class FlingRoom {
     if (firstSeq > 0 && this.direct?.readyState === 'open') {
       this.fallbackToRelay(`partial replay requires relay (${manifest.id.slice(0, 8)})`);
     }
-    await this.sendManifestWithAck(manifest);
-    let directMode = firstSeq === 0 && this.direct?.readyState === 'open';
-    // sendManifestWithAck already sent a relay manifest when directMode is
-    // false. A later direct failure will send exactly one more relay manifest.
-    let relayManifestSent = !directMode;
+    const manifestResult = await this.sendManifestWithAck(manifest);
+    let directMode = firstSeq === 0 && this.direct?.readyState === 'open' && manifestResult.chunkAckCapable;
+    let relayManifestSent = manifestResult.relaySent;
+    let relayChunkAckCapable = manifestResult.chunkAckCapable;
+    this.events.onLog?.('xfer', `file route selected for ${manifest.name} (${manifest.id.slice(0, 8)}): ${directMode ? 'direct' : 'relay'}, relayManifest=${relayManifestSent}, chunkAck=${relayChunkAckCapable}`);
     let sent = Math.min(file.size, firstSeq * manifest.chunkSize);
     let reported = sent;
 
@@ -222,6 +231,8 @@ export class FlingRoom {
     // accepted; there is no data window to acknowledge.
     if (manifest.size === 0) {
       onProgress?.(0, 0);
+      this.chunkAckProgress.delete(manifest.id);
+      this.chunkAckCapabilities.delete(manifest.id);
       return manifest;
     }
 
@@ -247,14 +258,28 @@ export class FlingRoom {
 
     const sendRelayManifest = async (): Promise<void> => {
       if (relayManifestSent) return;
-      // The direct path has already been detached by the caller before this
-      // function is reached, so sendManifestWithAck uses the relay here.
-      await this.sendManifestWithAck(manifest);
-      relayManifestSent = true;
+      if (this.direct?.readyState === 'open') {
+        this.fallbackToRelay(`relay window requires a relay manifest (${manifest.id.slice(0, 8)})`);
+      }
+      const result = await this.sendManifestWithAck(manifest);
+      relayManifestSent = result.relaySent;
+      relayChunkAckCapable = result.chunkAckCapable;
     };
 
+    if (!directMode) await sendRelayManifest();
+
     let nextSeq = firstSeq;
+    let relayWindowRetries = 0;
+    let relayWindowNumber = 0;
     while (nextSeq < manifest.totalChunks) {
+      // A late completion ACK can arrive after a direct timeout/replay has
+      // already started. Do not publish the rest of an already completed file
+      // into the relay queue.
+      if (this.chunkAckProgress.get(manifest.id)?.complete) {
+        onProgress?.(file.size, file.size);
+        nextSeq = manifest.totalChunks;
+        break;
+      }
       if (directMode && this.direct?.readyState === 'open') {
         const windowStart = nextSeq;
         const windowEnd = Math.min(manifest.totalChunks, windowStart + DIRECT_CHUNK_WINDOW);
@@ -298,28 +323,74 @@ export class FlingRoom {
       }
 
       await sendRelayManifest();
-      await sendChunk(nextSeq);
-      nextSeq++;
+      const windowStart = nextSeq;
+      const windowEnd = Math.min(manifest.totalChunks, windowStart + DIRECT_CHUNK_WINDOW);
+      const windowNumber = ++relayWindowNumber;
+      const windowStartedAt = Date.now();
+      this.events.onLog?.('xfer', `relay window start ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber} [${windowStart},${windowEnd})`);
+      for (let seq = windowStart; seq < windowEnd; seq++) await sendChunk(seq);
+      this.events.onLog?.('xfer', `relay window published ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber} [${windowStart},${windowEnd}) in ${Date.now() - windowStartedAt}ms, chunkAck=${relayChunkAckCapable}`);
+
+      // Peers before the receive-ACK capability continue on the old relay
+      // path. New peers use the same bounded window on LiveKit as on P2P;
+      // publish() alone only proves local enqueue, not remote processing.
+      if (!relayChunkAckCapable) {
+        this.events.onLog?.('xfer', `relay window unconfirmed ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber}; peer has no chunk-ACK capability`);
+        nextSeq = windowEnd;
+        continue;
+      }
+      const confirmed = await this.waitForChunkAck(
+        manifest.id,
+        windowEnd,
+        RELAY_CHUNK_ACK_TIMEOUT_MS,
+      );
+      if (confirmed) {
+        const ack = this.chunkAckProgress.get(manifest.id);
+        this.events.onLog?.('xfer', `relay window ACK confirmed ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber}: next=${ack?.nextSeq ?? 0}, bytes=${ack?.receivedBytes ?? 0}, complete=${Boolean(ack?.complete)}, wait=${Date.now() - windowStartedAt}ms`);
+        relayWindowRetries = 0;
+        nextSeq = windowEnd;
+        continue;
+      }
+      const lastAck = this.chunkAckProgress.get(manifest.id)?.nextSeq ?? windowStart;
+      const replayFrom = Math.max(firstSeq, lastAck - DIRECT_REPLAY_OVERLAP_CHUNKS);
+      relayWindowRetries++;
+      this.events.onLog?.('xfer', `relay chunk ACK timeout for ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber} after ${Date.now() - windowStartedAt}ms; retry ${relayWindowRetries}/${MAX_RELAY_WINDOW_RETRIES} from ${replayFrom} (ack ${lastAck}, target ${windowEnd})`);
+      if (relayWindowRetries > MAX_RELAY_WINDOW_RETRIES) {
+        this.chunkAckProgress.delete(manifest.id);
+        this.chunkAckCapabilities.delete(manifest.id);
+        throw new Error(`relay chunk ack timeout (${manifest.id.slice(0, 8)})`);
+      }
+      nextSeq = replayFrom;
     }
     this.chunkAckProgress.delete(manifest.id);
+    this.chunkAckCapabilities.delete(manifest.id);
     return manifest;
   }
 
   /**
-   * A direct send only means that bytes entered the local SCTP buffer. Wait
-   * for the receiver's relay-side confirmation before putting chunks behind
-   * it. If the confirmation does not arrive, disable direct and send one
-   * relay copy; the task-level ack is the final end-to-end confirmation.
+   * A manifest ACK confirms that the peer has created its receiver. New peers
+   * also advertise chunk ACK support, which lets relay sends use bounded
+   * windows instead of filling LiveKit's local reliable-data queue.
    */
-  private async sendManifestWithAck(manifest: FileManifest): Promise<void> {
-    // Relay-only transfers already have the task-level ack and should not pay
-    // an extra round trip. This handshake is specifically for direct P2P.
+  private async sendManifestWithAck(manifest: FileManifest): Promise<ManifestSendResult> {
     const wasDirect = this.direct?.readyState === 'open';
     if (!wasDirect) {
+      this.events.onLog?.('xfer', `manifest send route=relay ${manifest.name} (${manifest.id.slice(0, 8)})`);
+      const ack = this.waitForManifestAck(manifest.id, P2P_MANIFEST_ACK_TIMEOUT_MS);
       await this.send({ kind: 'file-manifest', manifest });
-      return;
+      const accepted = await ack;
+      const chunkAckCapable = accepted && this.chunkAckCapabilities.has(manifest.id);
+      this.events.onLog?.('xfer', `manifest ACK route=relay ${manifest.name} (${manifest.id.slice(0, 8)}): accepted=${accepted}, chunkAck=${chunkAckCapable}`);
+      if (!accepted) {
+        this.events.onLog?.('xfer', `relay manifest ack missing for ${manifest.name}; using legacy relay pacing`);
+      }
+      return {
+        chunkAckCapable,
+        relaySent: true,
+      };
     }
 
+    this.events.onLog?.('xfer', `manifest send route=direct ${manifest.name} (${manifest.id.slice(0, 8)})`);
     const ack = this.waitForManifestAck(manifest.id, P2P_MANIFEST_ACK_TIMEOUT_MS);
     let route: 'direct' | 'relay';
     try {
@@ -328,7 +399,16 @@ export class FlingRoom {
       this.resolveManifestAck(manifest.id, false);
       throw e;
     }
-    if (await ack) return;
+    const accepted = await ack;
+    if (accepted) {
+      const chunkAckCapable = this.chunkAckCapabilities.has(manifest.id);
+      this.events.onLog?.('xfer', `manifest ACK route=${route} ${manifest.name} (${manifest.id.slice(0, 8)}): accepted=true, chunkAck=${chunkAckCapable}`);
+      return {
+        chunkAckCapable,
+        relaySent: route === 'relay',
+      };
+    }
+    this.events.onLog?.('xfer', `manifest ACK timeout route=${route} ${manifest.name} (${manifest.id.slice(0, 8)})`);
 
     // A direct manifest that was accepted locally but never acknowledged is
     // exactly the black-hole case. Abandon it before sending any chunks.
@@ -343,11 +423,22 @@ export class FlingRoom {
     if (route === 'direct') {
       const relayAck = this.waitForManifestAck(manifest.id, P2P_MANIFEST_ACK_TIMEOUT_MS);
       await this.send({ kind: 'file-manifest', manifest });
-      if (!(await relayAck)) {
+      const relayAccepted = await relayAck;
+      if (!relayAccepted) {
         this.events.onLog?.('p2p', `relay manifest ack missing for ${manifest.name}; continuing with task ack`);
       }
+      const chunkAckCapable = relayAccepted && this.chunkAckCapabilities.has(manifest.id);
+      this.events.onLog?.('xfer', `manifest ACK route=relay-after-direct ${manifest.name} (${manifest.id.slice(0, 8)}): accepted=${relayAccepted}, chunkAck=${chunkAckCapable}`);
+      return {
+        chunkAckCapable,
+        relaySent: true,
+      };
     } else {
       this.events.onLog?.('p2p', `manifest ack missing for ${manifest.name}; continuing with task ack`);
+      return {
+        chunkAckCapable: this.chunkAckCapabilities.has(manifest.id),
+        relaySent: true,
+      };
     }
   }
 
@@ -367,7 +458,10 @@ export class FlingRoom {
     });
   }
 
-  private resolveManifestAck(id: string, ok: boolean): void {
+  private resolveManifestAck(id: string, ok: boolean, source: 'relay' | 'direct' = 'relay'): void {
+    if (ok && this.manifestAckWaiters.has(id)) {
+      this.events.onLog?.('xfer', `manifest ACK received (${id.slice(0, 8)}) source=${source}`);
+    }
     this.manifestAckWaiters.get(id)?.(ok);
   }
 
@@ -381,7 +475,10 @@ export class FlingRoom {
     return (this.chunkAckProgress.get(id)?.nextSeq ?? 0) >= targetSeq;
   }
 
-  private resolveChunkAck(msg: Extract<FlingMessage, { kind: 'file-chunk-ack' }>): void {
+  private resolveChunkAck(
+    msg: Extract<FlingMessage, { kind: 'file-chunk-ack' }>,
+    source: 'relay' | 'direct' = 'relay',
+  ): void {
     const nextSeq = Math.max(0, Math.floor(Number(msg.nextSeq) || 0));
     const receivedBytes = Math.max(0, Math.floor(Number(msg.receivedBytes) || 0));
     const previous = this.chunkAckProgress.get(msg.id);
@@ -396,6 +493,7 @@ export class FlingRoom {
         receivedBytes: Math.max(previous?.receivedBytes ?? 0, receivedBytes),
         complete: Boolean(msg.complete) || Boolean(previous?.complete),
       });
+      this.events.onLog?.('xfer', `chunk ACK received (${msg.id.slice(0, 8)}): source=${source}, next=${nextSeq}, bytes=${receivedBytes}, complete=${Boolean(msg.complete)}`);
     }
   }
 
@@ -552,8 +650,22 @@ export class FlingRoom {
           path: typeof m.path === 'string' ? m.path : undefined,
         };
         if (this.incoming.has(manifest.id) || this.completedFiles.has(manifest.id)) {
-          this.events.onLog?.('xfer', `duplicate manifest ${manifest.id.slice(0, 8)}, acknowledging without reset`);
-          void this.send({ kind: 'file-manifest-ack', id: manifest.id }).catch(() => {});
+          const completed = this.completedFiles.has(manifest.id);
+          this.events.onLog?.('xfer', `duplicate manifest received (${manifest.id.slice(0, 8)}) source=${source}, completed=${completed}, acknowledging without reset`);
+          void this.send({ kind: 'file-manifest-ack', id: manifest.id, chunkAck: true }).catch(() => {});
+          // If the sender lost the final chunk ACK and is repairing through
+          // relay, there is no incoming receiver entry left to emit another
+          // ACK. Re-advertise completion on the duplicate manifest so the
+          // sender can stop the replay instead of resending the whole file.
+          if (completed) {
+            void this.send({
+              kind: 'file-chunk-ack',
+              id: manifest.id,
+              nextSeq: manifest.totalChunks,
+              receivedBytes: manifest.size,
+              complete: true,
+            }).catch(() => {});
+          }
           break;
         }
         this.incoming.set(manifest.id, {
@@ -562,9 +674,10 @@ export class FlingRoom {
           lastAckSeq: 0,
           lastAckAt: 0,
         });
+        this.events.onLog?.('xfer', `manifest received ${manifest.name} (${manifest.id.slice(0, 8)}) source=${source}, chunks=${manifest.totalChunks}, size=${manifest.size}`);
         // The acknowledgement is deliberately not a directKinds message, so
         // it always travels over LiveKit even while the data channel is sick.
-        void this.send({ kind: 'file-manifest-ack', id: manifest.id }).catch(() => {});
+        void this.send({ kind: 'file-manifest-ack', id: manifest.id, chunkAck: true }).catch(() => {});
         this.events.onFileManifest?.(manifest, from);
         // Replay any chunks that beat the manifest here.
         const buffered = this.earlyChunks.get(manifest.id);
@@ -584,10 +697,11 @@ export class FlingRoom {
         break;
       }
       case 'file-manifest-ack':
-        this.resolveManifestAck(msg.id, true);
+        if (msg.chunkAck === true) this.chunkAckCapabilities.add(msg.id);
+        this.resolveManifestAck(msg.id, true, source);
         break;
       case 'file-chunk-ack':
-        this.resolveChunkAck(msg);
+        this.resolveChunkAck(msg, source);
         break;
       case 'offer':
         this.events.onOffer?.(msg, from);
@@ -648,6 +762,7 @@ export class FlingRoom {
         if (buf.length < 2000) buf.push(msg);
       } else {
         this.earlyChunks.set(msg.id, [msg]);
+        this.events.onLog?.('xfer', `chunk before manifest (${msg.id.slice(0, 8)}): source=${source}, seq=${msg.seq}`);
       }
       return;
     }
@@ -660,20 +775,28 @@ export class FlingRoom {
       this.incoming.delete(msg.id);
       return;
     }
-    this.events.onFileProgress?.(msg.id, receiver.progress * receiver.totalBytes, receiver.totalBytes);
-    if (source === 'direct') this.maybeSendChunkAck(msg.id, entry, complete);
+    // Use the integer accumulator as the source of truth. Computing
+    // `progress * totalBytes` introduced values such as 3932159.9999999995
+    // into task-progress, which made sender/receiver progress comparisons
+    // look inconsistent and could leave a target one fraction short.
+    this.events.onFileProgress?.(msg.id, receiver.receivedByteCount, receiver.totalBytes);
+    // Both transports use the same application-level receive ACK. Direct
+    // ACKs detect a UDP black hole; relay ACKs keep LiveKit's reliable queue
+    // from being flooded by publish() calls that only completed locally.
+    this.maybeSendChunkAck(msg.id, entry, complete, source);
     if (complete) this.finishFile(msg.id);
   }
 
   /**
-   * ACK direct chunks through LiveKit, not through the same ordered SCTP
-   * channel. A small cadence keeps relay control traffic bounded while still
-   * giving the sender a hard end-to-end signal for every direct window.
+   * ACK data windows through the encrypted LiveKit control path. A small
+   * cadence keeps control traffic bounded while still giving the sender a
+   * hard end-to-end signal for every direct or relay window.
    */
   private maybeSendChunkAck(
     id: string,
     entry: { receiver: FileReceiver; lastAckSeq: number; lastAckAt: number },
     complete: boolean,
+    source: 'relay' | 'direct',
   ): void {
     const now = Date.now();
     const nextSeq = entry.receiver.nextSeq;
@@ -701,6 +824,7 @@ export class FlingRoom {
       receivedBytes: entry.receiver.receivedByteCount,
       complete,
     }).catch(() => {});
+    this.events.onLog?.('xfer', `chunk ACK sent (${id.slice(0, 8)}): source=${source}, next=${nextSeq}, bytes=${entry.receiver.receivedByteCount}, complete=${complete}`);
   }
 
   /** Wait until all received payloads have been processed. */
@@ -715,6 +839,7 @@ export class FlingRoom {
     for (const resolve of this.manifestAckWaiters.values()) resolve(false);
     this.manifestAckWaiters.clear();
     this.chunkAckProgress.clear();
+    this.chunkAckCapabilities.clear();
     if (this.direct) {
       try {
         this.direct.close();

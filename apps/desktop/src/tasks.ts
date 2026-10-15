@@ -279,7 +279,9 @@ export class SendTask {
         onDirectFallback: (reason) => this.onDirectFallback(reason),
         onTaskProgress: (taskId, doneBytes, totalBytes) => {
           if (taskId === this.taskId) {
-            if (this.phase === 'sending' && this.p2p === 'open' && this.room?.directActive) {
+            const previousPeerDone = this.peerDoneBytes;
+            const progressAdvanced = doneBytes > previousPeerDone;
+            if (this.phase === 'sending' && this.p2p === 'open' && this.room?.directActive && progressAdvanced) {
               this.lastPeerProgressAt = Date.now();
             }
             // 诊断：对方上报的已收到不应超过我已发送的；倒退/超发都说明计数错乱
@@ -303,6 +305,7 @@ export class SendTask {
             log('xfer', 'peer progress', {
               taskId,
               doneBytes: this.peerDoneBytes,
+              delta: doneBytes - previousPeerDone,
               totalBytes: this.peerTotalBytes,
               direct: this.room?.directActive ?? false,
             });
@@ -473,6 +476,14 @@ export class SendTask {
           log('xfer', 'send item error', { taskId: this.taskId, name: st.name, error: st.error });
         }
         this.notify();
+        // Do not enqueue later files after one item has lost end-to-end
+        // confirmation. Continuing here used to turn a single relay stall
+        // into an even larger LiveKit queue and made the UI show e.g. 3/5
+        // while item 2 was already failed.
+        if (st.status === 'error') {
+          log('xfer', 'stopping after item failure', { taskId: this.taskId, name: st.name });
+          break;
+        }
       }
 
       // 5. 收尾：等接收方确认全部落盘（task-ack）再拆连接。
@@ -482,7 +493,13 @@ export class SendTask {
         await this.room!.sendTaskDone(this.taskId);
         log('task', 'task-done sent', { taskId: this.taskId });
       } catch { /* 尽力 */ }
-      const acked = await this.waitForAck(30_000);
+      // A partial task cannot become successful by waiting for the receiver's
+      // final ACK. Waiting 30 seconds here used to hide the real item-level
+      // relay failure and keep the broken room alive; close promptly after a
+      // failed item, while preserving the full end-to-end wait for success.
+      const acked = okCount === this.items.length
+        ? await this.waitForAck(30_000)
+        : false;
       this.stopDirectHealth();
       log('task', acked ? 'ack ok, closing' : 'ack timeout, closing anyway', {
         taskId: this.taskId,
@@ -867,6 +884,8 @@ export class RecvTask {
   private ackTimer: ReturnType<typeof setInterval> | null = null;
   /** Progress report trailing edge: a fast burst must still publish its final value. */
   private progressTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Serialize progress reports so async encryption cannot publish stale values after newer ones. */
+  private progressSendChain: Promise<void> = Promise.resolve();
   /** 发送方已离开（收到 ack 后关闭房间，ack 重试可停） */
   private peerGone = false;
   /** 已收到 manifest 但还没落盘完成的个数（在途分块计数） */
@@ -1131,8 +1150,16 @@ export class RecvTask {
           items: this.items.map((i) => ({ name: i.name, done: i.doneBytes, total: i.totalBytes })),
         });
       }
-      void room.sendTaskProgress(this.taskId, d, this.totalBytes).catch(() => {});
+      void this.enqueueProgressReport(d, this.totalBytes);
     }
+  }
+
+  private enqueueProgressReport(doneBytes: number, totalBytes: number): Promise<void> {
+    const room = this.room;
+    if (!room) return Promise.resolve();
+    const next = this.progressSendChain.then(() => room.sendTaskProgress(this.taskId, doneBytes, totalBytes));
+    this.progressSendChain = next.catch(() => {});
+    return this.progressSendChain;
   }
 
   private onFileError(id: string, err: string): void {
@@ -1352,7 +1379,7 @@ export class RecvTask {
       };
       try {
         // 先发最终进度（100%），再发 ack：避免发送端停留在过期的百分比上
-        await room.sendTaskProgress(this.taskId, this.doneBytes, this.totalBytes).catch(() => {});
+        await this.enqueueProgressReport(this.doneBytes, this.totalBytes);
         sendAck();
         await room.flush().catch(() => {});
       } catch {
