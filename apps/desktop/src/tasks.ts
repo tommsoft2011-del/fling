@@ -268,6 +268,18 @@ export class SendTask {
         },
         onTaskProgress: (taskId, doneBytes, totalBytes) => {
           if (taskId === this.taskId) {
+            // 诊断：对方上报的已收到不应超过我已发送的；倒退/超发都说明计数错乱
+            const mySent = this.doneBytes;
+            if (doneBytes > mySent + 65536) {
+              log('xfer', 'PEER PROGRESS EXCEEDS SENT', {
+                taskId, peerDone: doneBytes, mySent, peerTotal: totalBytes,
+              });
+            }
+            if (doneBytes < this.peerDoneBytes) {
+              log('xfer', 'PEER PROGRESS BACKWARDS', {
+                taskId, was: this.peerDoneBytes, now: doneBytes,
+              });
+            }
             this.peerDoneBytes = doneBytes;
             this.peerTotalBytes = totalBytes;
             this.notify();
@@ -828,8 +840,11 @@ export class RecvTask {
   }
 
   private onManifest(m: FileManifest): void {
+    // 诊断：manifest 重复到达会导致条目错配、doneBytes 虚高
+    const dup = this.manifestToItem.has(m.id);
     // 按 offer 顺序匹配（data channel 有序可靠），辅以 文件名+大小 兜底
     let item = this.fileQueue.shift();
+    let matchMode = 'queue';
     if (!item) {
       // offer.items 被截断时：manifest 对应的条目不在预览里，按 manifest 现场补建
       item = {
@@ -842,6 +857,7 @@ export class RecvTask {
         totalBytes: m.size,
       };
       this.items.push(item);
+      matchMode = 'created';
     }
     if (item.name !== m.name || item.size !== m.size) {
       const alt = this.fileQueue.find((i) => i.name === m.name && i.size === m.size);
@@ -849,6 +865,9 @@ export class RecvTask {
         this.fileQueue = this.fileQueue.filter((i) => i !== alt);
         this.fileQueue.unshift(item);
         item = alt;
+        matchMode = 'name-size-fallback';
+      } else {
+        matchMode = 'queue-mismatch!';
       }
     }
     item.status = 'active';
@@ -858,18 +877,36 @@ export class RecvTask {
     this.manifestsReceived++;
     log('xfer', 'manifest recv', {
       taskId: this.taskId,
+      mid: m.id.slice(0, 8),
       name: m.name,
       size: m.size,
       chunks: m.totalChunks,
       chunkSize: m.chunkSize,
       kind: m.kind,
+      duplicate: dup,
+      matchMode,
+      queueLeft: this.fileQueue.length,
+      itemsCount: this.items.length,
     });
+    if (dup || matchMode === 'queue-mismatch!') {
+      log('xfer', 'MANIFEST ANOMALY', {
+        taskId: this.taskId, mid: m.id.slice(0, 8), name: m.name,
+        duplicate: dup, matchMode,
+      });
+    }
     this.notify();
   }
 
   private onProgress(id: string, r: number, t: number): void {
     const item = this.manifestToItem.get(id);
     if (!item) return;
+    // 诊断：doneBytes 倒退说明条目错配或重复计数
+    if (r < item.doneBytes) {
+      log('xfer', 'PROGRESS BACKWARDS', {
+        taskId: this.taskId, mid: id.slice(0, 8), name: item.name,
+        was: item.doneBytes, now: r, total: t,
+      });
+    }
     item.doneBytes = r;
     item.totalBytes = t;
     this.trackSpeed();
@@ -885,7 +922,15 @@ export class RecvTask {
     this.lastProgressReport = now;
     const room = this.room;
     if (room) {
-      void room.sendTaskProgress(this.taskId, this.doneBytes, this.totalBytes).catch(() => {});
+      const d = this.doneBytes;
+      // 诊断：上报值不应超过 totalBytes；记录明细以便核对
+      if (d > this.totalBytes) {
+        log('xfer', 'REPORT OVERFLOW', {
+          taskId: this.taskId, done: d, total: this.totalBytes,
+          items: this.items.map((i) => ({ name: i.name, done: i.doneBytes, total: i.totalBytes })),
+        });
+      }
+      void room.sendTaskProgress(this.taskId, d, this.totalBytes).catch(() => {});
     }
   }
 
