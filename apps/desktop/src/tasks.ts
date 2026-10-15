@@ -391,6 +391,13 @@ export class SendTask {
               onFileProgress(sent);
             }, src.kind);
 
+            // sendFile now confirms every direct window itself. If it had to
+            // abandon the path, the remaining bytes are already being
+            // repaired through LiveKit; use the relay's no-progress timeout
+            // instead of applying the old five-second direct deadline to
+            // that repair stream.
+            const directPathStillActive = directFileTransfer && this.room?.directActive === true;
+
             // Do not start the next file after only filling a local buffer.
             // This is required for both direct and relay modes: after a direct
             // fallback, relay publish() can finish long before the receiver
@@ -400,10 +407,10 @@ export class SendTask {
               .reduce((sum, item) => sum + item.totalBytes, 0);
             let confirmed = await this.waitForPeerProgress(
               peerTarget,
-              directFileTransfer
+              directPathStillActive
                 ? DIRECT_PEER_PROGRESS_TIMEOUT_MS
                 : RELAY_PEER_PROGRESS_SILENCE_TIMEOUT_MS,
-              !directFileTransfer,
+              !directPathStillActive,
             );
             if (directFileTransfer && !confirmed) {
               const reason = `file progress stalled at ${this.peerDoneBytes}/${peerTarget}`;

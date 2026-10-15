@@ -265,7 +265,15 @@ export class P2PLink {
       if (this.pc) this.logSelectedPair(this.pc);
       this.setState('open');
       try {
-        this.room.setDirectChannel(new RTCDirectChannel(dc, this.peerLabel));
+        const direct = new RTCDirectChannel(dc, this.peerLabel);
+        // RTCDirectChannel owns the native onclose slot after wrapping the
+        // browser channel, so wire the P2P link's failure path through the
+        // wrapper as well. Without this, a closed channel could remain
+        // attached to FlingRoom until the next send happened to notice it.
+        direct.onclose = () => {
+          if (!this.closed && this._state === 'open') this.fail('data channel closed');
+        };
+        this.room.setDirectChannel(direct);
       } catch (e) {
         this.fail(`setDirectChannel threw: ${(e as Error).message}`);
       }

@@ -69,6 +69,8 @@ export async function buildManifest(file: FileLike, kind: FileKind = 'file'): Pr
 export class FileReceiver {
   private chunks: (Uint8Array | undefined)[];
   private receivedBytes = 0;
+  /** The first chunk not yet present in the contiguous prefix. */
+  private nextMissingSeq = 0;
 
   constructor(readonly manifest: FileManifest) {
     // NOTE: must .fill() — a bare new Array(n) has holes which .every() skips,
@@ -80,13 +82,30 @@ export class FileReceiver {
     return this.manifest.size;
   }
 
+  /** Aggregate bytes already present, including chunks after a hole. */
+  get receivedByteCount(): number {
+    return this.receivedBytes;
+  }
+
+  /** The next contiguous chunk needed by a sender doing windowed replay. */
+  get nextSeq(): number {
+    return this.nextMissingSeq;
+  }
+
   /** Add a chunk; returns true when the file is complete. */
   addChunk(seq: number, dataB64: string): boolean {
     if (seq < 0 || seq >= this.manifest.totalChunks) return false;
-    if (this.chunks[seq]) return this.isComplete(); // duplicate
-    const bytes = b64decode(dataB64);
-    this.chunks[seq] = bytes;
-    this.receivedBytes += bytes.length;
+    if (!this.chunks[seq]) {
+      const bytes = b64decode(dataB64);
+      this.chunks[seq] = bytes;
+      this.receivedBytes += bytes.length;
+    }
+    // Direct delivery is ordered today, but relay replay and a future
+    // unordered channel are allowed to fill holes. Keep this incremental so
+    // an ACK does not scan the whole file on every chunk.
+    while (this.nextMissingSeq < this.chunks.length && this.chunks[this.nextMissingSeq]) {
+      this.nextMissingSeq++;
+    }
     return this.isComplete();
   }
 

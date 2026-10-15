@@ -85,6 +85,18 @@ export type FlingMessage =
   | { kind: 'file-chunk'; id: string; seq: number; data: string } // base64
   // Sent over the LiveKit relay after the receiver has accepted a manifest.
   | { kind: 'file-manifest-ack'; id: string }
+  // Application-level receive acknowledgement for direct P2P windows.  This
+  // deliberately stays on the encrypted LiveKit relay: an ACK behind the
+  // same wedged RTCDataChannel would not be a useful health signal.
+  | {
+      kind: 'file-chunk-ack';
+      id: string;
+      /** Next contiguous chunk the receiver still needs. */
+      nextSeq: number;
+      /** Aggregate bytes present in the receiver's reassembly buffer. */
+      receivedBytes: number;
+      complete?: boolean;
+    }
   | OfferMessage
   | { kind: 'offer-withdraw'; taskId: string }
   | { kind: 'offer-rejected'; taskId: string }
@@ -113,6 +125,7 @@ export function isFlingMessage(o: unknown): o is FlingMessage {
     k === 'file-manifest' ||
     k === 'file-chunk' ||
     k === 'file-manifest-ack' ||
+    k === 'file-chunk-ack' ||
     k === 'offer' ||
     k === 'offer-withdraw' ||
     k === 'offer-rejected' ||
