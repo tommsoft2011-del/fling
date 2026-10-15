@@ -95,6 +95,8 @@ const DIRECT_PEER_PROGRESS_TIMEOUT_MS = 5000;
 const DIRECT_HEALTH_CHECK_MS = 1000;
 /** Progress is an aggregate, throttled lower-bound; replay an overlap to cover interior holes. */
 const DIRECT_REPLAY_OVERLAP_CHUNKS = 64;
+/** Relay throughput is variable; fail only after it stops making progress for this long. */
+const RELAY_PEER_PROGRESS_SILENCE_TIMEOUT_MS = 30_000;
 
 function toOfferItem(c: ComposeItem): OfferItem {
   return {
@@ -389,65 +391,69 @@ export class SendTask {
               onFileProgress(sent);
             }, src.kind);
 
-            // Do not immediately start the next file after only filling the
-            // local SCTP buffer. The receiver's aggregate progress is the
-            // end-to-end confirmation for this file. If it stalls, force the
-            // relay and replay this same manifest once so missing direct
-            // chunks are filled instead of merely routing future chunks.
-            if (directFileTransfer) {
-              const peerTarget = this.items
-                .slice(0, i + 1)
-                .reduce((sum, item) => sum + item.totalBytes, 0);
-              const confirmed = await this.waitForPeerProgress(
-                peerTarget,
-                DIRECT_PEER_PROGRESS_TIMEOUT_MS,
+            // Do not start the next file after only filling a local buffer.
+            // This is required for both direct and relay modes: after a direct
+            // fallback, relay publish() can finish long before the receiver
+            // has drained the reliable LiveKit queue.
+            const peerTarget = this.items
+              .slice(0, i + 1)
+              .reduce((sum, item) => sum + item.totalBytes, 0);
+            let confirmed = await this.waitForPeerProgress(
+              peerTarget,
+              directFileTransfer
+                ? DIRECT_PEER_PROGRESS_TIMEOUT_MS
+                : RELAY_PEER_PROGRESS_SILENCE_TIMEOUT_MS,
+              !directFileTransfer,
+            );
+            if (directFileTransfer && !confirmed) {
+              const reason = `file progress stalled at ${this.peerDoneBytes}/${peerTarget}`;
+              const previousTarget = peerTarget - st.totalBytes;
+              const peerFileBytes = Math.min(
+                st.totalBytes,
+                Math.max(0, this.peerDoneBytes - previousTarget),
               );
-              if (!confirmed) {
-                const reason = `file progress stalled at ${this.peerDoneBytes}/${peerTarget}`;
-                const previousTarget = peerTarget - st.totalBytes;
-                const peerFileBytes = Math.min(
-                  st.totalBytes,
-                  Math.max(0, this.peerDoneBytes - previousTarget),
-                );
-                const replayFromSeq = Math.max(
-                  0,
-                  Math.floor(peerFileBytes / manifest.chunkSize) - DIRECT_REPLAY_OVERLAP_CHUNKS,
-                );
-                log('p2p', 'file confirmation stalled, replaying via relay', {
+              const replayFromSeq = Math.max(
+                0,
+                Math.floor(peerFileBytes / manifest.chunkSize) - DIRECT_REPLAY_OVERLAP_CHUNKS,
+              );
+              log('p2p', 'file confirmation stalled, replaying via relay', {
+                taskId: this.taskId,
+                name: st.name,
+                peerDoneBytes: this.peerDoneBytes,
+                peerTarget,
+                peerFileBytes,
+                replayFromSeq,
+                direct: this.room?.directActive ?? false,
+              });
+              this.room?.fallbackToRelay(reason);
+              await this.room!.sendFile(file, onFileProgress, src.kind, manifest, replayFromSeq);
+              confirmed = await this.waitForPeerProgress(
+                peerTarget,
+                RELAY_PEER_PROGRESS_SILENCE_TIMEOUT_MS,
+                true,
+              );
+              // A throttled progress report can still be stale, or the first
+              // overlap may not cover an unusual interior hole. Use one full
+              // replay as a bounded last resort, but never advance to the next
+              // file while the receiver still has not confirmed this one.
+              if (!confirmed && replayFromSeq > 0) {
+                log('p2p', 'selective relay replay not confirmed, retrying full file', {
                   taskId: this.taskId,
                   name: st.name,
-                  peerDoneBytes: this.peerDoneBytes,
-                  peerTarget,
-                  peerFileBytes,
                   replayFromSeq,
-                  direct: this.room?.directActive ?? false,
                 });
-                this.room?.fallbackToRelay(reason);
-                await this.room!.sendFile(file, onFileProgress, src.kind, manifest, replayFromSeq);
-                let relayConfirmed = await this.waitForPeerProgress(
+                await this.room!.sendFile(file, onFileProgress, src.kind, manifest, 0);
+                confirmed = await this.waitForPeerProgress(
                   peerTarget,
-                  DIRECT_PEER_PROGRESS_TIMEOUT_MS * 2,
+                  RELAY_PEER_PROGRESS_SILENCE_TIMEOUT_MS,
+                  true,
                 );
-                // A throttled progress report can still be stale, or the first
-                // overlap may not cover an unusual interior hole. Use one full
-                // replay as a bounded last resort, but never advance to the next
-                // file while the receiver still has not confirmed this one.
-                if (!relayConfirmed && replayFromSeq > 0) {
-                  log('p2p', 'selective relay replay not confirmed, retrying full file', {
-                    taskId: this.taskId,
-                    name: st.name,
-                    replayFromSeq,
-                  });
-                  await this.room!.sendFile(file, onFileProgress, src.kind, manifest, 0);
-                  relayConfirmed = await this.waitForPeerProgress(
-                    peerTarget,
-                    DIRECT_PEER_PROGRESS_TIMEOUT_MS * 2,
-                  );
-                }
-                if (!relayConfirmed) {
-                  throw new Error('中继重传后对方仍未确认文件进度');
-                }
               }
+            }
+            if (!confirmed) {
+              throw new Error(
+                directFileTransfer ? '中继重传后对方仍未确认文件进度' : '中继传输后对方进度停止',
+              );
             }
           }
           st.status = 'done';
@@ -607,11 +613,23 @@ export class SendTask {
     }
   }
 
-  /** Wait for the receiver to confirm bytes, not just local send-buffering. */
-  private async waitForPeerProgress(target: number, timeoutMs: number): Promise<boolean> {
+  /** Wait for receiver bytes; relay mode uses a no-progress timeout, not a total-size timeout. */
+  private async waitForPeerProgress(
+    target: number,
+    timeoutMs: number,
+    timeoutOnSilence = false,
+  ): Promise<boolean> {
     const start = Date.now();
-    while (!this.cancelled && this.peerDoneBytes < target && Date.now() - start < timeoutMs) {
+    let lastObserved = this.peerDoneBytes;
+    let lastAdvanceAt = start;
+    while (!this.cancelled && this.peerDoneBytes < target) {
       await delay(200);
+      if (this.peerDoneBytes > lastObserved) {
+        lastObserved = this.peerDoneBytes;
+        lastAdvanceAt = Date.now();
+      }
+      const elapsed = timeoutOnSilence ? Date.now() - lastAdvanceAt : Date.now() - start;
+      if (elapsed >= timeoutMs) break;
     }
     const ok = this.peerDoneBytes >= target;
     if (!ok) {
@@ -620,6 +638,7 @@ export class SendTask {
         peerDoneBytes: this.peerDoneBytes,
         target,
         timeoutMs,
+        timeoutOnSilence,
         direct: this.room?.directActive ?? false,
       });
     }
@@ -839,6 +858,8 @@ export class RecvTask {
   private pendingSaves = new Set<Promise<void>>();
   /** ack 重试定时器（ack 可能丢包，重发直到发送方离开或超时） */
   private ackTimer: ReturnType<typeof setInterval> | null = null;
+  /** Progress report trailing edge: a fast burst must still publish its final value. */
+  private progressTimer: ReturnType<typeof setTimeout> | null = null;
   /** 发送方已离开（收到 ack 后关闭房间，ack 重试可停） */
   private peerGone = false;
   /** 已收到 manifest 但还没落盘完成的个数（在途分块计数） */
@@ -1074,7 +1095,24 @@ export class RecvTask {
   /** 向发送方上报真实接收进度（1s 节流），让发送端显示"对方已接收"而非"已发送" */
   private reportProgress(force = false): void {
     const now = Date.now();
-    if ((!force && now - this.lastProgressReport < 1000) || this.finished) return;
+    if (this.finished) return;
+    const elapsed = now - this.lastProgressReport;
+    if (!force && elapsed < 1000) {
+      // Direct chunks can arrive in a sub-second burst. Without a trailing
+      // report, the sender may only see the first 32KB forever and replay the
+      // whole file even though the receiver already has almost all chunks.
+      if (!this.progressTimer) {
+        this.progressTimer = setTimeout(() => {
+          this.progressTimer = null;
+          this.reportProgress();
+        }, 1000 - elapsed);
+      }
+      return;
+    }
+    if (this.progressTimer) {
+      clearTimeout(this.progressTimer);
+      this.progressTimer = null;
+    }
     this.lastProgressReport = now;
     const room = this.room;
     if (room) {
@@ -1242,6 +1280,10 @@ export class RecvTask {
   private async finish(completed: boolean): Promise<void> {
     if (this.finished) return;
     this.finished = true;
+    if (this.progressTimer) {
+      clearTimeout(this.progressTimer);
+      this.progressTimer = null;
+    }
     clearTimeout(this.peerGoneTimer);
     if (completed) {
       // task-done 可能先于 manifest/分块到达（中继与直连是两条通道）：
