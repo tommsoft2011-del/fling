@@ -14,6 +14,7 @@
     "test:stream": "bun test/file-stream.ts",
     "test:p2p": "bun test/p2p-routing.ts",
     "test:window": "bun test/direct-window.ts",
+    "test:drain-ab": "bun test/drain-threshold-ab.ts",
     "typecheck": "tsc --noEmit -p ."
   },
   "type": "module",

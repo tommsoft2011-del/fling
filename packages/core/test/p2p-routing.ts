@@ -11,7 +11,7 @@
 
 import { FlingRoom, type FlingRoomEvents } from '../src/room.js';
 import { P2P_DRAIN_THRESHOLD, type DirectChannel } from '../src/p2p.js';
-import { buildManifest, FileReceiver, type FileLike } from '../src/files.js';
+import { buildManifest, FILE_HASH_CHUNK_SIZE, FileReceiver, type FileLike, wrapWebFile } from '../src/files.js';
 import { decodeDirectFileChunkFrame, encodeDirectFileChunkFrame } from '../src/protocol.js';
 import type { DataHandler, FlingTransport } from '../src/transport.js';
 
@@ -223,6 +223,42 @@ async function main(): Promise<void> {
     drainTargets.length > 0 && drainTargets.every((threshold) => threshold === P2P_DRAIN_THRESHOLD),
     'drain wait target matches bufferedamountlow threshold in the 223–256 KiB window',
   );
+
+  // A manifest prepared while the previous file is being saved must be reused
+  // rather than hashing the next Blob again at the start of sendFile.
+  done = freshBox();
+  const countedBase = fileLike('prehashed.bin', 100_000);
+  const sourceBytes = await countedBase.slice(0, countedBase.size);
+  const blobBuffer = new ArrayBuffer(sourceBytes.byteLength);
+  new Uint8Array(blobBuffer).set(sourceBytes);
+  const immutableBlob = new Blob([blobBuffer]);
+  const blobSnapshot = new Uint8Array(await immutableBlob.arrayBuffer());
+  const webFile = wrapWebFile(immutableBlob, 'prehashed.bin');
+  let sliceReads = 0;
+  const countedFile: FileLike = {
+    ...webFile,
+    slice: async (start, end) => {
+      sliceReads++;
+      return webFile.slice(start, end);
+    },
+  };
+  const precomputedManifest = await buildManifest(countedFile);
+  const manifestSnapshot = JSON.stringify(precomputedManifest);
+  const hashReads = sliceReads;
+  const prehashedSend = roomA.sendFile(countedFile, undefined, 'file', precomputedManifest);
+  for (let i = 0; i < 100 && !done.cur; i++) {
+    wire();
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  await prehashedSend;
+  check(FILE_HASH_CHUNK_SIZE === 256 * 1024, 'manifest hashing reads at most one 256 KiB chunk at a time');
+  check(done.cur?.bytes.length === countedFile.size, 'prehashed next-file manifest still completes and saves');
+  check(
+    !!done.cur && done.cur.bytes.length === blobSnapshot.length && done.cur.bytes.every((byte, index) => byte === blobSnapshot[index]),
+    'immutable Blob contents are unchanged through prehash and send',
+  );
+  check(JSON.stringify(precomputedManifest) === manifestSnapshot, 'manifest fields remain unchanged during send');
+  check(sliceReads - hashReads === precomputedManifest.totalChunks, 'sendFile reuses a prepared manifest without hashing the Blob twice');
 
   // --- 1a. adaptive bounded 1/4/8 MiB windows and send-buffer cap -----------
   done = freshBox();

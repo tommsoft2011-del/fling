@@ -45,7 +45,10 @@ function b64decode(s: string): Uint8Array {
 }
 
 /** Stream-hash a file (two reads max, constant memory). */
-export async function hashFile(file: FileLike, chunkSize = 256 * 1024): Promise<string> {
+/** Default maximum read buffer for manifest hashing; independent of file size. */
+export const FILE_HASH_CHUNK_SIZE = 256 * 1024;
+
+export async function hashFile(file: FileLike, chunkSize = FILE_HASH_CHUNK_SIZE): Promise<string> {
   const h = sha256.create();
   for (let off = 0; off < file.size; off += chunkSize) {
     h.update(await file.slice(off, Math.min(off + chunkSize, file.size)));

@@ -105,6 +105,7 @@ interface ReceivedFileChunk {
 }
 
 export class FlingRoom {
+  private readonly directDrainThresholdBytes: number;
   private roomKey!: CryptoKey;
   private events!: FlingRoomEvents;
   private helloTimer?: ReturnType<typeof setInterval>;
@@ -150,7 +151,14 @@ export class FlingRoom {
   constructor(
     private transport: FlingTransport,
     private deviceName: string,
-  ) {}
+    /** @internal Isolated backpressure-test seam; production callers use the 256 KiB default. */
+    directDrainThresholdBytes = P2P_DRAIN_THRESHOLD,
+  ) {
+    if (!Number.isSafeInteger(directDrainThresholdBytes) || directDrainThresholdBytes < 64 * 1024 || directDrainThresholdBytes > 512 * 1024) {
+      throw new Error(`direct drain threshold out of test bounds (${directDrainThresholdBytes})`);
+    }
+    this.directDrainThresholdBytes = directDrainThresholdBytes;
+  }
 
   get isConnected(): boolean {
     return this.transport.isConnected;
@@ -324,14 +332,13 @@ export class FlingRoom {
             throw new Error(`binary frame exceeds SCTP maxMessageSize (${frame.byteLength} > ${dc.maxMessageSize})`);
           }
           // Keep the wait target equal to bufferedAmountLowThreshold. Waiting
-          // for a smaller per-frame target can miss the already-fired low
-          // event when bufferedAmount is between that target and 256 KiB.
-          if (dc.bufferedAmount + frame.byteLength > P2P_DRAIN_THRESHOLD) {
+          // for a smaller per-frame target can miss the already-fired low event.
+          if (dc.bufferedAmount + frame.byteLength > this.directDrainThresholdBytes) {
             directDrainWaitCount++;
             directBufferedHighWater = Math.max(directBufferedHighWater, dc.bufferedAmount + frame.byteLength);
             const drainStartedAt = Date.now();
             try {
-              await dc.waitForDrain(P2P_DRAIN_THRESHOLD);
+              await dc.waitForDrain(this.directDrainThresholdBytes);
             } finally {
               directDrainWaitTotalMs += Date.now() - drainStartedAt;
             }
@@ -808,8 +815,8 @@ export class FlingRoom {
     const directKinds = msg.kind === 'file-chunk' || msg.kind === 'file-manifest';
     if (directKinds && dc && dc.readyState === 'open') {
       try {
-        if (dc.bufferedAmount > P2P_DRAIN_THRESHOLD) {
-          await dc.waitForDrain(P2P_DRAIN_THRESHOLD);
+        if (dc.bufferedAmount > this.directDrainThresholdBytes) {
+          await dc.waitForDrain(this.directDrainThresholdBytes);
           if (dc.readyState !== 'open') throw new Error('direct channel closed while draining');
         }
         dc.send(enc.encode(JSON.stringify(msg)));

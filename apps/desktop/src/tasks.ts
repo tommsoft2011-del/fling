@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { writeText as writeClipboardText } from '@tauri-apps/plugin-clipboard-manager';
 import {
+  buildManifest,
   wrapWebFile,
   type FileReceiver,
   type FileManifest,
@@ -250,6 +251,8 @@ export class SendTask {
   private currentSendingItem: ItemState | null = null;
   private currentPeerProgressTarget: number | null = null;
   private currentFileFinalizing = false;
+  /** At most one loaded next Blob is hashed while the current file is durably saved. */
+  private preparedManifest: { index: number; promise: Promise<FileManifest | null> } | null = null;
   private lobbyLeave?: () => void;
   private announceTimer?: ReturnType<typeof setInterval>;
   private waitTimer?: ReturnType<typeof setTimeout>;
@@ -276,6 +279,57 @@ export class SendTask {
       doneBytes: 0,
       totalBytes: c.size,
     }));
+  }
+
+  /**
+   * Overlap only the next already-loaded Blob's streaming hash with receiver
+   * save/fsync. Hashing reads 256 KiB slices, so extra byte-buffer memory is
+   * independent of Blob size. Lazy path-backed files are never read early.
+   */
+  private prepareNextBlobManifest(): void {
+    if (this.cancelled || !this.currentSendingItem) return;
+    const currentIndex = this.items.indexOf(this.currentSendingItem);
+    let nextIndex = currentIndex + 1;
+    while (nextIndex < this.source.length && this.source[nextIndex]?.kind === 'text') nextIndex++;
+    const next = this.source[nextIndex];
+    if (!next || next.kind === 'text') return;
+    if (!next.blob) {
+      log('xfer', 'next manifest prehash skipped for lazy path-backed file', {
+        taskId: this.taskId,
+        name: next.name,
+        size: next.size,
+      });
+      return;
+    }
+    if (this.preparedManifest?.index === nextIndex) return;
+
+    const file = wrapWebFile(next.blob, next.name, next.relPath);
+    const startedAt = performance.now();
+    log('xfer', 'next manifest prehash started', {
+      taskId: this.taskId,
+      name: next.name,
+      size: next.size,
+      overlaps: this.currentSendingItem.name,
+    });
+    const promise = buildManifest(file, next.kind).then((manifest) => {
+      log('xfer', 'next manifest prehash complete', {
+        taskId: this.taskId,
+        name: next.name,
+        size: next.size,
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
+      return manifest;
+    }).catch((error: unknown) => {
+      log('xfer', 'next manifest prehash failed', {
+        taskId: this.taskId,
+        name: next.name,
+        size: next.size,
+        elapsedMs: Math.round(performance.now() - startedAt),
+        error: errText(error),
+      });
+      return null;
+    });
+    this.preparedManifest = { index: nextIndex, promise };
   }
 
   get peerLabel(): string {
@@ -424,6 +478,7 @@ export class SendTask {
             xfer: id.slice(0, 8),
             size,
           });
+          this.prepareNextBlobManifest();
           this.notify();
         },
         onTaskProgress: (taskId, receivedBytes, totalBytes, _from, savedBytes = 0) => {
@@ -559,7 +614,11 @@ export class SendTask {
               this.trackSpeed(this.doneBytes);
               this.notify();
             };
-            const manifest = await this.room!.sendFile(file, onFileProgress, src.kind);
+            const prepared = this.preparedManifest?.index === i
+              ? (await this.preparedManifest.promise) ?? undefined
+              : undefined;
+            if (this.preparedManifest?.index === i) this.preparedManifest = null;
+            const manifest = await this.room!.sendFile(file, onFileProgress, src.kind, prepared);
             st.sha256 = manifest.sha256;
             st.mimeType = manifest.mimeType;
 
