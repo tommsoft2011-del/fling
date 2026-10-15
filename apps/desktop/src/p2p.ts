@@ -171,7 +171,17 @@ export class P2PLink {
             peer: this.peerLabel,
             local: `${l?.candidateType ?? '?'}/${l?.protocol ?? '?'}`,
             remote: `${r?.candidateType ?? '?'}/${r?.protocol ?? '?'}`,
+            localNetworkType: l?.networkType,
+            remoteNetworkType: r?.networkType,
             relayed,
+            currentRoundTripTimeMs: Number.isFinite(pair.currentRoundTripTime)
+              ? Math.round(pair.currentRoundTripTime * 1_000)
+              : undefined,
+            availableOutgoingBitrateMbps: Number.isFinite(pair.availableOutgoingBitrate)
+              ? Math.round(pair.availableOutgoingBitrate / 1_000_000 * 100) / 100
+              : undefined,
+            pairBytesSent: Number.isFinite(pair.bytesSent) ? pair.bytesSent : undefined,
+            pairBytesReceived: Number.isFinite(pair.bytesReceived) ? pair.bytesReceived : undefined,
           });
         } else {
           log('p2p', 'no selected pair in stats', { role: this.role, peer: this.peerLabel });

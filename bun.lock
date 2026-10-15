@@ -7,7 +7,7 @@
     },
     "apps/desktop": {
       "name": "@fling/desktop",
-      "version": "0.5.46",
+      "version": "0.6.0",
       "dependencies": {
         "@fling/core": "0.3.0",
         "@tauri-apps/api": "^2.0.0",

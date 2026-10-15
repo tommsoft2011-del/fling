@@ -12,6 +12,8 @@
   "scripts": {
     "test:v2": "bun test/loopback-v2.ts",
     "test:stream": "bun test/file-stream.ts",
+    "test:p2p": "bun test/p2p-routing.ts",
+    "test:window": "bun test/direct-window.ts",
     "typecheck": "tsc --noEmit -p ."
   },
   "type": "module",

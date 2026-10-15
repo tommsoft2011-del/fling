@@ -19,6 +19,34 @@ function patternFile(size: number): FileLike {
   };
 }
 
+async function testMissingChunksBlockFinalization(): Promise<void> {
+  const source = patternFile(FILE_CHUNK_SIZE * 3);
+  const manifest: FileManifest = {
+    id: 'stream-missing-chunks-test',
+    name: source.name,
+    size: source.size,
+    sha256: await hashFile(source),
+    chunkSize: FILE_CHUNK_SIZE,
+    totalChunks: 3,
+    kind: 'file',
+  };
+  const receiver = new FileReceiver(manifest);
+  receiver.addChunkBytes(0, await source.slice(0, FILE_CHUNK_SIZE));
+  receiver.addChunkBytes(2, await source.slice(FILE_CHUNK_SIZE * 2, source.size));
+  check(!receiver.isComplete(), 'an out-of-order hole prevents completion');
+  check(receiver.nextSeq === 1, 'ACK repair position is the first missing contiguous chunk');
+  let saveRejected = false;
+  try {
+    await receiver.streamTo(async () => {});
+  } catch {
+    saveRejected = true;
+  }
+  check(saveRejected, 'a receiver with missing chunks cannot enter save/finalization');
+  receiver.addChunkBytes(1, await source.slice(FILE_CHUNK_SIZE, FILE_CHUNK_SIZE * 2));
+  check(receiver.isComplete() && Number(receiver.nextSeq) === 3, 'filling the hole advances the contiguous ACK position to EOF');
+  console.log('PASS missing-chunk ACK position and finalization guard');
+}
+
 async function testLargeBoundedBackpressureStream(): Promise<void> {
   const size = 122_891_016;
   const source = patternFile(size);
@@ -131,6 +159,7 @@ async function testInterruptedStreamReleasesReceiver(): Promise<void> {
   console.log('PASS interrupted stream releases chunk references and reports failure');
 }
 
+await testMissingChunksBlockFinalization();
 await testLargeBoundedBackpressureStream();
 await testInterruptedStreamReleasesReceiver();
 console.log('ALL FILE STREAM TESTS PASSED');

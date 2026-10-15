@@ -39,6 +39,9 @@ class Hub {
 
 class MockTransport implements FlingTransport {
   isConnected = false;
+  publishDelayMs = 0;
+  dropNextPublish = false;
+  droppedPublishes = 0;
   private dataHandler: DataHandler | null = null;
   constructor(
     readonly localIdentity: string,
@@ -52,6 +55,14 @@ class MockTransport implements FlingTransport {
     this.isConnected = false;
   }
   async publish(payload: Uint8Array, topic: string): Promise<void> {
+    if (this.dropNextPublish) {
+      this.dropNextPublish = false;
+      this.droppedPublishes++;
+      return;
+    }
+    if (this.publishDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.publishDelayMs));
+    }
     this.hub.publish(this, payload, topic);
   }
   onData(h: DataHandler): void {
@@ -70,6 +81,7 @@ class FakeDirect implements DirectChannel {
   readonly maxMessageSize = 64 * 1024;
   bufferedAmount = 0;
   drainWaitThresholds: number[] = [];
+  maxBufferedAmountObserved = 0;
   onmessage: ((data: Uint8Array<ArrayBuffer>) => void) | null = null;
   onclose: (() => void) | null = null;
   sent: Uint8Array[] = [];
@@ -85,6 +97,7 @@ class FakeDirect implements DirectChannel {
     if (this.dead) throw new Error('channel closed');
     const count = ++this.sendCount;
     this.bufferedAmount += data.byteLength;
+    this.maxBufferedAmountObserved = Math.max(this.maxBufferedAmountObserved, this.bufferedAmount);
     if (!this.blackhole && (this.dropAfter === undefined || count <= this.dropAfter)) {
       this.sent.push(data);
     }
@@ -109,6 +122,7 @@ class FakeDirect implements DirectChannel {
     this.sent = [];
     this.sendCount = 0;
     this.bufferedAmount = 0;
+    this.maxBufferedAmountObserved = 0;
     this.drainWaitThresholds = [];
   }
 }
@@ -171,6 +185,8 @@ async function main(): Promise<void> {
     },
   };
   const eventsA: FlingRoomEvents = {};
+  const directWindowLogs: string[] = [];
+  eventsA.onLog = (_tag, message) => directWindowLogs.push(message);
   await roomA.connect('x', 'tok', 'code123', eventsA);
   await roomB.connect('x', 'tok', 'code123', eventsB);
 
@@ -207,6 +223,61 @@ async function main(): Promise<void> {
     drainTargets.length > 0 && drainTargets.every((threshold) => threshold === P2P_DRAIN_THRESHOLD),
     'drain wait target matches bufferedamountlow threshold in the 223–256 KiB window',
   );
+
+  // --- 1a. adaptive bounded 1/4/8 MiB windows and send-buffer cap -----------
+  done = freshBox();
+  directA.resetStats();
+  directB.resetStats();
+  const adaptiveLogStart = directWindowLogs.length;
+  const adaptiveSend = roomA.sendFile(fileLike('adaptive-8m.bin', 8 * 1024 * 1024));
+  for (let i = 0; i < 2_000 && !done.cur; i++) {
+    wire();
+    await new Promise((r) => setTimeout(r, 1));
+  }
+  await adaptiveSend;
+  const adaptiveLogs = directWindowLogs.slice(adaptiveLogStart);
+  const caps = adaptiveLogs
+    .filter((message) => message.startsWith('direct window start '))
+    .map((message) => Number(/cap=(\d+)/.exec(message)?.[1] ?? 0));
+  check(done.cur?.bytes.length === 8 * 1024 * 1024, '8 MiB direct file is fully received and saved');
+  check(caps.includes(1 * 1024 * 1024) && caps.includes(4 * 1024 * 1024) && caps.includes(8 * 1024 * 1024), `adaptive windows grow 1 -> 4 -> 8 MiB (${caps.join(',')})`);
+  check(
+    directA.maxBufferedAmountObserved <= P2P_DRAIN_THRESHOLD + 32 * 1024 + 26,
+    `sender bufferedAmount stays within threshold + one frame (${directA.maxBufferedAmountObserved} bytes)`,
+  );
+
+  // --- 1aa. slow ACK is tolerated and the final saved-file ACK still wins ---
+  done = freshBox();
+  tB.publishDelayMs = 250;
+  const delayedStartedAt = Date.now();
+  const delayedSend = roomA.sendFile(fileLike('delayed-ack.bin', 100_000));
+  for (let i = 0; i < 200 && !done.cur; i++) {
+    wire();
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  await delayedSend;
+  const delayedElapsedMs = Date.now() - delayedStartedAt;
+  tB.publishDelayMs = 0;
+  check(done.cur?.bytes.length === 100_000, 'delayed receiver ACK does not trigger a false P2P failure');
+  check(delayedElapsedMs >= 400, `sendFile waits for delayed manifest/final ACKs (${delayedElapsedMs} ms)`);
+
+  // --- 1ab. one lost progress ACK is repaired by the later saved-file ACK ---
+  done = freshBox();
+  let lossScheduled = false;
+  const droppedBefore = tB.droppedPublishes;
+  const lostAckSend = roomA.sendFile(fileLike('lost-progress-ack.bin', 100_000), () => {
+    if (!lossScheduled) {
+      tB.dropNextPublish = true;
+      lossScheduled = true;
+    }
+  });
+  for (let i = 0; i < 200 && !done.cur; i++) {
+    wire();
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  await lostAckSend;
+  check(lossScheduled && tB.droppedPublishes === droppedBefore + 1, 'simulated receiver progress ACK is lost');
+  check(done.cur?.bytes.length === 100_000, 'later final ACK confirms saved file after a lost progress ACK');
 
   // --- 1b. raw chunks beating the manifest are buffered, not dropped ------
   done = freshBox();
