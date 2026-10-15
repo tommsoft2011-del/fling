@@ -153,6 +153,8 @@ export type FlingMessage =
       nextSeq: number;
       /** Aggregate bytes present in the receiver's reassembly buffer. */
       receivedBytes: number;
+      /** Optional diagnostic correlation ID; older peers may omit it. */
+      ackId?: string;
       complete?: boolean;
       /** Receiver could not assemble, verify, or persist the file. */
       failed?: boolean;

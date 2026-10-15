@@ -172,7 +172,9 @@ async function main(): Promise<void> {
     return { cur: null };
   }
   let done = freshBox();
+  const receiverAckLogs: string[] = [];
   const eventsB: FlingRoomEvents = {
+    onLog: (_tag, message) => receiverAckLogs.push(message),
     onFileManifest: (manifest) => {
       if (manifest.name === 'hello.bin') {
         // Simulate SCTP data queued from before the first raw chunk. This is
@@ -277,6 +279,13 @@ async function main(): Promise<void> {
     .map((message) => Number(/cap=(\d+)/.exec(message)?.[1] ?? 0));
   check(done.cur?.bytes.length === 8 * 1024 * 1024, '8 MiB direct file is fully received and saved');
   check(caps.includes(1 * 1024 * 1024) && caps.includes(4 * 1024 * 1024) && caps.includes(8 * 1024 * 1024), `adaptive windows grow 1 -> 4 -> 8 MiB (${caps.join(',')})`);
+  const correlatedAckLine = adaptiveLogs.find((message) => message.startsWith('direct window ACK ') && /ackId=[a-f0-9]{16}/.test(message));
+  const correlatedAckId = correlatedAckLine?.match(/ackId=([a-f0-9]{16})/)?.[1];
+  const correlatedReceiverLogs = correlatedAckId
+    ? receiverAckLogs.filter((message) => message.includes(`ackId=${correlatedAckId}`))
+    : [];
+  check(!!correlatedAckId && correlatedReceiverLogs.some((message) => message.includes('publish start')) && correlatedReceiverLogs.some((message) => message.includes('publish end')), 'receiver publish and sender window ACK share a trace ID');
+  check(!!correlatedAckLine && correlatedAckLine.includes('callbackToHandlerMs=') && correlatedAckLine.includes('waiterUnlockMs='), 'sender logs callback handling and waiter-unlock durations');
   check(
     directA.maxBufferedAmountObserved <= P2P_DRAIN_THRESHOLD + 32 * 1024 + 26,
     `sender bufferedAmount stays within threshold + one frame (${directA.maxBufferedAmountObserved} bytes)`,
@@ -393,6 +402,30 @@ async function main(): Promise<void> {
     'fallback bytes intact',
   );
   check(!roomA.directActive, 'directActive false after failure');
+
+  // --- 2a. duplicate/out-of-order cumulative ACKs never move the prefix back ---
+  const ackProbeId = 'abcdef0123456789abcdef01';
+  const cumulativeAckLogsStart = directWindowLogs.length;
+  const sendProbeAck = async (nextSeq: number, receivedBytes: number, ackId?: string) => {
+    await roomB.sendSignal({ kind: 'file-chunk-ack', id: ackProbeId, nextSeq, receivedBytes, ...(ackId ? { ackId } : {}) });
+    await roomA.flush();
+  };
+  const ackProgress = (roomA as unknown as {
+    chunkAckProgress: Map<string, { nextSeq: number; receivedBytes: number; ackId?: string }>;
+  }).chunkAckProgress;
+  await sendProbeAck(8, 800, '0000000000000001');
+  await sendProbeAck(4, 900, '0000000000000002');
+  const afterOlderAck = ackProgress.get(ackProbeId);
+  check(afterOlderAck?.nextSeq === 8 && afterOlderAck.receivedBytes === 900 && afterOlderAck.ackId === '0000000000000001', 'older cumulative ACK may add buffered-byte evidence but cannot regress nextSeq or replace its trace ID');
+  await sendProbeAck(8, 800, '0000000000000003');
+  const afterDuplicateAck = ackProgress.get(ackProbeId);
+  check(afterDuplicateAck?.nextSeq === 8 && afterDuplicateAck.receivedBytes === 900, 'duplicate ACK does not overwrite newer cumulative progress');
+  await sendProbeAck(12, 1_200, '0000000000000004');
+  const afterNewerAck = ackProgress.get(ackProbeId);
+  check(afterNewerAck?.nextSeq === 12 && afterNewerAck.receivedBytes === 1_200, 'later cumulative ACK advances the receive prefix normally');
+  check(directWindowLogs.slice(cumulativeAckLogsStart).some((message) => message.includes('chunk ACK ignored') && message.includes('ackId=0000000000000003')), 'duplicate/regressing ACK is explicitly diagnosed');
+  await sendProbeAck(13, 1_300);
+  check(ackProgress.get(ackProbeId)?.nextSeq === 13 && directWindowLogs.slice(cumulativeAckLogsStart).some((message) => message.includes('ackId=legacy-abcdef01-13-progress')), 'ACK from an older peer without a trace ID remains accepted');
 
   // --- 3. asynchronous whole-file validation yields to network callbacks ---
   const largeFile = fileLike('large.bin', 8 * 1024 * 1024);

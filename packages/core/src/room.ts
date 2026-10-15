@@ -96,6 +96,34 @@ interface ManifestSendResult {
   relaySent: boolean;
 }
 
+interface PendingChunkAck {
+  nextSeq: number;
+  receivedBytes: number;
+  complete: boolean;
+  ackId: string;
+  queuedAtMonoMs: number;
+}
+
+interface ChunkAckProgress {
+  nextSeq: number;
+  receivedBytes: number;
+  complete: boolean;
+  failed?: boolean;
+  updatedMonoAt: number;
+  ackId: string;
+  callbackToHandlerMs: number;
+  handlerMs: number;
+}
+
+interface ChunkAckWaitResult {
+  ackId: string;
+  nextSeq: number;
+  receivedAtMonoMs: number;
+  callbackToHandlerMs: number;
+  handlerMs: number;
+  waiterUnlockMs: number;
+}
+
 interface ReceivedFileChunk {
   id: string;
   seq: number;
@@ -117,7 +145,7 @@ export class FlingRoom {
     ackChain: Promise<void>;
     ackPending: boolean;
     finalizing: boolean;
-    pendingAck?: { nextSeq: number; receivedBytes: number; complete: boolean };
+    pendingAck?: PendingChunkAck;
   }>();
   /**
    * Chunks that arrived before their manifest. Manifests and chunks can
@@ -137,7 +165,7 @@ export class FlingRoom {
   /** Resolve functions for manifests sent over a direct channel. */
   private manifestAckWaiters = new Map<string, (ok: boolean) => void>();
   /** Highest contiguous receive position reported for each direct file. */
-  private chunkAckProgress = new Map<string, { nextSeq: number; receivedBytes: number; complete: boolean; failed?: boolean; updatedAt: number }>();
+  private chunkAckProgress = new Map<string, ChunkAckProgress>();
   /** Sizes let the sender distinguish a full-byte ACK from a saved-file ACK. */
   private outgoingFileSizes = new Map<string, number>();
   private finalizingFiles = new Set<string>();
@@ -229,8 +257,9 @@ export class FlingRoom {
 
     this.transport.onData((payload, from, topic) => {
       if (topic !== FLING_TOPIC) return;
+      const receivedAtMonoMs = performance.now();
       this.handleQueue = this.handleQueue
-        .then(() => this.handlePayload(payload, from))
+        .then(() => this.handlePayload(payload, from, receivedAtMonoMs))
         .catch((e) => console.error('fling: payload handling failed:', e));
     });
     this.transport.onPeerJoined((id) => {
@@ -409,35 +438,35 @@ export class FlingRoom {
         const windowChunkLimit = directWindow.chunksFor(manifest.chunkSize);
         const windowEnd = Math.min(manifest.totalChunks, windowStart + windowChunkLimit);
         const windowBytes = Math.min(file.size, windowEnd * manifest.chunkSize) - windowStart * manifest.chunkSize;
-        const windowStartedAt = Date.now();
+        const windowStartedAt = performance.now();
         const windowNumber = ++directWindowCount;
         let lastDirectChunkSentAt = windowStartedAt;
         this.events.onLog?.('xfer', `direct window start ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber} [${windowStart},${windowEnd}) bytes=${windowBytes} cap=${windowCapBytes}`);
         let route: 'direct' | 'relay' = 'direct';
         for (let seq = windowStart; seq < windowEnd; seq++) {
           route = await sendChunk(seq);
-          if (route === 'direct') lastDirectChunkSentAt = Date.now();
+          if (route === 'direct') lastDirectChunkSentAt = performance.now();
           if (route !== 'direct') break;
         }
 
         if (route === 'direct') {
-          const publishedAt = Date.now();
+          const publishedAt = performance.now();
           this.events.onLog?.('xfer', `direct window sent ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber} bytes=${windowBytes} sendMs=${publishedAt - windowStartedAt} drainWaits=${directDrainWaitCount} drainWaitMs=${directDrainWaitTotalMs} bufferedHighWater=${directBufferedHighWater}`);
-          const ackAt = await this.waitForChunkAck(
+          const ackResult = await this.waitForChunkAck(
             manifest.id,
             windowEnd,
             DIRECT_CHUNK_ACK_TIMEOUT_MS,
           );
-          if (ackAt !== null) {
-            const elapsedMs = Math.max(0, ackAt - windowStartedAt);
-            const sendToAckMs = Math.max(0, ackAt - lastDirectChunkSentAt);
-            const ackWaitMs = Math.max(0, ackAt - publishedAt);
+          if (ackResult !== null) {
+            const elapsedMs = Math.max(0, ackResult.receivedAtMonoMs - windowStartedAt);
+            const sendToAckMs = Math.max(0, ackResult.receivedAtMonoMs - lastDirectChunkSentAt);
+            const ackWaitMs = Math.max(0, ackResult.receivedAtMonoMs - publishedAt);
             const previousCapBytes = directWindow.byteLimit;
             directAckedWindowCount++;
             directAckElapsedTotalMs += elapsedMs;
             directAckElapsedMaxMs = Math.max(directAckElapsedMaxMs, elapsedMs);
             directWindow.onAcknowledged(elapsedMs);
-            this.events.onLog?.('xfer', `direct window ACK ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber}: bytes=${windowBytes}, sendToAckMs=${sendToAckMs}, elapsedMs=${elapsedMs}, ackWaitMs=${ackWaitMs}, cap=${previousCapBytes}->${directWindow.byteLimit}, drainWaits=${directDrainWaitCount}, drainWaitMs=${directDrainWaitTotalMs}, bufferedHighWater=${directBufferedHighWater}`);
+            this.events.onLog?.('xfer', `direct window ACK ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber}: ackId=${ackResult.ackId}, next=${ackResult.nextSeq}, bytes=${windowBytes}, sendToAckMs=${sendToAckMs}, elapsedMs=${elapsedMs}, ackWaitMs=${ackWaitMs}, callbackToHandlerMs=${ackResult.callbackToHandlerMs}, handlerMs=${ackResult.handlerMs}, waiterUnlockMs=${ackResult.waiterUnlockMs}, cap=${previousCapBytes}->${directWindow.byteLimit}, drainWaits=${directDrainWaitCount}, drainWaitMs=${directDrainWaitTotalMs}, bufferedHighWater=${directBufferedHighWater}`);
             nextSeq = windowEnd;
             continue;
           }
@@ -446,7 +475,7 @@ export class FlingRoom {
           const replayFrom = Math.max(firstSeq, lastAck);
           const repairBytes = Math.max(0, file.size - Math.min(file.size, replayFrom * manifest.chunkSize));
           directReplayBytes += repairBytes;
-          this.events.onLog?.('p2p', `direct chunk ACK timeout for ${manifest.name}; relay repair from ${replayFrom} (ack ${lastAck}, target ${windowEnd}, windowBytes=${windowBytes}, elapsedMs=${Date.now() - windowStartedAt}, repairBytes=${repairBytes}, directReplayBytes=${directReplayBytes})`);
+          this.events.onLog?.('p2p', `direct chunk ACK timeout for ${manifest.name}; relay repair from ${replayFrom} (ack ${lastAck}, target ${windowEnd}, windowBytes=${windowBytes}, elapsedMs=${Math.max(0, performance.now() - windowStartedAt)}, repairBytes=${repairBytes}, directReplayBytes=${directReplayBytes})`);
           this.fallbackToRelay(`direct chunk ack timeout (${manifest.id.slice(0, 8)})`);
           directMode = false;
           await sendRelayManifest();
@@ -482,10 +511,10 @@ export class FlingRoom {
       const windowStart = nextSeq;
       const windowEnd = Math.min(manifest.totalChunks, windowStart + RELAY_CHUNK_WINDOW);
       const windowNumber = ++relayWindowNumber;
-      const windowStartedAt = Date.now();
+      const windowStartedAt = performance.now();
       this.events.onLog?.('xfer', `relay window start ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber} [${windowStart},${windowEnd})`);
       for (let seq = windowStart; seq < windowEnd; seq++) await sendChunk(seq);
-      this.events.onLog?.('xfer', `relay window published ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber} [${windowStart},${windowEnd}) in ${Date.now() - windowStartedAt}ms, chunkAck=${relayChunkAckCapable}`);
+      this.events.onLog?.('xfer', `relay window published ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber} [${windowStart},${windowEnd}) in ${Math.max(0, performance.now() - windowStartedAt)}ms, chunkAck=${relayChunkAckCapable}`);
 
       // Peers before the receive-ACK capability continue on the old relay
       // path. New peers use the same bounded window on LiveKit as on P2P;
@@ -499,14 +528,14 @@ export class FlingRoom {
       // LiveKit client.  More importantly, waitForChunkAck treats any ACK
       // progress as activity and only times out after a period of silence.
       // A slow but healthy relay must not be mistaken for a dead one.
-      const ackAt = await this.waitForChunkAck(
+      const ackResult = await this.waitForChunkAck(
         manifest.id,
         windowEnd,
         RELAY_CHUNK_ACK_TIMEOUT_MS,
       );
-      if (ackAt !== null) {
+      if (ackResult !== null) {
         const ack = this.chunkAckProgress.get(manifest.id);
-        this.events.onLog?.('xfer', `relay window ACK confirmed ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber}: next=${ack?.nextSeq ?? 0}, bytes=${ack?.receivedBytes ?? 0}, complete=${Boolean(ack?.complete)}, sendToAckMs=${Math.max(0, ackAt - windowStartedAt)}, wait=${Date.now() - windowStartedAt}ms`);
+        this.events.onLog?.('xfer', `relay window ACK confirmed ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber}: ackId=${ackResult.ackId}, next=${ackResult.nextSeq}, bytes=${ack?.receivedBytes ?? 0}, complete=${Boolean(ack?.complete)}, sendToAckMs=${Math.max(0, ackResult.receivedAtMonoMs - windowStartedAt)}, callbackToHandlerMs=${ackResult.callbackToHandlerMs}, handlerMs=${ackResult.handlerMs}, waiterUnlockMs=${ackResult.waiterUnlockMs}`);
         relayWindowRetries = 0;
         nextSeq = Math.max(windowEnd, ack?.nextSeq ?? 0);
         continue;
@@ -514,7 +543,7 @@ export class FlingRoom {
       const lastAck = this.chunkAckProgress.get(manifest.id)?.nextSeq ?? windowStart;
       const replayFrom = Math.max(firstSeq, lastAck - RELAY_REPLAY_OVERLAP_CHUNKS);
       relayWindowRetries++;
-      this.events.onLog?.('xfer', `relay chunk ACK timeout for ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber} after ${Date.now() - windowStartedAt}ms; retry ${relayWindowRetries}/${MAX_RELAY_WINDOW_RETRIES} from ${replayFrom} (ack ${lastAck}, target ${windowEnd})`);
+      this.events.onLog?.('xfer', `relay chunk ACK timeout for ${manifest.name} (${manifest.id.slice(0, 8)}) #${windowNumber} after ${Math.max(0, performance.now() - windowStartedAt)}ms; retry ${relayWindowRetries}/${MAX_RELAY_WINDOW_RETRIES} from ${replayFrom} (ack ${lastAck}, target ${windowEnd})`);
       if (relayWindowRetries > MAX_RELAY_WINDOW_RETRIES) {
         this.chunkAckProgress.delete(manifest.id);
         this.chunkAckCapabilities.delete(manifest.id);
@@ -668,22 +697,33 @@ export class FlingRoom {
    * advancing its contiguous prefix or byte count, retrying would only add
    * duplicate payloads to that same queue.
    */
-  private async waitForChunkAck(id: string, targetSeq: number, timeoutMs: number): Promise<number | null> {
+  private async waitForChunkAck(id: string, targetSeq: number, timeoutMs: number): Promise<ChunkAckWaitResult | null> {
     let lastSeq = this.chunkAckProgress.get(id)?.nextSeq ?? 0;
     let lastBytes = this.chunkAckProgress.get(id)?.receivedBytes ?? 0;
-    let lastProgressAt = Date.now();
+    let lastProgressAt = performance.now();
     while (true) {
       const progress = this.chunkAckProgress.get(id);
-      if ((progress?.nextSeq ?? 0) >= targetSeq || progress?.complete) return progress?.updatedAt ?? Date.now();
+      if ((progress?.nextSeq ?? 0) >= targetSeq || progress?.complete) {
+        const waiterResumedAtMonoMs = performance.now();
+        const receivedAtMonoMs = progress?.updatedMonoAt ?? waiterResumedAtMonoMs;
+        return {
+          ackId: progress?.ackId ?? `legacy-${id}-${progress?.nextSeq ?? 0}`,
+          nextSeq: progress?.nextSeq ?? 0,
+          receivedAtMonoMs,
+          callbackToHandlerMs: progress?.callbackToHandlerMs ?? 0,
+          handlerMs: progress?.handlerMs ?? 0,
+          waiterUnlockMs: Math.max(0, waiterResumedAtMonoMs - receivedAtMonoMs),
+        };
+      }
       if (
         (progress?.nextSeq ?? 0) > lastSeq ||
         (progress?.receivedBytes ?? 0) > lastBytes
       ) {
         lastSeq = progress?.nextSeq ?? lastSeq;
         lastBytes = progress?.receivedBytes ?? lastBytes;
-        lastProgressAt = Date.now();
+        lastProgressAt = performance.now();
       }
-      if (Date.now() - lastProgressAt >= timeoutMs) return null;
+      if (performance.now() - lastProgressAt >= timeoutMs) return null;
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
   }
@@ -725,26 +765,40 @@ export class FlingRoom {
   private resolveChunkAck(
     msg: Extract<FlingMessage, { kind: 'file-chunk-ack' }>,
     source: 'relay' | 'direct' = 'relay',
+    receivedAtMonoMs = performance.now(),
   ): void {
+    const handlerStartedAtMonoMs = performance.now();
     const nextSeq = Math.max(0, Math.floor(Number(msg.nextSeq) || 0));
     const receivedBytes = Math.max(0, Math.floor(Number(msg.receivedBytes) || 0));
     const previous = this.chunkAckProgress.get(msg.id);
-    const updatedAt = Date.now();
-    if (
+    const ackId = typeof msg.ackId === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(msg.ackId)
+      ? msg.ackId
+      : `legacy-${msg.id.slice(0, 8)}-${nextSeq}-${Boolean(msg.complete) ? 'final' : 'progress'}`;
+    const advanced = (
       !previous ||
       nextSeq > previous.nextSeq ||
       receivedBytes > previous.receivedBytes ||
       (msg.complete && !previous.complete) ||
       (msg.failed && !previous.failed)
-    ) {
+    );
+    const advancesConfirmedPosition = !previous || nextSeq > previous.nextSeq ||
+      (msg.complete && !previous.complete) || (msg.failed && !previous.failed);
+    const callbackToHandlerMs = Math.max(0, handlerStartedAtMonoMs - receivedAtMonoMs);
+    const handlerMs = Math.max(0, performance.now() - handlerStartedAtMonoMs);
+    if (advanced) {
       this.chunkAckProgress.set(msg.id, {
         nextSeq: Math.max(previous?.nextSeq ?? 0, nextSeq),
         receivedBytes: Math.max(previous?.receivedBytes ?? 0, receivedBytes),
         complete: Boolean(msg.complete) || Boolean(previous?.complete),
         failed: Boolean(msg.failed) || Boolean(previous?.failed),
-        updatedAt,
+        updatedMonoAt: advancesConfirmedPosition ? handlerStartedAtMonoMs : previous?.updatedMonoAt ?? handlerStartedAtMonoMs,
+        ackId: advancesConfirmedPosition ? ackId : previous?.ackId ?? ackId,
+        callbackToHandlerMs: advancesConfirmedPosition ? callbackToHandlerMs : previous?.callbackToHandlerMs ?? callbackToHandlerMs,
+        handlerMs: advancesConfirmedPosition ? handlerMs : previous?.handlerMs ?? handlerMs,
       });
-      this.events.onLog?.('xfer', `chunk ACK received (${msg.id.slice(0, 8)}): source=${source}, next=${nextSeq}, bytes=${receivedBytes}, complete=${Boolean(msg.complete)}`);
+      this.events.onLog?.('xfer', `chunk ACK received (${msg.id.slice(0, 8)}): ackId=${ackId}, source=${source}, next=${nextSeq}, bytes=${receivedBytes}, complete=${Boolean(msg.complete)}, callbackToHandlerMs=${callbackToHandlerMs}, handlerMs=${handlerMs}`);
+    } else {
+      this.events.onLog?.('xfer', `chunk ACK ignored (${msg.id.slice(0, 8)}): ackId=${ackId}, source=${source}, reason=duplicate-or-regressing, next=${nextSeq}, bytes=${receivedBytes}, currentNext=${previous?.nextSeq ?? 0}, currentBytes=${previous?.receivedBytes ?? 0}`);
     }
     const size = this.outgoingFileSizes.get(msg.id);
     if (msg.complete || msg.failed) {
@@ -839,7 +893,7 @@ export class FlingRoom {
     return 'relay';
   }
 
-  private async handlePayload(payload: Uint8Array, from: string): Promise<void> {
+  private async handlePayload(payload: Uint8Array, from: string, receivedAtMonoMs = performance.now()): Promise<void> {
     const t0 = performance.now();
     let plain: string;
     try {
@@ -859,7 +913,7 @@ export class FlingRoom {
     }
     if (!isFlingMessage(msg)) return;
     if (msg.kind === 'file-chunk') this.events.onFileRoute?.('relay', msg.id);
-    this.dispatchMessage(msg, from, 'relay');
+    this.dispatchMessage(msg, from, 'relay', receivedAtMonoMs);
   }
 
   /**
@@ -910,7 +964,12 @@ export class FlingRoom {
   /** Per-file direct-chunk counters (diagnostics). Cleared in finishFile. */
   private directChunkCounts = new Map<string, number>();
 
-  private dispatchMessage(msg: FlingMessage, from: string, source: 'relay' | 'direct' = 'relay'): void {
+  private dispatchMessage(
+    msg: FlingMessage,
+    from: string,
+    source: 'relay' | 'direct' = 'relay',
+    receivedAtMonoMs = performance.now(),
+  ): void {
     switch (msg.kind) {
       case 'text':
         this.events.onText?.(msg.text, from);
@@ -946,11 +1005,14 @@ export class FlingRoom {
           // ACK. Re-advertise completion on the duplicate manifest so the
           // sender can stop the replay instead of resending the whole file.
           if (completed) {
+            const ackId = randomId(8);
+            this.events.onLog?.('xfer', `final ACK repair publish queued (${manifest.id.slice(0, 8)}): ackId=${ackId}, next=${manifest.totalChunks}, bytes=${manifest.size}`);
             void this.send({
               kind: 'file-chunk-ack',
               id: manifest.id,
               nextSeq: manifest.totalChunks,
               receivedBytes: manifest.size,
+              ackId,
               complete: true,
             }).catch(() => {});
           }
@@ -996,7 +1058,7 @@ export class FlingRoom {
         this.resolveManifestAck(msg.id, true, source);
         break;
       case 'file-chunk-ack':
-        this.resolveChunkAck(msg, source);
+        this.resolveChunkAck(msg, source, receivedAtMonoMs);
         break;
       case 'offer':
         this.events.onOffer?.(msg, from);
@@ -1075,39 +1137,47 @@ export class FlingRoom {
     // Do not wait for a queued progress publish: LiveKit can stall that
     // promise. The final ACK carries the monotonic total and resolveChunkAck
     // ignores any late/stale progress ACK, so it can safely be sent now.
-    const finalAckStartedAt = Date.now();
-    this.events.onLog?.('xfer', `final ACK publish start (${xfer}): size=${manifest.size}`);
+    const ackId = randomId(8);
+    const finalAckStartedAtMonoMs = performance.now();
+    this.events.onLog?.('xfer', `final ACK publish start (${xfer}): ackId=${ackId}, size=${manifest.size}`);
     try {
       await this.send({
         kind: 'file-chunk-ack',
         id,
         nextSeq: entry.receiver.nextSeq,
         receivedBytes: entry.receiver.receivedByteCount,
+        ackId,
         complete: true,
       });
-      this.events.onLog?.('xfer', `final ACK publish end (${xfer}): size=${manifest.size}, status=ok, elapsedMs=${Date.now() - finalAckStartedAt}`);
-      this.events.onLog?.('xfer', `final chunk ACK sent (${id.slice(0, 8)}): bytes=${entry.receiver.receivedByteCount}`);
+      const elapsedMs = Math.max(0, performance.now() - finalAckStartedAtMonoMs);
+      this.events.onLog?.('xfer', `final ACK publish end (${xfer}): ackId=${ackId}, size=${manifest.size}, status=ok, elapsedMs=${elapsedMs}`);
+      this.events.onLog?.('xfer', `final chunk ACK sent (${id.slice(0, 8)}): ackId=${ackId}, bytes=${entry.receiver.receivedByteCount}`);
     } catch (e) {
-      this.events.onLog?.('xfer', `final ACK publish end (${xfer}): size=${manifest.size}, status=error, elapsedMs=${Date.now() - finalAckStartedAt}`);
+      const elapsedMs = Math.max(0, performance.now() - finalAckStartedAtMonoMs);
+      this.events.onLog?.('xfer', `final ACK publish end (${xfer}): ackId=${ackId}, size=${manifest.size}, status=error, elapsedMs=${elapsedMs}`);
       this.events.onLog?.('xfer', `final chunk ACK failed after save (${id.slice(0, 8)}): ${(e as Error).message}`);
     }
   }
 
   private async publishFinalizeFailureAck(id: string, receiver: FileReceiver): Promise<void> {
     const manifest = receiver.manifest;
-    const startedAt = Date.now();
+    const ackId = randomId(8);
+    const startedAtMonoMs = performance.now();
     try {
       await this.send({
         kind: 'file-chunk-ack',
         id,
         nextSeq: receiver.nextSeq,
         receivedBytes: receiver.receivedByteCount,
+        ackId,
         complete: false,
         failed: true,
       });
-      this.events.onLog?.('xfer', `finalize failure ACK publish (${id.slice(0, 8)}): size=${manifest.size}, status=ok, elapsedMs=${Date.now() - startedAt}`);
+      const elapsedMs = Math.max(0, performance.now() - startedAtMonoMs);
+      this.events.onLog?.('xfer', `finalize failure ACK publish (${id.slice(0, 8)}): ackId=${ackId}, size=${manifest.size}, status=ok, elapsedMs=${elapsedMs}`);
     } catch {
-      this.events.onLog?.('xfer', `finalize failure ACK publish (${id.slice(0, 8)}): size=${manifest.size}, status=error, elapsedMs=${Date.now() - startedAt}`);
+      const elapsedMs = Math.max(0, performance.now() - startedAtMonoMs);
+      this.events.onLog?.('xfer', `finalize failure ACK publish (${id.slice(0, 8)}): ackId=${ackId}, size=${manifest.size}, status=error, elapsedMs=${elapsedMs}`);
     }
   }
 
@@ -1166,7 +1236,7 @@ export class FlingRoom {
       lastAckAt: number;
       ackChain: Promise<void>;
       ackPending: boolean;
-      pendingAck?: { nextSeq: number; receivedBytes: number; complete: boolean };
+      pendingAck?: PendingChunkAck;
     },
     complete: boolean,
     source: 'relay' | 'direct',
@@ -1189,12 +1259,14 @@ export class FlingRoom {
     // If the receiver has advanced by a non-window amount, resend the last
     // known contiguous position as a heartbeat.  A sender that did not see
     // the original ACK can then replay only from that exact position.
-    const ack = {
+    const ack: PendingChunkAck = {
       nextSeq: progressAck ? nextSeq : entry.lastAckSeq,
       receivedBytes: entry.receiver.receivedByteCount,
       // This ACK is strictly byte-received progress. A separate complete=true
       // ACK is sent only after async SHA-256 validation and the save callback.
       complete: false,
+      ackId: randomId(8),
+      queuedAtMonoMs: performance.now(),
     };
     entry.lastAckSeq = Math.max(entry.lastAckSeq, ack.nextSeq);
     entry.lastAckAt = now;
@@ -1206,7 +1278,7 @@ export class FlingRoom {
     } else {
       this.enqueueChunkAck(id, entry, ack);
     }
-    this.events.onLog?.('xfer', `chunk ACK queued (${id.slice(0, 8)}): source=${source}, next=${ack.nextSeq}, bytes=${ack.receivedBytes}, complete=${complete}`);
+    this.events.onLog?.('xfer', `chunk ACK queued (${id.slice(0, 8)}): ackId=${ack.ackId}, source=${source}, next=${ack.nextSeq}, bytes=${ack.receivedBytes}, complete=${complete}`);
   }
 
   /** Serialize receive ACKs so a slow relay cannot accumulate promises. */
@@ -1215,22 +1287,34 @@ export class FlingRoom {
     entry: {
       ackChain: Promise<void>;
       ackPending: boolean;
-      pendingAck?: { nextSeq: number; receivedBytes: number; complete: boolean };
+      pendingAck?: PendingChunkAck;
     },
-    ack: { nextSeq: number; receivedBytes: number; complete: boolean },
+    ack: PendingChunkAck,
   ): void {
     entry.ackPending = true;
     entry.ackChain = entry.ackChain
       .catch(() => {})
       .then(async () => {
-        await this.send({
-          kind: 'file-chunk-ack',
-          id,
-          nextSeq: ack.nextSeq,
-          receivedBytes: ack.receivedBytes,
-          complete: ack.complete,
-        });
-        this.events.onLog?.('xfer', `chunk ACK sent (${id.slice(0, 8)}): next=${ack.nextSeq}, bytes=${ack.receivedBytes}, complete=${ack.complete}`);
+        const publishStartedAtMonoMs = performance.now();
+        const queueWaitMs = Math.max(0, publishStartedAtMonoMs - ack.queuedAtMonoMs);
+        this.events.onLog?.('xfer', `chunk ACK publish start (${id.slice(0, 8)}): ackId=${ack.ackId}, next=${ack.nextSeq}, queueWaitMs=${queueWaitMs}`);
+        try {
+          const route = await this.send({
+            kind: 'file-chunk-ack',
+            id,
+            nextSeq: ack.nextSeq,
+            receivedBytes: ack.receivedBytes,
+            ackId: ack.ackId,
+            complete: ack.complete,
+          });
+          const publishMs = Math.max(0, performance.now() - publishStartedAtMonoMs);
+          this.events.onLog?.('xfer', `chunk ACK publish end (${id.slice(0, 8)}): ackId=${ack.ackId}, route=${route}, status=ok, publishMs=${publishMs}, queueToPublishMs=${queueWaitMs + publishMs}`);
+          this.events.onLog?.('xfer', `chunk ACK sent (${id.slice(0, 8)}): ackId=${ack.ackId}, next=${ack.nextSeq}, bytes=${ack.receivedBytes}, complete=${ack.complete}`);
+        } catch (e) {
+          const publishMs = Math.max(0, performance.now() - publishStartedAtMonoMs);
+          this.events.onLog?.('xfer', `chunk ACK publish end (${id.slice(0, 8)}): ackId=${ack.ackId}, status=error, publishMs=${publishMs}, error=${e instanceof Error ? e.message : String(e)}`);
+          throw e;
+        }
       })
       .catch(() => {})
       .finally(() => {
