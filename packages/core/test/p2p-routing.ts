@@ -10,7 +10,7 @@
 //   - per-chunk mixed routing (some chunks direct, some relay) reassembles
 
 import { FlingRoom, type FlingRoomEvents } from '../src/room.js';
-import type { DirectChannel } from '../src/p2p.js';
+import { P2P_DRAIN_THRESHOLD, type DirectChannel } from '../src/p2p.js';
 import { buildManifest, FileReceiver, type FileLike } from '../src/files.js';
 import { decodeDirectFileChunkFrame, encodeDirectFileChunkFrame } from '../src/protocol.js';
 import type { DataHandler, FlingTransport } from '../src/transport.js';
@@ -69,6 +69,7 @@ class FakeDirect implements DirectChannel {
   readonly readyState: string = 'open';
   readonly maxMessageSize = 64 * 1024;
   bufferedAmount = 0;
+  drainWaitThresholds: number[] = [];
   onmessage: ((data: Uint8Array<ArrayBuffer>) => void) | null = null;
   onclose: (() => void) | null = null;
   sent: Uint8Array[] = [];
@@ -83,6 +84,7 @@ class FakeDirect implements DirectChannel {
   send(data: Uint8Array<ArrayBuffer>): void {
     if (this.dead) throw new Error('channel closed');
     const count = ++this.sendCount;
+    this.bufferedAmount += data.byteLength;
     if (!this.blackhole && (this.dropAfter === undefined || count <= this.dropAfter)) {
       this.sent.push(data);
     }
@@ -92,12 +94,22 @@ class FakeDirect implements DirectChannel {
     this.dead = true;
     this.onclose?.();
   }
-  waitForDrain(): Promise<void> {
-    return this.dead ? Promise.reject(new Error('channel closed')) : Promise.resolve();
+  waitForDrain(threshold: number): Promise<void> {
+    this.drainWaitThresholds.push(threshold);
+    if (this.dead) return Promise.reject(new Error('channel closed'));
+    // Browsers only signal bufferedamountlow at the fixed threshold. A
+    // request for a smaller threshold after crossing it would never resolve.
+    if (threshold < P2P_DRAIN_THRESHOLD && this.bufferedAmount <= P2P_DRAIN_THRESHOLD && this.bufferedAmount > threshold) {
+      return Promise.reject(new Error('simulated missed bufferedamountlow event'));
+    }
+    this.bufferedAmount = Math.min(this.bufferedAmount, threshold);
+    return Promise.resolve();
   }
   resetStats(): void {
     this.sent = [];
     this.sendCount = 0;
+    this.bufferedAmount = 0;
+    this.drainWaitThresholds = [];
   }
 }
 
@@ -125,10 +137,14 @@ async function main(): Promise<void> {
   const directB = new FakeDirect('B->A');
   // wire the pair: A's sends arrive at B's room and vice versa
   const wire = () => {
-    directA.sent.forEach((d) => directB.onmessage?.(d as Uint8Array<ArrayBuffer>));
-    directB.sent.forEach((d) => directA.onmessage?.(d as Uint8Array<ArrayBuffer>));
+    const fromA = directA.sent;
     directA.sent = [];
+    directA.bufferedAmount = 0;
+    fromA.forEach((d) => directB.onmessage?.(d as Uint8Array<ArrayBuffer>));
+    const fromB = directB.sent;
     directB.sent = [];
+    directB.bufferedAmount = 0;
+    fromB.forEach((d) => directA.onmessage?.(d as Uint8Array<ArrayBuffer>));
   };
 
   let relayPublishesA = 0;
@@ -143,7 +159,13 @@ async function main(): Promise<void> {
   }
   let done = freshBox();
   const eventsB: FlingRoomEvents = {
-    onFileManifest: () => {},
+    onFileManifest: (manifest) => {
+      if (manifest.name === 'hello.bin') {
+        // Simulate SCTP data queued from before the first raw chunk. This is
+        // between bufferedamountlow (256 KiB) and the old per-frame target.
+        directA.bufferedAmount = P2P_DRAIN_THRESHOLD - 16 * 1024;
+      }
+    },
     onFileComplete: (id, _m, bytes) => {
       done.cur = { id, bytes };
     },
@@ -158,6 +180,7 @@ async function main(): Promise<void> {
   check(roomA.directActive && roomB.directActive, 'directActive true while open');
 
   const relayBefore = relayPublishesA;
+  const drainChecksBefore = directA.drainWaitThresholds.length;
   const file = fileLike('hello.bin', 100_000); // 100KB -> 4 chunks of 32KB
   const p1 = roomA.sendFile(file, undefined, 'file');
   // pump: deliver direct messages as they are produced
@@ -179,6 +202,11 @@ async function main(): Promise<void> {
   // manifest + chunks all bypass the relay while direct is open
   const relayDuringDirect = relayPublishesA - relayBefore;
   check(relayDuringDirect === 0, `manifest+chunks bypassed relay (relay publishes: ${relayDuringDirect}, want 0)`);
+  const drainTargets = directA.drainWaitThresholds.slice(drainChecksBefore);
+  check(
+    drainTargets.length > 0 && drainTargets.every((threshold) => threshold === P2P_DRAIN_THRESHOLD),
+    'drain wait target matches bufferedamountlow threshold in the 223–256 KiB window',
+  );
 
   // --- 1b. raw chunks beating the manifest are buffered, not dropped ------
   done = freshBox();

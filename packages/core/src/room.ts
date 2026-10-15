@@ -281,9 +281,11 @@ export class FlingRoom {
           if (Number.isFinite(dc.maxMessageSize) && frame.byteLength > dc.maxMessageSize) {
             throw new Error(`binary frame exceeds SCTP maxMessageSize (${frame.byteLength} > ${dc.maxMessageSize})`);
           }
-          const drainLimit = Math.max(0, P2P_DRAIN_THRESHOLD - frame.byteLength);
-          if (dc.bufferedAmount > drainLimit) {
-            await dc.waitForDrain(drainLimit);
+          // Keep the wait target equal to bufferedAmountLowThreshold. Waiting
+          // for a smaller per-frame target can miss the already-fired low
+          // event when bufferedAmount is between that target and 256 KiB.
+          if (dc.bufferedAmount + frame.byteLength > P2P_DRAIN_THRESHOLD) {
+            await dc.waitForDrain(P2P_DRAIN_THRESHOLD);
           }
           if (dc.readyState !== 'open') throw new Error('direct channel closed while draining');
           dc.send(frame);
