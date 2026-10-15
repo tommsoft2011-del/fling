@@ -422,10 +422,11 @@ button { font: inherit; cursor: pointer; }
 .tdetail-row .tdot.done { color: var(--accent); }
 .tdetail-row .tdot.error { color: var(--danger); }
 .tdetail-row .tdot.active { color: var(--accent); }
-.tdetail-row .tname { flex-shrink: 0; max-width: 32%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
-.tdetail-row .tprog { flex-shrink: 0; font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 600; min-width: 44px; }
-.tdetail-row .pbar { flex: 1; min-width: 60px; }
-.tdetail-row .tsize { flex-shrink: 0; font-variant-numeric: tabular-nums; }
+/* 固定列宽：文件名截断、进度条等长、大小右对齐 */
+.tdetail-row .tname { width: 180px; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.tdetail-row .tprog { width: 44px; flex-shrink: 0; font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 600; }
+.tdetail-row .pbar { flex: 1; min-width: 80px; }
+.tdetail-row .tsize { width: 70px; flex-shrink: 0; text-align: right; font-variant-numeric: tabular-nums; }
 /* ---------- 接收页：底部任务抽屉（与发送页同构，ListView 风格） ---------- */
 .recv-actions { margin: 14px 0 4px; }
 #recvDrawer {

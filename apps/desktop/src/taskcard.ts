@@ -70,25 +70,32 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
         activeIdx >= 0 ? `正在传送 ${activeIdx + 1}/${task.items.length}` : `已完成 ${doneCount}/${task.items.length}`);
       detail.appendChild(hint);
     }
+    // 发送端：按接收端上报的总进度，依文件顺序推算每个文件"对方已确认"字节。
+    // 文件是按顺序发送的，所以 peerDoneBytes 先填满文件1，再填文件2……
+    // 这样"✓ 100%"只在对方真正收到时显示，不会出现"发送端全完成但接收端还差2个"。
+    let remainingConfirmed = dir === 'send' ? ((task as SendTask).peerDoneBytes ?? 0) : -1;
     for (const it of task.items) {
       const r = el('div', 'tdetail-row');
-      const st = it.status === 'done' ? '✓' : it.status === 'error' ? '✗' : it.status === 'active' ? '…' : '○';
-      // 发送端按接收/发送比率校准单文件进度，与总进度保持一致
       let fileDoneB = it.doneBytes;
-      if (dir === 'send' && it.kind !== 'text') {
-        const pd = (task as SendTask).peerDoneBytes ?? 0;
-        if (pd > 0 && task.doneBytes > 0) {
-          fileDoneB = Math.min(it.totalBytes, it.doneBytes * Math.min(1, pd / task.doneBytes));
-        }
+      let confirmedDone = it.status === 'done';
+      if (remainingConfirmed >= 0 && it.kind !== 'text') {
+        const itConfirmed = Math.max(0, Math.min(it.totalBytes, remainingConfirmed));
+        remainingConfirmed -= itConfirmed;
+        fileDoneB = itConfirmed;
+        // 只有对方确认收完才算 done（而非"我发出去了"）
+        confirmedDone = itConfirmed >= it.totalBytes && it.totalBytes > 0;
+      } else if (dir !== 'send') {
+        confirmedDone = it.status === 'done';
       }
+      const st = confirmedDone ? '✓' : it.status === 'error' ? '✗' : it.status === 'active' ? '…' : '○';
       const p = it.totalBytes > 0 ? Math.min(100, Math.round((fileDoneB / it.totalBytes) * 100)) : 0;
-      const ptxt = it.status === 'done' ? '100%' : it.status === 'error' ? (it.error ?? '失败') : p + '%';
+      const ptxt = confirmedDone ? '100%' : it.status === 'error' ? (it.error ?? '失败') : p + '%';
       const bar = el('div', 'pbar thin');
       const fill = el('div', 'pfill');
-      fill.style.width = (it.status === 'done' ? 100 : p) + '%';
+      fill.style.width = (confirmedDone ? 100 : p) + '%';
       bar.appendChild(fill);
       r.append(
-        el('span', 'tdot ' + it.status, st),
+        el('span', 'tdot ' + (confirmedDone ? 'done' : it.status), st),
         el('span', 'tname', it.name),
         el('span', 'tprog', ptxt),
         bar,

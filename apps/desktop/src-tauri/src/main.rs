@@ -59,13 +59,13 @@ struct FlingConfig {
     device_name: String,
     #[serde(default = "default_download_dir")]
     download_dir: String,
-    #[serde(default, alias = "turnUrl")]
+    #[serde(default, alias = "turnUrl", skip_serializing_if = "Option::is_none")]
     turn_url: Option<String>,
-    #[serde(default, alias = "turnUsername")]
+    #[serde(default, alias = "turnUsername", skip_serializing_if = "Option::is_none")]
     turn_username: Option<String>,
-    #[serde(default, alias = "turnPassword")]
+    #[serde(default, alias = "turnPassword", skip_serializing_if = "Option::is_none")]
     turn_password: Option<String>,
-    #[serde(default, alias = "remoteConfigUrl")]
+    #[serde(default, alias = "remoteConfigUrl", skip_serializing_if = "Option::is_none")]
     remote_config_url: Option<String>,
 }
 
