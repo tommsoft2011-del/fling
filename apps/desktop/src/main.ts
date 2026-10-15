@@ -29,7 +29,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { $, toast } from './ui.js';
 import { initNet, getDeviceName } from './net.js';
 import { manager } from './tasks.js';
-import { applyTheme } from './store.js';
+import { applyTheme, hydrateHistory } from './store.js';
 import { initSendPage } from './send.js';
 import { initRecvPage, blurRecvPage } from './receive.js';
 import { initHistPage, refreshHistPage } from './history.js';
@@ -121,8 +121,14 @@ async function startMain(): Promise<void> {
     return;
   }
 
-  showMain();
   $('#myDeviceLine').textContent = getDeviceName();
+  try {
+    await hydrateHistory();
+  } catch (e) {
+    log('app', 'disk history unavailable; showing local cache', { error: String(e) });
+    toast('完整传输历史暂时无法读取，将显示本地缓存', true);
+  }
+  showMain();
 
   document.addEventListener('fling:devicename', (e) => {
     $('#myDeviceLine').textContent = (e as CustomEvent).detail;

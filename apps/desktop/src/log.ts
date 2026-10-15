@@ -3,7 +3,7 @@
 // 注意：只记元数据（文件名/大小/状态/错误信息），不记文本内容与剪贴板内容。
 import { invoke } from '@tauri-apps/api/core';
 
-export type LogTag = 'app' | 'task' | 'p2p' | 'xfer' | 'err';
+export type LogTag = 'app' | 'task' | 'p2p' | 'xfer' | 'net' | 'ui' | 'err';
 
 const queue: string[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | null = null;

@@ -1,21 +1,26 @@
-// 历史记录 + 本地设置持久化（localStorage）
+// Transfer history is backed by the Tauri JSONL archive; localStorage is only a small fast cache.
 import { invoke } from '@tauri-apps/api/core';
 import type { ItemKind } from './tasks.js';
 
 export interface HistoryItem {
   name: string;
+  path?: string;
   size: number;
   kind: ItemKind;
   status: 'ok' | 'fail';
   error?: string;
-  /** 文本内容（文本条目常驻，用于"复制/重发"） */
+  /** Text content (available for copy/re-send). */
   text?: string;
-  /** 剪贴板图片 base64（<1MB 才存，用于"复制到剪贴板"） */
+  /** Small clipboard image preview (base64). */
   imageB64?: string;
-  /** 接收端落盘后的完整路径（硬盘历史记录用，分辨每次的文件名） */
+  /** Actual receive destination, preserved in the on-disk archive. */
   savedPath?: string;
-  /** 文件 sha256（发送端计算、接收端校验一致，用于完整性核对） */
+  /** Whole-file SHA-256. */
   sha256?: string;
+  /** Browser-provided MIME type when available. */
+  mimeType?: string;
+  /** Observed payload route for this item. */
+  transport?: 'p2p' | 'relay' | 'mixed';
 }
 
 export interface HistoryEntry {
@@ -23,40 +28,137 @@ export interface HistoryEntry {
   dir: 'send' | 'recv';
   peer: string;
   time: number;
+  endedAt?: number;
   items: HistoryItem[];
   totalBytes: number;
+  transport?: 'p2p' | 'relay' | 'mixed';
 }
 
-const HIST_KEY = 'fling-history-v3';
-const MAX_ENTRIES = 300;
-/** 剪贴板图片超过此大小就不进历史（localStorage 配额） */
+const HIST_KEY = 'fling-history-v4';
+const LEGACY_HIST_KEYS = ['fling-history-v3'];
+const LOCAL_CACHE_LIMIT = 300;
+/** Clipboard images above this size are not stored in the history/cache. */
 export const HIST_IMAGE_LIMIT = 1024 * 1024;
 
+let diskHistory: HistoryEntry[] | null = null;
+let writeChain: Promise<void> = Promise.resolve();
+
+function readLocalHistory(): HistoryEntry[] {
+  const all: HistoryEntry[] = [];
+  for (const key of [HIST_KEY, ...LEGACY_HIST_KEYS]) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+      const arr = JSON.parse(raw) as unknown;
+      if (Array.isArray(arr)) all.push(...arr.filter(isHistoryEntry));
+    } catch {
+      // Ignore invalid/corrupt browser cache; the JSONL archive is authoritative.
+    }
+  }
+  return mergeHistory(all);
+}
+
+function isHistoryEntry(value: unknown): value is HistoryEntry {
+  if (!value || typeof value !== 'object') return false;
+  const e = value as Partial<HistoryEntry>;
+  return typeof e.taskId === 'string' && (e.dir === 'send' || e.dir === 'recv') &&
+    typeof e.peer === 'string' && Number.isFinite(e.time) && Array.isArray(e.items) &&
+    Number.isFinite(e.totalBytes);
+}
+
+function keyOf(entry: HistoryEntry): string {
+  return `${entry.dir}\u0000${entry.taskId}`;
+}
+
+function mergeHistory(...groups: HistoryEntry[][]): HistoryEntry[] {
+  const merged = new Map<string, HistoryEntry>();
+  for (const group of groups) {
+    for (const entry of group) {
+      const key = keyOf(entry);
+      const previous = merged.get(key);
+      if (!previous) {
+        merged.set(key, entry);
+        continue;
+      }
+      // Cache and JSONL copies retain the same item order. Merge by position
+      // rather than by name/size so duplicate same-name files remain distinct.
+      const items = entry.items.map((item, index) => {
+        const old = previous.items[index];
+        const same = old && old.kind === item.kind && old.name === item.name &&
+          old.size === item.size && old.path === item.path;
+        return same ? { ...old, ...item } : item;
+      });
+      if (previous.items.length > items.length) items.push(...previous.items.slice(items.length));
+      merged.set(key, {
+        ...previous,
+        ...entry,
+        items,
+      });
+    }
+  }
+  return [...merged.values()].sort((a, b) => (b.endedAt ?? b.time) - (a.endedAt ?? a.time));
+}
+
+function cacheHistory(entries: HistoryEntry[]): void {
+  try {
+    localStorage.setItem(HIST_KEY, JSON.stringify(entries.slice(0, LOCAL_CACHE_LIMIT)));
+  } catch (e) {
+    console.error('fling: history cache write failed:', e);
+  }
+}
+
+function persistLine(line: string): Promise<void> {
+  const next = writeChain.then(async () => {
+    await invoke('append_history', { line });
+  });
+  writeChain = next.then(() => {}, (e) => {
+    console.error('fling: disk history write failed:', e);
+  });
+  return next;
+}
+
+/** Load the complete JSONL archive and migrate cache-only records on first run. */
+export async function hydrateHistory(): Promise<void> {
+  const local = readLocalHistory();
+  const rawLines = await invoke<string[]>('read_history');
+  const disk: HistoryEntry[] = [];
+  for (const line of rawLines) {
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (isHistoryEntry(parsed)) disk.push(parsed);
+    } catch {
+      console.error('fling: skipping malformed history line');
+    }
+  }
+  const diskKeys = new Set(disk.map(keyOf));
+  for (const entry of local) {
+    if (!diskKeys.has(keyOf(entry))) {
+      await persistLine(JSON.stringify(entry));
+      disk.push(entry);
+      diskKeys.add(keyOf(entry));
+    }
+  }
+  diskHistory = mergeHistory(local, disk);
+  cacheHistory(diskHistory);
+}
+
 export function loadHistory(): HistoryEntry[] {
+  const local = readLocalHistory();
+  return diskHistory ? mergeHistory(local, diskHistory) : local;
+}
+
+export async function saveHistoryEntry(entry: HistoryEntry): Promise<void> {
+  const all = mergeHistory([entry], loadHistory());
+  if (diskHistory) diskHistory = mergeHistory([entry], diskHistory);
+  cacheHistory(all);
   try {
-    const raw = localStorage.getItem(HIST_KEY);
-    if (!raw) return [];
-    const arr = JSON.parse(raw) as HistoryEntry[];
-    return Array.isArray(arr) ? arr : [];
-  } catch {
-    return [];
+    await persistLine(JSON.stringify(entry));
+  } catch (e) {
+    console.error('fling: durable history append failed:', e);
   }
 }
 
-export function saveHistoryEntry(entry: HistoryEntry): void {
-  try {
-    const list = loadHistory();
-    list.unshift(entry);
-    while (list.length > MAX_ENTRIES) list.pop();
-    localStorage.setItem(HIST_KEY, JSON.stringify(list));
-  } catch {
-    /* 配额满了就丢弃本次写入，不阻塞主流程 */
-  }
-  // 硬盘完整存档：JSONL，每行一条，含保存路径等 localStorage 放不下的信息
-  void invoke('append_history', { line: JSON.stringify(entry) }).catch(() => {});
-}
-
-// ---------- 简单键值设置 ----------
+// ---------- Simple key/value settings ----------
 function getStr(key: string, def: string): string {
   return localStorage.getItem(key) ?? def;
 }
@@ -75,14 +177,14 @@ export const settings = {
     setStr('fling-theme', v);
     applyTheme();
   },
-  /** 允许附近设备发现我（mDNS 广播开关） */
+  /** Nearby discovery / mDNS broadcast switch. */
   get discoverable(): boolean {
     return getStr('fling-discoverable', '1') === '1';
   },
   set discoverable(v: boolean) {
     setStr('fling-discoverable', v ? '1' : '0');
   },
-  /** 任务完成/失败时弹系统通知 */
+  /** Show system notifications when transfers finish or fail. */
   get notifyOnDone(): boolean {
     return getStr('fling-notify', '1') === '1';
   },
@@ -93,8 +195,7 @@ export const settings = {
 
 export function applyTheme(): void {
   const mode = settings.theme;
-  const dark =
-    mode === 'dark' ||
+  const dark = mode === 'dark' ||
     (mode === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
   document.documentElement.dataset.theme = dark ? 'dark' : 'light';
 }

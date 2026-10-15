@@ -51,7 +51,7 @@ function renderHist(): void {
     if (filter === 'recv' && e.dir !== 'recv') return false;
     if (filter === 'clip' && !e.items.some((i) => i.kind === 'text' || i.kind === 'clipboard-image')) return false;
     if (searchKw) {
-      const hay = (e.peer + ' ' + e.items.map((i) => i.name + ' ' + (i.text ?? '')).join(' ')).toLowerCase();
+      const hay = (e.peer + ' ' + e.items.map((i) => `${i.path ?? ''} ${i.name} ${i.text ?? ''}`).join(' ')).toLowerCase();
       if (!hay.includes(searchKw)) return false;
     }
     return true;
@@ -78,6 +78,10 @@ function renderEntry(e: HistoryEntry): HTMLElement {
   // ---- 标题行 ----
   const l1 = el('div', 'hl1');
   l1.appendChild(el('b', '', e.peer));
+  if (e.transport) {
+    const routeLabel = e.transport === 'p2p' ? 'P2P 直连' : e.transport === 'relay' ? '中继' : 'P2P/中继混合';
+    l1.appendChild(el('span', '', routeLabel));
+  }
   const counts = new Map<string, number>();
   for (const i of e.items) counts.set(i.kind, (counts.get(i.kind) ?? 0) + 1);
   if (e.items.length === 1) {
@@ -96,7 +100,7 @@ function renderEntry(e: HistoryEntry): HTMLElement {
   if (okCount < e.items.length) {
     l1.appendChild(el('span', 'hfail', `${okCount}/${e.items.length} 成功`));
   }
-  l1.appendChild(el('span', 'ht', fmtClock(e.time)));
+  l1.appendChild(el('span', 'ht', fmtClock(e.endedAt ?? e.time)));
 
   // ---- 摘要行 ----
   const l2 = el('div', 'hl2');
@@ -116,9 +120,13 @@ function renderEntry(e: HistoryEntry): HTMLElement {
     batch.hidden = true;
     for (const it of e.items) {
       const row = el('div', 'hbrow');
-      const fn = el('span', 'fn', it.name);
-      fn.title = it.name;
+      const fn = el('span', 'fn', it.path ?? it.name);
+      fn.title = [it.savedPath, it.mimeType ? `MIME：${it.mimeType}` : ''].filter(Boolean).join('\n') || it.path || it.name;
       row.append(fn, el('span', '', fmtSize(it.size)));
+      if (it.transport) {
+        const routeLabel = it.transport === 'p2p' ? 'P2P 直连' : it.transport === 'relay' ? '中继' : '混合';
+        row.appendChild(el('span', '', routeLabel));
+      }
       if (it.status === 'ok') {
         row.appendChild(el('span', 'ok', '✓'));
       } else {
@@ -207,7 +215,11 @@ function singleSummary(it: HistoryItem, dir: 'send' | 'recv'): HTMLElement {
     th.append(`剪贴板图片 · ${fmtSize(it.size)}`);
     span.appendChild(th);
   } else {
-    span.textContent = `${it.name} · ${fmtSize(it.size)} · ${dir === 'send' ? '发送成功' : '已保存到接收目录'}`;
+    const routeLabel = it.transport === 'p2p' ? ' · P2P 直连' : it.transport === 'relay' ? ' · 中继' : it.transport === 'mixed' ? ' · P2P/中继混合' : '';
+    const resultLabel = it.status === 'fail' ? '传输失败' : dir === 'send' ? '发送成功' : '已保存到接收目录';
+    span.textContent = `${it.path ?? it.name} · ${fmtSize(it.size)} · ${resultLabel}${routeLabel}`;
+    const details = [it.savedPath ? `保存位置：${it.savedPath}` : '', it.mimeType ? `MIME：${it.mimeType}` : ''].filter(Boolean);
+    if (details.length) span.title = details.join('\n');
   }
   if (it.status === 'fail') {
     span.append(` · `);

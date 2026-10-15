@@ -16,6 +16,8 @@ use std::sync::mpsc;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
 
+static HISTORY_IO_LOCK: Mutex<()> = Mutex::new(());
+
 mod embedded_config;
 
 // ================================================================ config ==
@@ -415,45 +417,118 @@ fn save_received_file(
         }
     };
 
-    let mut candidate = target_dir.join(&clean);
-    if candidate.exists() {
-        let (stem, ext) = match clean.rfind('.') {
-            Some(i) if i > 0 => (clean[..i].to_string(), clean[i..].to_string()),
-            _ => (clean.clone(), String::new()),
-        };
-        let mut i = 1u32;
-        loop {
-            candidate = target_dir.join(format!("{stem} ({i}){ext}"));
-            if !candidate.exists() || i >= 9999 {
-                break;
-            }
-            i += 1;
+    // First write and fsync a unique temporary file in the destination
+    // directory. Then hard-link it to the first unused name: link creation is
+    // atomic and fails rather than overwriting a file created concurrently.
+    let (temp_path, mut temp_file) = loop {
+        let temp = target_dir.join(format!(".fling-{}.tmp", new_device_id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => break (temp, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("创建临时文件失败: {e}")),
         }
-        if candidate.exists() {
-            return Err("无法生成不重名的文件名".to_string());
+    };
+    use std::io::Write;
+    if let Err(e) = temp_file.write_all(&bytes).and_then(|_| temp_file.sync_all()) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!("写入失败: {e}"));
+    }
+    drop(temp_file);
+
+    let (stem, ext) = match clean.rfind('.') {
+        Some(i) if i > 0 => (clean[..i].to_string(), clean[i..].to_string()),
+        _ => (clean.clone(), String::new()),
+    };
+    for i in 0..10_000u32 {
+        let filename = if i == 0 { clean.clone() } else { format!("{stem} ({i}){ext}") };
+        let candidate = target_dir.join(filename);
+        match std::fs::hard_link(&temp_path, &candidate) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Ok(candidate.to_string_lossy().into_owned());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput) => {
+                // Some removable/network filesystems do not implement hard
+                // links. Reserve the final path with create_new before copy;
+                // this fallback still never overwrites a concurrent file.
+                match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+                    Ok(mut destination) => {
+                        let mut source = std::fs::File::open(&temp_path).map_err(|err| format!("重开临时文件失败: {err}"))?;
+                        if let Err(err) = std::io::copy(&mut source, &mut destination)
+                            .and_then(|_| destination.sync_all())
+                        {
+                            let _ = std::fs::remove_file(&candidate);
+                            let _ = std::fs::remove_file(&temp_path);
+                            return Err(format!("写入失败: {err}"));
+                        }
+                        let _ = std::fs::remove_file(&temp_path);
+                        return Ok(candidate.to_string_lossy().into_owned());
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => {
+                        let _ = std::fs::remove_file(&temp_path);
+                        return Err(format!("创建目标文件失败: {err}"));
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(format!("原子保存失败: {e}"));
+            }
         }
     }
-    std::fs::write(&candidate, bytes).map_err(|e| format!("写入失败: {e}"))?;
-    Ok(candidate.to_string_lossy().into_owned())
+    let _ = std::fs::remove_file(&temp_path);
+    Err("无法生成不重名的文件名".to_string())
 }
 
-/// 传输历史落盘：每条记录一行 JSON（JSONL），存在配置目录的 history.jsonl。
-/// 前端 localStorage 仍保留一份做快速展示，硬盘文件是完整存档（含保存路径）。
-#[tauri::command]
-fn append_history(app: tauri::AppHandle, line: String) -> Result<(), String> {
+fn history_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     let dir = app
         .path()
         .app_config_dir()
         .map_err(|e| format!("config dir: {e}"))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
-    let p = dir.join("history.jsonl");
+    Ok(dir.join("history.jsonl"))
+}
+
+/// Load the durable transfer archive; localStorage is only a cache.
+#[tauri::command]
+fn read_history(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    use std::io::BufRead;
+    let _guard = HISTORY_IO_LOCK.lock().map_err(|e| format!("history lock: {e}"))?;
+    let path = history_path(&app)?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = std::fs::File::open(&path).map_err(|e| format!("open history: {e}"))?;
+    std::io::BufReader::new(file)
+        .lines()
+        .filter_map(|line| match line {
+            Ok(value) if !value.trim().is_empty() => Some(Ok(value)),
+            Ok(_) => None,
+            Err(e) => Some(Err(format!("read history: {e}"))),
+        })
+        .collect()
+}
+
+/// Append one validated JSON record to the durable history archive.
+#[tauri::command]
+fn append_history(app: tauri::AppHandle, line: String) -> Result<(), String> {
     use std::io::Write;
+    let _guard = HISTORY_IO_LOCK.lock().map_err(|e| format!("history lock: {e}"))?;
+    let value: serde_json::Value = serde_json::from_str(&line).map_err(|e| format!("invalid history JSON: {e}"))?;
+    if !value.is_object() {
+        return Err("history record must be a JSON object".to_string());
+    }
+    let line = serde_json::to_string(&value).map_err(|e| format!("encode history: {e}"))?;
+    let path = history_path(&app)?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&p)
+        .open(&path)
         .map_err(|e| format!("open history: {e}"))?;
     writeln!(f, "{line}").map_err(|e| format!("write history: {e}"))?;
+    f.sync_data().map_err(|e| format!("sync history: {e}"))?;
     Ok(())
 }
 
@@ -960,6 +1035,7 @@ fn main() {
             app_version,
             get_log_dir,
             append_log,
+            read_history,
             append_history,
             get_remote_config_url,
             apply_remote_config
@@ -1078,5 +1154,30 @@ mod tests {
     #[test]
     fn default_device_name_nonempty() {
         assert!(!default_device_name().is_empty());
+    }
+
+    #[test]
+    fn save_received_file_never_overwrites_existing_data() {
+        let dir = std::env::temp_dir().join(format!("fling-save-test-{}", new_device_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_string_lossy().into_owned();
+
+        let first = save_received_file(dir_str.clone(), "../sample.txt".into(), vec![1, 2, 3], None).unwrap();
+        let second = save_received_file(dir_str.clone(), "sample.txt".into(), vec![9, 8], None).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(&first).unwrap(), vec![1, 2, 3]);
+        assert_eq!(std::fs::read(&second).unwrap(), vec![9, 8]);
+        assert!(std::path::Path::new(&first).starts_with(&dir));
+
+        let nested = save_received_file(
+            dir_str.clone(),
+            "evil.txt".into(),
+            vec![4],
+            Some("../../nested/evil.txt".into()),
+        )
+        .unwrap();
+        assert!(std::path::Path::new(&nested).starts_with(&dir));
+        assert_eq!(std::fs::read(nested).unwrap(), vec![4]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

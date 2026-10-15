@@ -84,6 +84,9 @@ export interface ItemState {
   savedPath?: string;
   /** 文件 sha256（用于完整性核对） */
   sha256?: string;
+  mimeType?: string;
+  transport?: 'p2p' | 'relay' | 'mixed';
+  relPath?: string;
 }
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -112,6 +115,16 @@ function kindLabel(k: ItemKind): string {
   return k === 'text' ? '文本' : k === 'clipboard-image' ? '剪贴板' : '文件';
 }
 
+function mergeTransport(current: ItemState['transport'], route: 'p2p' | 'relay'): ItemState['transport'] {
+  return current && current !== route ? 'mixed' : route;
+}
+
+function summarizeTransport(items: ItemState[]): 'p2p' | 'relay' | 'mixed' | undefined {
+  const routes = new Set(items.map((item) => item.transport).filter(Boolean));
+  if (routes.size === 0) return undefined;
+  return routes.size === 1 ? [...routes][0] : 'mixed';
+}
+
 // ================================================================== 发送任务
 export type SendPhase = 'preparing' | 'waiting' | 'sending' | 'done' | 'error' | 'cancelled' | 'rejected';
 
@@ -136,6 +149,8 @@ export class SendTask {
   peerTotalBytes = 0;
   /** 等待接收方 task-ack 的 resolver（收到确认/对方离开/超时后置空） */
   private ackResolve: ((ok: boolean) => void) | null = null;
+  private peerFailures: { name: string; size: number; error: string }[] = [];
+  private currentSendingItem: ItemState | null = null;
   private lobbyLeave?: () => void;
   private announceTimer?: ReturnType<typeof setInterval>;
   private waitTimer?: ReturnType<typeof setTimeout>;
@@ -277,6 +292,23 @@ export class SendTask {
             this.ackResolve?.(false);
           }
         },
+        onTaskFailed: (taskId, failures) => {
+          if (taskId !== this.taskId) return;
+          this.peerFailures = failures;
+          for (const failure of failures) {
+            const index = this.items.findIndex((it, i) =>
+              (it.name === failure.name || this.source[i]?.name === failure.name) && it.totalBytes === failure.size,
+            );
+            const item = index >= 0 ? this.items[index] : undefined;
+            if (item) {
+              item.status = 'error';
+              item.error = failure.error;
+            }
+          }
+          log('task', 'task-failed received', { taskId, failures });
+          this.ackResolve?.(false);
+          this.notify();
+        },
         onDirectFallback: (reason) => this.onDirectFallback(reason),
         onTaskProgress: (taskId, doneBytes, totalBytes) => {
           if (taskId === this.taskId) {
@@ -311,6 +343,11 @@ export class SendTask {
               direct: this.room?.directActive ?? false,
             });
             this.notify();
+          }
+        },
+        onFileRoute: (route) => {
+          if (this.currentSendingItem) {
+            this.currentSendingItem.transport = mergeTransport(this.currentSendingItem.transport, route);
           }
         },
         onLog: (tag, msg) => log(tag as LogTag, `[room] ${msg}`),
@@ -359,6 +396,7 @@ export class SendTask {
         if (this.cancelled) break;
         const src = this.source[i];
         const st = this.items[i];
+        this.currentSendingItem = src.kind === 'text' ? null : st;
         if (src.kind !== 'text' && !p2pAwaited) {
           p2pAwaited = true;
           const ready = (await this.p2pReady?.catch(() => 'failed' as const)) ?? 'failed';
@@ -394,6 +432,8 @@ export class SendTask {
             const manifest = await this.room!.sendFile(file, (sent) => {
               onFileProgress(sent);
             }, src.kind);
+            st.sha256 = manifest.sha256;
+            st.mimeType = manifest.mimeType;
 
             // sendFile now confirms every direct window itself. If it had to
             // abandon the path, the remaining bytes are already being
@@ -477,6 +517,7 @@ export class SendTask {
           log('xfer', 'send item error', { taskId: this.taskId, name: st.name, error: st.error });
         }
         this.notify();
+        this.currentSendingItem = null;
         // Do not enqueue later files after one item has lost end-to-end
         // confirmation. Continuing here used to turn a single relay stall
         // into an even larger LiveKit queue and made the UI show e.g. 3/5
@@ -513,7 +554,7 @@ export class SendTask {
         this.phase = 'cancelled';
       } else if (!acked) {
         this.phase = 'error';
-        this.error = '对方未确认接收';
+        this.error = this.peerFailures[0]?.error ?? '对方未确认接收';
       } else if (okCount === this.items.length) {
         this.phase = 'done';
       } else {
@@ -535,7 +576,7 @@ export class SendTask {
         error: this.error,
       });
       void flushLogs();
-      void this.archive();
+      await this.archive();
       this.closeRooms();
     } catch (e) {
       if (this.cancelled) {
@@ -553,7 +594,7 @@ export class SendTask {
       this.endedAt = Date.now();
       this.notify();
       this.closeP2P();
-      void this.archive();
+      await this.archive();
       this.closeRooms();
     }
   }
@@ -681,6 +722,7 @@ export class SendTask {
    * 调用方照常关闭——旧版本接收方不会发 ack，不能无限等。
    */
   private waitForAck(timeoutMs: number): Promise<boolean> {
+    if (this.peerFailures.length > 0) return Promise.resolve(false);
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.ackResolve = null;
@@ -817,10 +859,14 @@ export class SendTask {
         const st = this.items[i];
         const base = {
           name: st.name,
+          path: c.relPath,
           size: c.size,
           kind: c.kind,
           status: (st.status === 'done' ? 'ok' : 'fail') as 'ok' | 'fail',
           error: st.error,
+          sha256: st.sha256,
+          mimeType: st.mimeType,
+          transport: st.transport,
         };
         if (c.kind === 'text') return { ...base, text: c.text };
         if (c.kind === 'clipboard-image' && c.blob && c.blob.size < HIST_IMAGE_LIMIT) {
@@ -837,6 +883,8 @@ export class SendTask {
       dir: 'send',
       peer: this.peerLabel,
       time: this.startedAt,
+      endedAt: this.endedAt,
+      transport: summarizeTransport(this.items),
       items,
       totalBytes: this.totalBytes,
     };
@@ -891,6 +939,7 @@ export class RecvTask {
   private peerGone = false;
   /** 已收到 manifest 但还没落盘完成的个数（在途分块计数） */
   private pendingFiles = 0;
+  private pendingFileIds = new Set<string>();
   /** 期望收到的 manifest 总数（offer 里 file/clipboard-image 的个数） */
   private expectedManifests = 0;
   /** 已收到的 manifest 个数 */
@@ -995,11 +1044,16 @@ export class RecvTask {
         onText: (t) => this.onTextPart(t),
         onFileManifest: (m) => this.onManifest(m),
         onFileProgress: (id, r, t) => this.onProgress(id, r, t),
+        onFileRoute: (route, id) => {
+          const item = this.manifestToItem.get(id);
+          if (item) item.transport = mergeTransport(item.transport, route);
+        },
         onFileComplete: (id, m, bytes) => {
           // 落盘是异步的：跟踪起来，finish(true) 需要等它们全部完成再发 task-ack
           const p = this.onFileComplete(id, m, bytes);
           this.pendingSaves.add(p);
-          void p.finally(() => this.pendingSaves.delete(p));
+          void p.finally(() => this.pendingSaves.delete(p)).catch(() => {});
+          return p;
         },
         onFileError: (id, err) => this.onFileError(id, err),
         onDirectFallback: (reason) => this.onDirectFallback(reason),
@@ -1076,8 +1130,13 @@ export class RecvTask {
     }
     item.status = 'active';
     item.totalBytes = m.size;
+    item.mimeType = m.mimeType;
+    item.relPath = m.path;
     this.manifestToItem.set(m.id, item);
-    this.pendingFiles++;
+    if (!this.pendingFileIds.has(m.id)) {
+      this.pendingFileIds.add(m.id);
+      this.pendingFiles++;
+    }
     this.manifestsReceived++;
     log('xfer', 'manifest recv', {
       taskId: this.taskId,
@@ -1168,7 +1227,7 @@ export class RecvTask {
     if (!item) return;
     item.status = 'error';
     item.error = err;
-    this.pendingFiles = Math.max(0, this.pendingFiles - 1);
+    this.settlePendingFile(id);
     log('xfer', 'item failed', { taskId: this.taskId, name: item.name, error: err });
     this.notify();
   }
@@ -1212,10 +1271,17 @@ export class RecvTask {
       item.status = 'error';
       item.error = errText(e);
       log('xfer', 'item save failed', { taskId: this.taskId, name: item.name, error: item.error });
+      this.notify();
+      throw e;
     } finally {
-      this.pendingFiles = Math.max(0, this.pendingFiles - 1);
+      this.settlePendingFile(id);
     }
     this.notify();
+  }
+
+  private settlePendingFile(id: string): void {
+    if (!this.pendingFileIds.delete(id)) return;
+    this.pendingFiles = Math.max(0, this.pendingFiles - 1);
   }
 
   /** 等待在途分块收齐并落盘（task-done 可能先于部分分块到达）。超时返回 false。 */
@@ -1399,6 +1465,16 @@ export class RecvTask {
       }, 3000);
       return;
     }
+    if (completed && failed > 0 && this.room) {
+      const failures = this.items
+        .filter((it) => it.status !== 'done')
+        .map((it) => ({ name: it.name, size: it.totalBytes, error: it.error ?? '接收或保存失败' }));
+      try {
+        await this.room.sendTaskFailed(this.taskId, failures);
+        await this.room.flush();
+        log('task', 'task-failed sent', { taskId: this.taskId, failures });
+      } catch { /* 尽力通知发送方具体失败原因 */ }
+    }
     await this.closeRoom();
   }
 
@@ -1440,12 +1516,14 @@ export class RecvTask {
       this.items.map(async (it) => {
         const base = {
           name: it.name,
+          path: it.relPath,
           size: it.size,
           kind: it.kind,
           status: (it.status === 'done' ? 'ok' : 'fail') as 'ok' | 'fail',
           error: it.error,
           savedPath: it.savedPath,
           sha256: it.sha256,
+          mimeType: it.mimeType,
         };
         if (it.kind === 'text') return { ...base, text: this.textParts.join('') };
         if (it.kind === 'clipboard-image') {

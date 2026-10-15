@@ -20,6 +20,8 @@ export interface DirectChannel {
   readonly label: string;
   readonly readyState: string;
   readonly bufferedAmount: number;
+  /** Negotiated SCTP maximum message size; Infinity/unknown is clamped by the sender. */
+  readonly maxMessageSize: number;
   send(data: Uint8Array<ArrayBuffer>): void;
   close(): void;
   onmessage: ((data: Uint8Array<ArrayBuffer>) => void) | null;

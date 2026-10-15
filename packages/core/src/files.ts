@@ -11,6 +11,7 @@ import { FILE_CHUNK_SIZE, randomId, type FileKind, type FileManifest } from './p
 export interface FileLike {
   readonly name: string;
   readonly size: number;
+  readonly type?: string;
   slice(start: number, end: number): Promise<Uint8Array>;
   /** 文件夹发送时的相对路径，如 "docs/report.pdf"；普通文件为空 */
   readonly path?: string;
@@ -21,6 +22,7 @@ export function wrapWebFile(f: Blob & { name?: string }, name?: string, path?: s
   return {
     name: name ?? f.name ?? 'file',
     size: f.size,
+    type: f.type,
     slice: async (s, e) => new Uint8Array(await f.slice(s, e).arrayBuffer()),
     path,
   };
@@ -61,6 +63,7 @@ export async function buildManifest(file: FileLike, kind: FileKind = 'file'): Pr
     chunkSize,
     totalChunks: Math.max(1, Math.ceil(file.size / chunkSize)),
     kind,
+    mimeType: file.type || undefined,
     path: file.path,
   };
 }
@@ -89,17 +92,34 @@ export class FileReceiver {
 
   /** The next contiguous chunk needed by a sender doing windowed replay. */
   get nextSeq(): number {
+    if (this.manifest.size === 0) return this.manifest.totalChunks;
     return this.nextMissingSeq;
   }
 
   /** Add a chunk; returns true when the file is complete. */
   addChunk(seq: number, dataB64: string): boolean {
-    if (seq < 0 || seq >= this.manifest.totalChunks) return false;
-    if (!this.chunks[seq]) {
-      const bytes = b64decode(dataB64);
-      this.chunks[seq] = bytes;
-      this.receivedBytes += bytes.length;
+    if (!Number.isInteger(seq) || seq < 0 || seq >= this.manifest.totalChunks) {
+      throw new Error('invalid chunk sequence');
     }
+    if (this.chunks[seq]) return this.isComplete();
+    return this.addChunkBytes(seq, b64decode(dataB64));
+  }
+
+  /** Store the received binary view directly; the DataChannel ArrayBuffer remains alive through this view. */
+  addChunkBytes(seq: number, bytes: Uint8Array): boolean {
+    if (!Number.isInteger(seq) || seq < 0 || seq >= this.manifest.totalChunks) {
+      throw new Error('invalid chunk sequence');
+    }
+    if (this.chunks[seq]) return this.isComplete();
+    const expectedBytes = Math.min(
+      this.manifest.chunkSize,
+      Math.max(0, this.manifest.size - seq * this.manifest.chunkSize),
+    );
+    if (bytes.byteLength !== expectedBytes) {
+      throw new Error(`invalid chunk size (got ${bytes.byteLength}, want ${expectedBytes})`);
+    }
+    this.chunks[seq] = bytes;
+    this.receivedBytes += bytes.byteLength;
     // Direct delivery is ordered today, but relay replay and a future
     // unordered channel are allowed to fill holes. Keep this incremental so
     // an ACK does not scan the whole file on every chunk.
@@ -114,19 +134,31 @@ export class FileReceiver {
   }
 
   isComplete(): boolean {
-    return this.chunks.every((c) => c !== undefined);
+    return this.manifest.size === 0 || this.chunks.every((c) => c !== undefined);
   }
 
-  /** Concatenate and verify sha256. Throws on mismatch. */
-  assemble(): Uint8Array {
+  /** Concatenate and verify in bounded turns so a large file cannot starve network callbacks. */
+  async assembleAsync(): Promise<Uint8Array> {
     const out = new Uint8Array(this.manifest.size);
+    const hash = sha256.create();
     let off = 0;
-    for (const c of this.chunks) {
+    let nextYieldAt = 4 * 1024 * 1024;
+    for (let i = 0; i < this.chunks.length; i++) {
+      if (this.manifest.size === 0) break;
+      const c = this.chunks[i];
       if (!c) throw new Error('missing chunks');
       out.set(c, off);
+      hash.update(c);
       off += c.length;
+      // The completed file is now represented by `out`; release each chunk
+      // reference as soon as it has been copied and hashed.
+      this.chunks[i] = undefined;
+      if (off >= nextYieldAt) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        nextYieldAt = off + 4 * 1024 * 1024;
+      }
     }
-    const digest = bytesToHex(sha256(out));
+    const digest = bytesToHex(hash.digest());
     if (digest !== this.manifest.sha256) {
       throw new Error(`sha256 mismatch (got ${digest.slice(0, 12)}…, want ${this.manifest.sha256.slice(0, 12)}…)`);
     }

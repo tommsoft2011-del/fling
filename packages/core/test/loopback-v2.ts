@@ -113,6 +113,7 @@ interface Collected {
   offers: Array<{ offer: OfferMessage; from: string }>;
   withdraws: Array<{ taskId: string; from: string }>;
   dones: Array<{ taskId: string; from: string }>;
+  failures: Array<{ taskId: string; failures: { name: string; size: number; error: string }[]; from: string }>;
   manifests: Array<{ manifest: FileManifest; from: string }>;
   completed: Array<{ id: string; manifest: FileManifest; bytes: Uint8Array }>;
 }
@@ -124,7 +125,7 @@ function makeEvents(c: Collected): FlingRoomEvents {
     onPeerLeft: () => {},
     onFileManifest: (manifest, from) => c.manifests.push({ manifest, from }),
     onFileProgress: () => {},
-    onFileComplete: (id, manifest, bytes) => c.completed.push({ id, manifest, bytes }),
+    onFileComplete: (id, manifest, bytes) => { c.completed.push({ id, manifest, bytes }); },
     onFileError: (id, err) => {
       failures++;
       console.error(`  FAIL - file error ${id}: ${err}`);
@@ -132,11 +133,12 @@ function makeEvents(c: Collected): FlingRoomEvents {
     onOffer: (offer, from) => c.offers.push({ offer, from }),
     onOfferWithdraw: (taskId, from) => c.withdraws.push({ taskId, from }),
     onTaskDone: (taskId, from) => c.dones.push({ taskId, from }),
+    onTaskFailed: (taskId, failures, from) => c.failures.push({ taskId, failures, from }),
   };
 }
 
 function newCollected(): Collected {
-  return { offers: [], withdraws: [], dones: [], manifests: [], completed: [] };
+  return { offers: [], withdraws: [], dones: [], failures: [], manifests: [], completed: [] };
 }
 
 function memFile(name: string, bytes: Uint8Array): FileLike {
@@ -221,6 +223,13 @@ async function main(): Promise<void> {
   await roomA.sendTaskDone(offer.taskId);
   await roomB.flush();
   check(colB.dones.length === 1 && colB.dones[0]?.taskId === offer.taskId, 'task-done received with taskId');
+
+  await roomB.sendTaskFailed(offer.taskId, [{ name: 'disk-full.bin', size: 99, error: '磁盘空间不足' }]);
+  await roomA.flush();
+  check(
+    colA.failures.length === 1 && colA.failures[0]?.failures[0]?.error === '磁盘空间不足',
+    'task-failed preserves receiver save error for sender',
+  );
 
   console.log('== loopback: clipboard-image file transfer ==');
   const bytes = new Uint8Array(100_000);

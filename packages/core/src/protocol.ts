@@ -23,6 +23,60 @@ export const MAX_TEXT_BYTES = 60 * 1024;
  */
 export const FILE_CHUNK_SIZE = 32 * 1024;
 
+/** P2P frame header: magic(4), version(1), type(1), transfer id(12), seq(4), payload length(4). */
+export const DIRECT_FILE_FRAME_HEADER_SIZE = 26;
+const DIRECT_FILE_FRAME_MAGIC = [0x46, 0x4c, 0x4e, 0x47] as const; // FLNG
+const DIRECT_FILE_FRAME_VERSION = 1;
+const DIRECT_FILE_CHUNK_TYPE = 1;
+
+export interface DirectFileChunkFrame {
+  id: string;
+  seq: number;
+  payload: Uint8Array<ArrayBuffer>;
+}
+
+/** Encode a raw file chunk for RTCDataChannel; control messages remain JSON. */
+export function encodeDirectFileChunkFrame(
+  id: string,
+  seq: number,
+  payload: Uint8Array,
+): Uint8Array<ArrayBuffer> {
+  if (!/^[0-9a-f]{24}$/i.test(id)) throw new Error('invalid transfer id');
+  if (!Number.isInteger(seq) || seq < 0 || seq > 0xffffffff) throw new Error('invalid chunk sequence');
+  const frame = new Uint8Array(DIRECT_FILE_FRAME_HEADER_SIZE + payload.byteLength);
+  frame.set(DIRECT_FILE_FRAME_MAGIC, 0);
+  frame[4] = DIRECT_FILE_FRAME_VERSION;
+  frame[5] = DIRECT_FILE_CHUNK_TYPE;
+  for (let i = 0; i < 12; i++) frame[6 + i] = Number.parseInt(id.slice(i * 2, i * 2 + 2), 16);
+  const view = new DataView(frame.buffer);
+  view.setUint32(18, seq, false);
+  view.setUint32(22, payload.byteLength, false);
+  frame.set(payload, DIRECT_FILE_FRAME_HEADER_SIZE);
+  return frame;
+}
+
+/** Return undefined for non-FLING payloads so older JSON direct messages remain accepted. */
+export function decodeDirectFileChunkFrame(data: Uint8Array): DirectFileChunkFrame | undefined {
+  if (data.byteLength < 4 || DIRECT_FILE_FRAME_MAGIC.some((b, i) => data[i] !== b)) return undefined;
+  if (data.byteLength < DIRECT_FILE_FRAME_HEADER_SIZE) throw new Error('truncated direct file frame');
+  if (data[4] !== DIRECT_FILE_FRAME_VERSION || data[5] !== DIRECT_FILE_CHUNK_TYPE) {
+    throw new Error('unsupported direct file frame');
+  }
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const seq = view.getUint32(18, false);
+  const payloadLength = view.getUint32(22, false);
+  if (payloadLength !== data.byteLength - DIRECT_FILE_FRAME_HEADER_SIZE) {
+    throw new Error('invalid direct file frame length');
+  }
+  let id = '';
+  for (let i = 6; i < 18; i++) id += data[i].toString(16).padStart(2, '0');
+  return {
+    id,
+    seq,
+    payload: data.subarray(DIRECT_FILE_FRAME_HEADER_SIZE) as Uint8Array<ArrayBuffer>,
+  };
+}
+
 /** What the bytes of a transferred item mean to the receiver. */
 export type FileKind = 'file' | 'clipboard-image';
 
@@ -36,6 +90,8 @@ export interface FileManifest {
   totalChunks: number;
   /** 'file' -> save to disk; 'clipboard-image' -> copy into clipboard */
   kind: FileKind;
+  /** Optional browser-provided MIME type, persisted in transfer history. */
+  mimeType?: string;
   /** 文件夹发送时的相对路径，如 "docs/report.pdf"；普通文件为空 */
   path?: string;
 }
@@ -86,7 +142,7 @@ export type FlingMessage =
   // Sent over the LiveKit relay after the receiver has accepted a manifest.
   // chunkAck advertises support for receive-confirmed relay windows; it is
   // optional so older peers can still use the legacy relay stream.
-  | { kind: 'file-manifest-ack'; id: string; chunkAck?: boolean }
+  | { kind: 'file-manifest-ack'; id: string; chunkAck?: boolean; binaryChunks?: boolean }
   // Application-level receive acknowledgement for direct P2P windows.  This
   // deliberately stays on the encrypted LiveKit relay: an ACK behind the
   // same wedged RTCDataChannel would not be a useful health signal.
@@ -108,6 +164,7 @@ export type FlingMessage =
   | { kind: 'task-ack'; taskId: string }
   // 接收方中途取消：发送方收到后不得再标"成功"，应标"已取消"。
   | { kind: 'task-cancel'; taskId: string }
+  | { kind: 'task-failed'; taskId: string; failures: { name: string; size: number; error: string }[] }
   // 接收方周期性上报真实接收进度（发送端的"已发送"只是进了缓冲，
   // 用接收端的数字才是用户真正关心的"对方收到了多少"）。
   | { kind: 'task-progress'; taskId: string; doneBytes: number; totalBytes: number }
@@ -134,6 +191,7 @@ export function isFlingMessage(o: unknown): o is FlingMessage {
     k === 'task-done' ||
     k === 'task-ack' ||
     k === 'task-cancel' ||
+    k === 'task-failed' ||
     k === 'task-progress' ||
     k === 'p2p-offer' ||
     k === 'p2p-answer' ||

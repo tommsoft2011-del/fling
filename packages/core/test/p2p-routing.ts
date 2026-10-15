@@ -11,7 +11,8 @@
 
 import { FlingRoom, type FlingRoomEvents } from '../src/room.js';
 import type { DirectChannel } from '../src/p2p.js';
-import type { FileLike } from '../src/files.js';
+import { buildManifest, FileReceiver, type FileLike } from '../src/files.js';
+import { decodeDirectFileChunkFrame, encodeDirectFileChunkFrame } from '../src/protocol.js';
 import type { DataHandler, FlingTransport } from '../src/transport.js';
 
 let failures = 0;
@@ -66,6 +67,7 @@ class MockTransport implements FlingTransport {
 /** Fake direct channel: deliver() is wired by the test to the peer's room. */
 class FakeDirect implements DirectChannel {
   readonly readyState: string = 'open';
+  readonly maxMessageSize = 64 * 1024;
   bufferedAmount = 0;
   onmessage: ((data: Uint8Array<ArrayBuffer>) => void) | null = null;
   onclose: (() => void) | null = null;
@@ -178,42 +180,25 @@ async function main(): Promise<void> {
   const relayDuringDirect = relayPublishesA - relayBefore;
   check(relayDuringDirect === 0, `manifest+chunks bypassed relay (relay publishes: ${relayDuringDirect}, want 0)`);
 
-  // --- 1b. chunks beating the manifest are buffered, not dropped -----------
+  // --- 1b. raw chunks beating the manifest are buffered, not dropped ------
   done = freshBox();
-  directA.sent = [];
   const fileE = fileLike('early.bin', 100_000); // 4 chunks
-  const captured: Uint8Array[] = [];
-  let earlyManifestDelivered = false;
-  const earlySend = roomA.sendFile(fileE, undefined, 'file'); // capture chunks, deliver only manifest for ack
-  for (let i = 0; i < 100 && !earlyManifestDelivered; i++) {
-    for (const d of directA.sent.splice(0)) {
-      captured.push(d);
-      const raw = JSON.parse(dec.decode(d)) as { kind: string };
-      if (raw.kind === 'file-manifest') {
-        directB.onmessage?.(d as Uint8Array<ArrayBuffer>);
-        earlyManifestDelivered = true;
-      }
-    }
-    await new Promise((r) => setTimeout(r, 5));
+  const earlyManifest = await buildManifest(fileE);
+  for (let seq = 0; seq < earlyManifest.totalChunks; seq++) {
+    const bytes = await fileE.slice(seq * earlyManifest.chunkSize, Math.min((seq + 1) * earlyManifest.chunkSize, fileE.size));
+    directB.onmessage?.(encodeDirectFileChunkFrame(earlyManifest.id, seq, bytes));
   }
-  await earlySend;
-  captured.push(...directA.sent.splice(0));
-  const raws = captured.map((d) => JSON.parse(dec.decode(d)) as { kind: string });
-  check(raws.filter((m) => m.kind === 'file-chunk').length === 4, 'captured 4 direct chunks');
-  // deliver chunks FIRST, manifest last (simulates the old relay/direct race)
-  const chunksFirst = [
-    ...raws.filter((m) => m.kind === 'file-chunk'),
-    ...raws.filter((m) => m.kind === 'file-manifest'),
-  ];
-  for (const m of chunksFirst) {
-    directB.onmessage?.(enc.encode(JSON.stringify(m)) as Uint8Array<ArrayBuffer>);
-  }
+  directB.onmessage?.(enc.encode(JSON.stringify({ kind: 'file-manifest', manifest: earlyManifest })) as Uint8Array<ArrayBuffer>);
   await new Promise((r) => setTimeout(r, 20));
   const gotE = done.cur;
   check(
     gotE !== null && gotE.bytes.length === 100_000 && gotE.bytes[99999] === (99999 & 0xff),
     'early chunks buffered and replayed once the manifest arrived',
   );
+  const probe = encodeDirectFileChunkFrame(earlyManifest.id, 0, new Uint8Array([1, 2, 3]));
+  const decodedProbe = decodeDirectFileChunkFrame(probe);
+  check(decodedProbe?.id === earlyManifest.id && decodedProbe.payload.length === 3 && decodedProbe.payload[2] === 3,
+    'direct file frame contains a small header plus raw bytes, not JSON/Base64');
 
   // --- 1c. black-hole: open/send-success is not delivery --------------------
   done = freshBox();
@@ -273,6 +258,21 @@ async function main(): Promise<void> {
     'fallback bytes intact',
   );
   check(!roomA.directActive, 'directActive false after failure');
+
+  // --- 3. asynchronous whole-file validation yields to network callbacks ---
+  const largeFile = fileLike('large.bin', 8 * 1024 * 1024);
+  const largeManifest = await buildManifest(largeFile);
+  const receiver = new FileReceiver(largeManifest);
+  for (let seq = 0; seq < largeManifest.totalChunks; seq++) {
+    const start = seq * largeManifest.chunkSize;
+    receiver.addChunkBytes(seq, await largeFile.slice(start, Math.min(start + largeManifest.chunkSize, largeFile.size)));
+  }
+  let eventLoopTicked = false;
+  setTimeout(() => { eventLoopTicked = true; }, 0);
+  const assembled = await receiver.assembleAsync();
+  await new Promise((r) => setTimeout(r, 0));
+  check(eventLoopTicked, 'large-file assembly/hash yields to the event loop');
+  check(assembled.length === largeFile.size && assembled[123456] === (123456 & 0xff), 'async hash preserves file bytes');
 
   await roomA.close();
   await roomB.close();
