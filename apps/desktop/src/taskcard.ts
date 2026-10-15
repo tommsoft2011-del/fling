@@ -3,6 +3,7 @@
 import type { SendTask, RecvTask } from './tasks.js';
 import { fmtSize, fmtSpeed, el } from './ui.js';
 import { replaceChildrenPreservingScroll } from './dom-utils.js';
+import { distributeSequentialProgress, progressForItem, progressPercent } from './file-progress.js';
 
 type AnyTask = SendTask | RecvTask;
 
@@ -83,44 +84,74 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
             : `已完成 ${doneCount}/${task.items.length}`);
       content.push(hint);
     }
-    // 文件按顺序发送：分别把接收确认和 Rust append 确认分配到文件行。
-    let remainingReceived = dir === 'send' ? (task as SendTask).peerDoneBytes : -1;
-    let remainingSaved = dir === 'send' ? (task as SendTask).peerSavedBytes : -1;
-    for (const it of task.items) {
+    // 文件按顺序发送：把接收确认和 Rust append 确认独立分配到每一行。
+    const sentProgress = dir === 'send'
+      ? distributeSequentialProgress(task.items, (task as SendTask).peerDoneBytes, (task as SendTask).peerSavedBytes)
+      : undefined;
+    for (const [index, it] of task.items.entries()) {
       const r = el('div', 'tdetail-row');
-      let fileDoneB = it.doneBytes;
-      let fileReceivedB = it.doneBytes;
+      const progress = sentProgress?.[index] ?? progressForItem(it.totalBytes, it.doneBytes, it.saveBytes ?? 0);
+      const fileReceivedB = progress.receivedBytes;
+      const fileDoneB = dir === 'send' ? progress.savedBytes : it.kind === 'text' ? it.doneBytes : progress.savedBytes;
       let confirmedDone = it.status === 'done';
-      const saving = dir === 'recv' && it.saving === true;
-      if (saving) fileDoneB = it.saveBytes ?? 0;
-      if (remainingReceived >= 0) {
-        fileReceivedB = Math.max(0, Math.min(it.totalBytes, remainingReceived));
-        remainingReceived -= fileReceivedB;
-        const itSaved = Math.max(0, Math.min(it.totalBytes, remainingSaved));
-        remainingSaved -= itSaved;
-        fileDoneB = itSaved;
+      if (dir === 'send') {
         // 只有 Rust append 确认、且文件最终 ACK 完成后才显示完成。
-        confirmedDone = itSaved >= it.totalBytes && it.status === 'done';
-      } else if (dir !== 'send') {
+        confirmedDone = progress.savedBytes >= it.totalBytes && it.status === 'done';
+      } else {
         confirmedDone = it.status === 'done';
       }
       const st = confirmedDone ? '✓' : it.status === 'error' ? '✗' : it.status === 'active' ? '…' : '○';
-      const p = it.totalBytes > 0 ? Math.min(100, Math.round((fileDoneB / it.totalBytes) * 100)) : 0;
-      const ptxt = dir === 'send' ? `写入 ${fmtSize(fileDoneB)} · 收到 ${fmtSize(fileReceivedB)}`
-        : saving ? `${fmtSize(fileDoneB)} / ${fmtSize(it.totalBytes)}`
-        : confirmedDone ? '100%' : it.status === 'error' ? (it.error ?? '失败') : p + '%';
-      const bar = el('div', 'pbar thin');
-      const fill = el('div', 'pfill');
-      fill.style.width = (confirmedDone ? 100 : p) + '%';
-      bar.appendChild(fill);
-      r.append(
-        el('span', 'tdot ' + (confirmedDone ? 'done' : it.status), st),
-        el('span', 'tname', it.name),
-        el('span', 'tprog', ptxt),
-        bar,
-        el('span', 'tsize', fmtSize(it.size)),
-      );
-      (r.querySelector('.tname') as HTMLElement).title = it.name;
+      if (it.kind !== 'text') {
+        r.classList.add('tdetail-file-row');
+        const head = el('div', 'tdetail-file-head');
+        const name = el('span', 'tname', it.name);
+        name.title = it.name;
+        head.append(
+          el('span', 'tdot ' + (confirmedDone ? 'done' : it.status), st),
+          name,
+          el('span', 'tsize', fmtSize(it.size)),
+        );
+        const progressLine = (label: string, bytes: number, complete: boolean) => {
+          const percent = progressPercent(it.totalBytes, bytes, complete);
+          const line = el('div', 'tdetail-file-progress');
+          const bar = el('div', 'pbar thin');
+          const fill = el('div', 'pfill');
+          fill.style.width = percent + '%';
+          bar.setAttribute('role', 'progressbar');
+          bar.setAttribute('aria-label', label);
+          bar.setAttribute('aria-valuemin', '0');
+          bar.setAttribute('aria-valuemax', '100');
+          bar.setAttribute('aria-valuenow', String(percent));
+          bar.appendChild(fill);
+          line.append(
+            el('span', 'tfile', label),
+            bar,
+            el('span', 'tprogress-text', `${percent}% · ${fmtSize(bytes)} / ${fmtSize(it.totalBytes)}`),
+          );
+          return line;
+        };
+        r.append(
+          head,
+          progressLine('已接收', fileReceivedB, confirmedDone),
+          progressLine('已写入', fileDoneB, confirmedDone),
+        );
+      } else {
+        const p = progressPercent(it.totalBytes, fileDoneB, confirmedDone);
+        const ptxt = dir === 'send' ? `写入 ${fmtSize(fileDoneB)} · 收到 ${fmtSize(fileReceivedB)}`
+          : confirmedDone ? '100%' : it.status === 'error' ? (it.error ?? '失败') : p + '%';
+        const bar = el('div', 'pbar thin');
+        const fill = el('div', 'pfill');
+        fill.style.width = (confirmedDone ? 100 : p) + '%';
+        bar.appendChild(fill);
+        r.append(
+          el('span', 'tdot ' + (confirmedDone ? 'done' : it.status), st),
+          el('span', 'tname', it.name),
+          el('span', 'tprog', ptxt),
+          bar,
+          el('span', 'tsize', fmtSize(it.size)),
+        );
+        (r.querySelector('.tname') as HTMLElement).title = it.name;
+      }
       content.push(r);
     }
     replaceChildrenPreservingScroll(detail, content);

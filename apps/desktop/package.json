@@ -1,12 +1,13 @@
 {
   "name": "@fling/desktop",
-  "version": "0.5.45",
+  "version": "0.5.46",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test:scroll": "bun test/taskcard-scroll.ts"
+    "test:scroll": "bun test/taskcard-scroll.ts",
+    "test:progress": "bun test/file-progress.ts"
   },
   "dependencies": {
     "@fling/core": "0.3.0",
