@@ -154,6 +154,8 @@ export type FlingMessage =
       /** Aggregate bytes present in the receiver's reassembly buffer. */
       receivedBytes: number;
       complete?: boolean;
+      /** Receiver could not assemble, verify, or persist the file. */
+      failed?: boolean;
     }
   | OfferMessage
   | { kind: 'offer-withdraw'; taskId: string }

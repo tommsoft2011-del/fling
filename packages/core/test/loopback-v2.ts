@@ -105,6 +105,29 @@ class MockTransport implements FlingTransport {
   }
 }
 
+class MockDirectChannel implements DirectChannel {
+  readonly maxMessageSize = 1024 * 1024;
+  bufferedAmount = 0;
+  readyState = 'open';
+  onmessage: ((data: Uint8Array<ArrayBuffer>) => void) | null = null;
+  onclose: (() => void) | null = null;
+  peer: MockDirectChannel | null = null;
+
+  constructor(readonly label: string) {}
+
+  send(data: Uint8Array<ArrayBuffer>): void {
+    if (this.readyState !== 'open') throw new Error('mock direct channel is closed');
+    this.peer?.onmessage?.(new Uint8Array(data) as Uint8Array<ArrayBuffer>);
+  }
+
+  close(): void {
+    this.readyState = 'closed';
+    this.onclose?.();
+  }
+
+  async waitForDrain(_threshold: number): Promise<void> {}
+}
+
 // ---------------------------------------------------------------------------
 // Event collector.
 // ---------------------------------------------------------------------------
@@ -264,6 +287,81 @@ async function main(): Promise<void> {
   check(m2.kind === 'file', 'default kind is file');
   check(colB.manifests[colB.manifests.length - 1]?.manifest.kind === 'file', 'receiver sees kind=file');
 
+  console.log('== loopback: 36MiB multi-file finalize ACK regression ==');
+  const delayedHub = new Hub();
+  const senderRoom = new FlingRoom(new MockTransport(delayedHub, 'sender-large'), 'Sender');
+  const receiverRoom = new FlingRoom(new MockTransport(delayedHub, 'receiver-large'), 'Receiver');
+  const senderCollected = newCollected();
+  const receiverCollected = newCollected();
+  let finalizingNotices = 0;
+  const senderEvents = makeEvents(senderCollected);
+  senderEvents.onFileFinalizing = () => { finalizingNotices++; };
+  const receiverEvents = makeEvents(receiverCollected);
+  receiverEvents.onFileError = () => {};
+  let signalSaveStarted!: () => void;
+  const saveStarted = new Promise<void>((resolve) => { signalSaveStarted = resolve; });
+  let releaseSave!: () => void;
+  const saveGate = new Promise<void>((resolve) => { releaseSave = resolve; });
+  let firstFilePersisted = false;
+  const completionOrder: string[] = [];
+  receiverEvents.onFileComplete = async (id, manifest, bytes) => {
+    if (manifest.name === 'large.bin') {
+      signalSaveStarted();
+      await saveGate;
+      firstFilePersisted = true;
+      completionOrder.push('persisted');
+    }
+    if (manifest.name === 'disk-full.bin') throw new Error('simulated disk failure');
+    receiverCollected.completed.push({ id, manifest, bytes });
+  };
+  await senderRoom.connect('mock://local', 'sender-token', 'FINALIZE1', senderEvents);
+  await receiverRoom.connect('mock://local', 'receiver-token', 'FINALIZE1', receiverEvents);
+  await senderRoom.flush();
+  await receiverRoom.flush();
+  const directSender = new MockDirectChannel('mock-sender');
+  const directReceiver = new MockDirectChannel('mock-receiver');
+  directSender.peer = directReceiver;
+  directReceiver.peer = directSender;
+  senderRoom.setDirectChannel(directSender);
+  receiverRoom.setDirectChannel(directReceiver);
+  const largeBytes = new Uint8Array(36 * 1024 * 1024);
+  largeBytes.fill(0xa5);
+  let firstSendReturned = false;
+  let senderObservedSaved = false;
+  const sequence = (async () => {
+    await senderRoom.sendFile(memFile('large.bin', largeBytes), (_sent, _total, saved) => {
+      if (saved) {
+        senderObservedSaved = true;
+        completionOrder.push('sender-final-ack');
+      }
+    });
+    firstSendReturned = true;
+    await senderRoom.sendFile(memFile('next.bin', new Uint8Array(8192)));
+  })();
+  await saveStarted;
+  await new Promise((resolve) => setTimeout(resolve, 8_500));
+  check(!firstSendReturned, 'sendFile remains pending during >8s receiver finalization');
+  check(receiverCollected.manifests.length === 1, 'next manifest is not processed before final save ACK');
+  check(finalizingNotices > 0, 'sender is explicitly notified that the receiver is finalizing');
+  releaseSave();
+  let sequenceError: unknown;
+  await sequence.catch((e) => { sequenceError = e; });
+  await receiverRoom.flush();
+  check(!sequenceError, 'multi-file sequence completes after delayed persistence');
+  check(firstFilePersisted && senderObservedSaved, 'final ACK follows persistence and reaches sender callback');
+  check(completionOrder.indexOf('persisted') < completionOrder.indexOf('sender-final-ack'), 'sender final ACK is observed after persistence');
+  check(receiverCollected.manifests.length === 2, 'second manifest arrives only after first final ACK');
+  const failureStartedAt = Date.now();
+  let saveFailureReported = false;
+  try {
+    await senderRoom.sendFile(memFile('disk-full.bin', new Uint8Array(4096)));
+  } catch (e) {
+    saveFailureReported = String(e).includes('receiver failed to finalize file');
+  }
+  check(saveFailureReported && Date.now() - failureStartedAt < 5_000, 'receiver save failure is ACKed promptly without full finalize timeout');
+  await senderRoom.close();
+  await receiverRoom.close();
+
   await roomA.close();
   await roomB.close();
 
@@ -275,3 +373,4 @@ main().catch((e) => {
   console.error('FATAL', e);
   throw e;
 });
+import type { DirectChannel } from '../src/p2p.js';

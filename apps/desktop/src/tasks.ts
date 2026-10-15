@@ -50,6 +50,49 @@ export function errText(e: unknown): string {
   return '未知错误';
 }
 
+interface SavedReceivedFileResult {
+  path: string;
+  writeAllMs: number;
+  syncAllMs: number;
+}
+
+async function saveReceivedFile(
+  taskId: string,
+  transferId: string,
+  dir: string,
+  name: string,
+  data: Uint8Array,
+  relPath: string | null,
+): Promise<string> {
+  const xfer = transferId.slice(0, 8);
+  const size = data.byteLength;
+  const startedAt = Date.now();
+  log('xfer', 'Tauri save IPC start', { taskId, xfer, size });
+  try {
+    const result = await invoke<SavedReceivedFileResult>('save_received_file', {
+      dir,
+      name,
+      data,
+      relPath,
+    });
+    log('xfer', 'Rust write_all stage', {
+      taskId, xfer, size, status: 'ok', elapsedMs: result.writeAllMs,
+    });
+    log('xfer', 'Rust sync_all stage', {
+      taskId, xfer, size, status: 'ok', elapsedMs: result.syncAllMs,
+    });
+    log('xfer', 'Tauri save IPC end', {
+      taskId, xfer, size, status: 'ok', elapsedMs: Date.now() - startedAt,
+    });
+    return result.path;
+  } catch (e) {
+    log('xfer', 'Tauri save IPC end', {
+      taskId, xfer, size, status: 'error', elapsedMs: Date.now() - startedAt,
+    });
+    throw e;
+  }
+}
+
 /** 发送框里的一个条目（快照） */
 export interface ComposeItem {
   uid: string;
@@ -151,6 +194,8 @@ export class SendTask {
   private ackResolve: ((ok: boolean) => void) | null = null;
   private peerFailures: { name: string; size: number; error: string }[] = [];
   private currentSendingItem: ItemState | null = null;
+  private currentPeerProgressTarget: number | null = null;
+  private currentFileFinalizing = false;
   private lobbyLeave?: () => void;
   private announceTimer?: ReturnType<typeof setInterval>;
   private waitTimer?: ReturnType<typeof setTimeout>;
@@ -305,11 +350,19 @@ export class SendTask {
               item.error = failure.error;
             }
           }
-          log('task', 'task-failed received', { taskId, failures });
+          log('task', 'task-failed received', { taskId, failureCount: failures.length });
           this.ackResolve?.(false);
           this.notify();
         },
         onDirectFallback: (reason) => this.onDirectFallback(reason),
+        onFileFinalizing: (id, size) => {
+          this.currentFileFinalizing = true;
+          log('p2p', 'receiver finalizing; pause byte-stall watchdog', {
+            taskId: this.taskId,
+            xfer: id.slice(0, 8),
+            size,
+          });
+        },
         onTaskProgress: (taskId, doneBytes, totalBytes) => {
           if (taskId === this.taskId) {
             const previousPeerDone = this.peerDoneBytes;
@@ -397,6 +450,10 @@ export class SendTask {
         const src = this.source[i];
         const st = this.items[i];
         this.currentSendingItem = src.kind === 'text' ? null : st;
+        this.currentFileFinalizing = false;
+        this.currentPeerProgressTarget = src.kind === 'text'
+          ? null
+          : this.items.slice(0, i + 1).reduce((sum, item) => sum + item.totalBytes, 0);
         if (src.kind !== 'text' && !p2pAwaited) {
           p2pAwaited = true;
           const ready = (await this.p2pReady?.catch(() => 'failed' as const)) ?? 'failed';
@@ -422,16 +479,20 @@ export class SendTask {
             if (!blob) throw new Error('文件内容不可用');
             const file = wrapWebFile(blob, src.name, src.relPath);
             const directFileTransfer = this.room?.directActive === true;
-            const onFileProgress = (sent: number) => {
+            const peerTarget = this.currentPeerProgressTarget!;
+            let receiverSaved = false;
+            const onFileProgress = (sent: number, _total: number, saved = false) => {
+              if (saved) {
+                receiverSaved = true;
+                this.currentFileFinalizing = false;
+              }
               // A relay replay uses the same manifest and must not make the
               // local progress display jump backwards either.
               st.doneBytes = Math.max(st.doneBytes, sent);
               this.trackSpeed(this.doneBytes);
               this.notify();
             };
-            const manifest = await this.room!.sendFile(file, (sent) => {
-              onFileProgress(sent);
-            }, src.kind);
+            const manifest = await this.room!.sendFile(file, onFileProgress, src.kind);
             st.sha256 = manifest.sha256;
             st.mimeType = manifest.mimeType;
 
@@ -446,10 +507,7 @@ export class SendTask {
             // This is required for both direct and relay modes: after a direct
             // fallback, relay publish() can finish long before the receiver
             // has drained the reliable LiveKit queue.
-            const peerTarget = this.items
-              .slice(0, i + 1)
-              .reduce((sum, item) => sum + item.totalBytes, 0);
-            let confirmed = await this.waitForPeerProgress(
+            let confirmed = receiverSaved || await this.waitForPeerProgress(
               peerTarget,
               directPathStillActive
                 ? DIRECT_PEER_PROGRESS_TIMEOUT_MS
@@ -514,10 +572,12 @@ export class SendTask {
         } catch (e) {
           st.status = 'error';
           st.error = (e as Error).message || '发送失败';
-          log('xfer', 'send item error', { taskId: this.taskId, name: st.name, error: st.error });
+          log('xfer', 'send item error', { taskId: this.taskId, size: st.size, status: 'error' });
         }
         this.notify();
         this.currentSendingItem = null;
+        this.currentPeerProgressTarget = null;
+        this.currentFileFinalizing = false;
         // Do not enqueue later files after one item has lost end-to-end
         // confirmation. Continuing here used to turn a single relay stall
         // into an even larger LiveKit queue and made the UI show e.g. 3/5
@@ -573,7 +633,6 @@ export class SendTask {
         ok: `${okCount}/${this.items.length}`,
         p2p: this.p2p,
         acked,
-        error: this.error,
       });
       void flushLogs();
       await this.archive();
@@ -659,6 +718,10 @@ export class SendTask {
         return;
       }
       const silentMs = Date.now() - this.lastPeerProgressAt;
+      if (
+        this.currentFileFinalizing ||
+        (this.currentPeerProgressTarget !== null && this.peerDoneBytes >= this.currentPeerProgressTarget)
+      ) return;
       if (silentMs < DIRECT_PEER_PROGRESS_TIMEOUT_MS) return;
       const reason = `peer progress timeout (${silentMs}ms)`;
       log('p2p', 'peer progress stalled, falling back to relay', {
@@ -1033,7 +1096,6 @@ export class RecvTask {
         taskId: this.taskId,
         peer: this.peerLabel,
         via: this.via,
-        savedDir: this.savedDir,
         items: this.items.map((i) => ({ kind: i.kind, name: i.name, size: i.size })),
       });
       const spec =
@@ -1098,6 +1160,9 @@ export class RecvTask {
   }
 
   private onManifest(m: FileManifest): void {
+    const startedAt = Date.now();
+    const xfer = m.id.slice(0, 8);
+    log('xfer', 'manifest processing start', { taskId: this.taskId, xfer, size: m.size });
     // 诊断：manifest 重复到达会导致条目错配、doneBytes 虚高
     const dup = this.manifestToItem.has(m.id);
     // 按 offer 顺序匹配（data channel 有序可靠），辅以 文件名+大小 兜底
@@ -1150,6 +1215,9 @@ export class RecvTask {
       matchMode,
       queueLeft: this.fileQueue.length,
       itemsCount: this.items.length,
+    });
+    log('xfer', 'manifest processing end', {
+      taskId: this.taskId, xfer, size: m.size, status: 'ok', elapsedMs: Date.now() - startedAt,
     });
     if (dup || matchMode === 'queue-mismatch!') {
       log('xfer', 'MANIFEST ANOMALY', {
@@ -1228,7 +1296,7 @@ export class RecvTask {
     item.status = 'error';
     item.error = err;
     this.settlePendingFile(id);
-    log('xfer', 'item failed', { taskId: this.taskId, name: item.name, error: err });
+    log('xfer', 'item failed', { taskId: this.taskId, xfer: id.slice(0, 8), size: item.totalBytes, status: 'error' });
     this.notify();
   }
 
@@ -1246,23 +1314,13 @@ export class RecvTask {
         // 剪贴板图片存为 PNG 文件，不直接写入系统剪贴板（避免覆盖用户剪贴板内容）；
         // 用户需要时去历史记录里点"复制到剪贴板"
         const name = /\.png$/i.test(m.name) ? m.name : m.name + '.png';
-        const savedPath = (await invoke('save_received_file', {
-          dir: this.savedDir,
-          name,
-          data: bytes,
-          relPath: null,
-        })) as string;
-        log('xfer', 'clipboard image saved', { taskId: this.taskId, name, size: bytes.length, path: savedPath });
+        const savedPath = await saveReceivedFile(this.taskId, id, this.savedDir, name, bytes, null);
+        log('xfer', 'clipboard image saved', { taskId: this.taskId, xfer: id.slice(0, 8), size: bytes.length });
         item.savedPath = savedPath;
         if (bytes.length < HIST_IMAGE_LIMIT) this.clipImages.set(item.uid, bytes);
       } else {
-        const savedPath = (await invoke('save_received_file', {
-          dir: this.savedDir,
-          name: m.name,
-          data: bytes,
-          relPath: m.path ?? null,
-        })) as string;
-        log('xfer', 'item saved', { taskId: this.taskId, name: m.name, size: bytes.length, path: savedPath });
+        const savedPath = await saveReceivedFile(this.taskId, id, this.savedDir, m.name, bytes, m.path ?? null);
+        log('xfer', 'item saved', { taskId: this.taskId, xfer: id.slice(0, 8), size: bytes.length });
         item.savedPath = savedPath;
       }
       item.status = 'done';
@@ -1270,7 +1328,7 @@ export class RecvTask {
     } catch (e) {
       item.status = 'error';
       item.error = errText(e);
-      log('xfer', 'item save failed', { taskId: this.taskId, name: item.name, error: item.error });
+      log('xfer', 'item save failed', { taskId: this.taskId, xfer: id.slice(0, 8), size: bytes.length, status: 'error' });
       this.notify();
       throw e;
     } finally {
@@ -1429,7 +1487,7 @@ export class RecvTask {
       phase: this.phase,
       failed,
       p2p: this.p2p,
-      items: this.items.map((i) => ({ kind: i.kind, name: i.name, status: i.status, error: i.error })),
+      items: this.items.map((i) => ({ kind: i.kind, size: i.totalBytes, status: i.status })),
     });
     void flushLogs();
     await this.archive();
@@ -1472,7 +1530,7 @@ export class RecvTask {
       try {
         await this.room.sendTaskFailed(this.taskId, failures);
         await this.room.flush();
-        log('task', 'task-failed sent', { taskId: this.taskId, failures });
+        log('task', 'task-failed sent', { taskId: this.taskId, failureCount: failures.length });
       } catch { /* 尽力通知发送方具体失败原因 */ }
     }
     await this.closeRoom();

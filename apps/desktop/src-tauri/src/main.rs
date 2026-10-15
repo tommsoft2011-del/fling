@@ -366,13 +366,21 @@ fn write_binary_file(path: String, data_b64: String) -> Result<(), String> {
 /// (appends " (1)", " (2)", … on collision), returns the final path.
 /// `rel_path`: 文件夹发送时的相对路径（如 "docs/report.pdf"），按此重建子目录；
 /// 为空时保持旧行为（直接存 dir 下）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveReceivedFileResult {
+    path: String,
+    write_all_ms: f64,
+    sync_all_ms: f64,
+}
+
 #[tauri::command]
 fn save_received_file(
     dir: String,
     name: String,
     data: Vec<u8>,
     rel_path: Option<String>,
-) -> Result<String, String> {
+) -> Result<SaveReceivedFileResult, String> {
     let bytes = data;
 
     // 取 basename，去掉非法字符
@@ -429,10 +437,18 @@ fn save_received_file(
         }
     };
     use std::io::Write;
-    if let Err(e) = temp_file.write_all(&bytes).and_then(|_| temp_file.sync_all()) {
+    let write_started = std::time::Instant::now();
+    if let Err(e) = temp_file.write_all(&bytes) {
         let _ = std::fs::remove_file(&temp_path);
         return Err(format!("写入失败: {e}"));
     }
+    let write_all_ms = write_started.elapsed().as_secs_f64() * 1000.0;
+    let sync_started = std::time::Instant::now();
+    if let Err(e) = temp_file.sync_all() {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!("写入失败: {e}"));
+    }
+    let sync_all_ms = sync_started.elapsed().as_secs_f64() * 1000.0;
     drop(temp_file);
 
     let (stem, ext) = match clean.rfind('.') {
@@ -445,7 +461,11 @@ fn save_received_file(
         match std::fs::hard_link(&temp_path, &candidate) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&temp_path);
-                return Ok(candidate.to_string_lossy().into_owned());
+                return Ok(SaveReceivedFileResult {
+                    path: candidate.to_string_lossy().into_owned(),
+                    write_all_ms,
+                    sync_all_ms,
+                });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) if matches!(e.kind(), std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput) => {
@@ -463,7 +483,11 @@ fn save_received_file(
                             return Err(format!("写入失败: {err}"));
                         }
                         let _ = std::fs::remove_file(&temp_path);
-                        return Ok(candidate.to_string_lossy().into_owned());
+                        return Ok(SaveReceivedFileResult {
+                            path: candidate.to_string_lossy().into_owned(),
+                            write_all_ms,
+                            sync_all_ms,
+                        });
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                     Err(err) => {
@@ -1162,8 +1186,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_string_lossy().into_owned();
 
-        let first = save_received_file(dir_str.clone(), "../sample.txt".into(), vec![1, 2, 3], None).unwrap();
-        let second = save_received_file(dir_str.clone(), "sample.txt".into(), vec![9, 8], None).unwrap();
+        let first_result = save_received_file(dir_str.clone(), "../sample.txt".into(), vec![1, 2, 3], None).unwrap();
+        assert!(first_result.write_all_ms.is_finite() && first_result.write_all_ms >= 0.0);
+        assert!(first_result.sync_all_ms.is_finite() && first_result.sync_all_ms >= 0.0);
+        let ipc_result = serde_json::to_value(&first_result).unwrap();
+        assert!(ipc_result.get("writeAllMs").is_some());
+        assert!(ipc_result.get("syncAllMs").is_some());
+        let first = first_result.path;
+        let second = save_received_file(dir_str.clone(), "sample.txt".into(), vec![9, 8], None).unwrap().path;
         assert_ne!(first, second);
         assert_eq!(std::fs::read(&first).unwrap(), vec![1, 2, 3]);
         assert_eq!(std::fs::read(&second).unwrap(), vec![9, 8]);
@@ -1175,7 +1205,8 @@ mod tests {
             vec![4],
             Some("../../nested/evil.txt".into()),
         )
-        .unwrap();
+        .unwrap()
+        .path;
         assert!(std::path::Path::new(&nested).starts_with(&dir));
         assert_eq!(std::fs::read(nested).unwrap(), vec![4]);
         std::fs::remove_dir_all(dir).unwrap();

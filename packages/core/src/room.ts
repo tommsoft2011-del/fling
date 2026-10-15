@@ -31,6 +31,8 @@ export interface FlingRoomEvents {
   onFileProgress?(id: string, receivedBytes: number, totalBytes: number): void;
   onFileRoute?(route: 'p2p' | 'relay', id: string): void;
   onFileComplete?(id: string, manifest: FileManifest, bytes: Uint8Array): void | Promise<void>;
+  /** All bytes arrived; receiver is assembling, hashing, or persisting the file. */
+  onFileFinalizing?(id: string, size: number): void;
   onFileError?(id: string, error: string): void;
   // v2 transfer-tool signaling. Optional so existing v1 callers (CLI)
   // keep working without changes.
@@ -69,6 +71,8 @@ const RELAY_CHUNK_WINDOW = 8;
 // P2P failure (the receiver had already got the complete file).
 const DIRECT_CHUNK_ACK_TIMEOUT_MS = 8_000;
 const RELAY_CHUNK_ACK_TIMEOUT_MS = 5_000;
+/** Bound the receiver's assemble/hash/save phase without treating it as a stalled transfer. */
+const FILE_FINALIZE_ACK_TIMEOUT_MS = 120_000;
 const DIRECT_CHUNK_ACK_EVERY = DIRECT_CHUNK_WINDOW;
 // Report real receive progress often enough to keep a slow relay alive, but
 // do not mirror every duplicate chunk.  The old 250ms cadence produced a
@@ -127,7 +131,10 @@ export class FlingRoom {
   /** Resolve functions for manifests sent over a direct channel. */
   private manifestAckWaiters = new Map<string, (ok: boolean) => void>();
   /** Highest contiguous receive position reported for each direct file. */
-  private chunkAckProgress = new Map<string, { nextSeq: number; receivedBytes: number; complete: boolean }>();
+  private chunkAckProgress = new Map<string, { nextSeq: number; receivedBytes: number; complete: boolean; failed?: boolean }>();
+  /** Sizes let the sender distinguish a full-byte ACK from a saved-file ACK. */
+  private outgoingFileSizes = new Map<string, number>();
+  private finalizingFiles = new Set<string>();
   /** Peer capability advertised by the file-manifest acknowledgement. */
   private chunkAckCapabilities = new Set<string>();
   /** Peers advertising support for raw binary direct-channel chunks. */
@@ -232,10 +239,10 @@ export class FlingRoom {
     await this.send({ kind: 'text', id: randomId(), text });
   }
 
-  /** Send a file with progress callback (sentBytes, totalBytes). */
+  /** Send a file; receiverSaved is true only after complete=true confirms persistence. */
   async sendFile(
     file: FileLike,
-    onProgress?: (sentBytes: number, totalBytes: number) => void,
+    onProgress?: (sentBytes: number, totalBytes: number, receiverSaved?: boolean) => void,
     kind: FileKind = 'file',
     /** Reuse the same id when a partially delivered file must be replayed. */
     existingManifest?: FileManifest,
@@ -243,6 +250,8 @@ export class FlingRoom {
     fromSeq = 0,
   ): Promise<FileManifest> {
     const manifest = existingManifest ?? await buildManifest(file, kind);
+    this.outgoingFileSizes.set(manifest.id, manifest.size);
+    this.finalizingFiles.delete(manifest.id);
 
     // A partial replay is a repair operation. Do not send its manifest and
     // then continue on a still-open direct path while the prefix may contain
@@ -264,10 +273,29 @@ export class FlingRoom {
     // accepted; there is no data window to acknowledge.
     if (manifest.size === 0) {
       onProgress?.(0, 0);
-    this.chunkAckProgress.delete(manifest.id);
-    this.chunkAckCapabilities.delete(manifest.id);
-    this.binaryChunkCapabilities.delete(manifest.id);
-    return manifest;
+      if (manifestResult.chunkAckCapable) {
+        this.finalizingFiles.add(manifest.id);
+        this.events.onFileFinalizing?.(manifest.id, 0);
+        const finalized = await this.waitForFileComplete(manifest, FILE_FINALIZE_ACK_TIMEOUT_MS);
+        if (!finalized) {
+          const failed = this.chunkAckProgress.get(manifest.id)?.failed;
+          this.outgoingFileSizes.delete(manifest.id);
+          this.finalizingFiles.delete(manifest.id);
+          this.chunkAckProgress.delete(manifest.id);
+          this.chunkAckCapabilities.delete(manifest.id);
+          this.binaryChunkCapabilities.delete(manifest.id);
+          throw new Error(failed
+            ? `receiver failed to finalize file (${manifest.id.slice(0, 8)})`
+            : `file finalize ack timeout (${manifest.id.slice(0, 8)})`);
+        }
+        onProgress?.(0, 0, true);
+      }
+      this.outgoingFileSizes.delete(manifest.id);
+      this.finalizingFiles.delete(manifest.id);
+      this.chunkAckProgress.delete(manifest.id);
+      this.chunkAckCapabilities.delete(manifest.id);
+      this.binaryChunkCapabilities.delete(manifest.id);
+      return manifest;
     }
 
     const sendChunk = async (seq: number): Promise<'direct' | 'relay'> => {
@@ -440,6 +468,26 @@ export class FlingRoom {
       }
       nextSeq = replayFrom;
     }
+    // A progress ACK (complete=false) only confirms that bytes reached the
+    // receiver's buffer. Do not return / permit the next manifest until the
+    // complete=true ACK after assembly, hash verification, and durable save.
+    if (manifestResult.chunkAckCapable) {
+      const finalized = await this.waitForFileComplete(manifest, FILE_FINALIZE_ACK_TIMEOUT_MS);
+      if (!finalized) {
+        const failed = this.chunkAckProgress.get(manifest.id)?.failed;
+        this.outgoingFileSizes.delete(manifest.id);
+        this.finalizingFiles.delete(manifest.id);
+        this.chunkAckProgress.delete(manifest.id);
+        this.chunkAckCapabilities.delete(manifest.id);
+        this.binaryChunkCapabilities.delete(manifest.id);
+        throw new Error(failed
+          ? `receiver failed to finalize file (${manifest.id.slice(0, 8)})`
+          : `file finalize ack timeout (${manifest.id.slice(0, 8)})`);
+      }
+      onProgress?.(file.size, file.size, true);
+    }
+    this.outgoingFileSizes.delete(manifest.id);
+    this.finalizingFiles.delete(manifest.id);
     this.chunkAckProgress.delete(manifest.id);
     this.chunkAckCapabilities.delete(manifest.id);
     this.binaryChunkCapabilities.delete(manifest.id);
@@ -580,6 +628,40 @@ export class FlingRoom {
     }
   }
 
+  /** Wait for complete=true, which is sent only after receiver-side save succeeds. */
+  private async waitForFileComplete(manifest: FileManifest, timeoutMs: number): Promise<boolean> {
+    const startedAt = Date.now();
+    let finalizingLogged = false;
+    while (this.transport.isConnected && Date.now() - startedAt < timeoutMs) {
+      const progress = this.chunkAckProgress.get(manifest.id);
+      if (progress?.complete) {
+        this.events.onLog?.('xfer', `file finalize ACK confirmed (${manifest.id.slice(0, 8)}): size=${manifest.size}, wait=${Date.now() - startedAt}ms`);
+        return true;
+      }
+      if (progress?.failed) {
+        this.events.onLog?.('xfer', `file finalize ACK failed (${manifest.id.slice(0, 8)}): size=${manifest.size}, wait=${Date.now() - startedAt}ms`);
+        return false;
+      }
+      if (!finalizingLogged && (manifest.size === 0 || (
+        (progress?.receivedBytes ?? 0) >= manifest.size &&
+        (progress?.nextSeq ?? 0) >= manifest.totalChunks
+      ))) {
+        finalizingLogged = true;
+        const newlyFinalizing = !this.finalizingFiles.has(manifest.id);
+        this.finalizingFiles.add(manifest.id);
+        if (newlyFinalizing) this.events.onFileFinalizing?.(manifest.id, manifest.size);
+        this.events.onLog?.('xfer', `file finalize wait start (${manifest.id.slice(0, 8)}): size=${manifest.size}, timeout=${timeoutMs}ms`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if (!this.transport.isConnected) {
+      this.events.onLog?.('xfer', `file finalize wait aborted (${manifest.id.slice(0, 8)}): size=${manifest.size}, wait=${Date.now() - startedAt}ms`);
+      return false;
+    }
+    this.events.onLog?.('xfer', `file finalize ACK timeout (${manifest.id.slice(0, 8)}): size=${manifest.size}, wait=${Date.now() - startedAt}ms, finalizing=${finalizingLogged}`);
+    return false;
+  }
+
   private resolveChunkAck(
     msg: Extract<FlingMessage, { kind: 'file-chunk-ack' }>,
     source: 'relay' | 'direct' = 'relay',
@@ -591,14 +673,23 @@ export class FlingRoom {
       !previous ||
       nextSeq > previous.nextSeq ||
       receivedBytes > previous.receivedBytes ||
-      (msg.complete && !previous.complete)
+      (msg.complete && !previous.complete) ||
+      (msg.failed && !previous.failed)
     ) {
       this.chunkAckProgress.set(msg.id, {
         nextSeq: Math.max(previous?.nextSeq ?? 0, nextSeq),
         receivedBytes: Math.max(previous?.receivedBytes ?? 0, receivedBytes),
         complete: Boolean(msg.complete) || Boolean(previous?.complete),
+        failed: Boolean(msg.failed) || Boolean(previous?.failed),
       });
       this.events.onLog?.('xfer', `chunk ACK received (${msg.id.slice(0, 8)}): source=${source}, next=${nextSeq}, bytes=${receivedBytes}, complete=${Boolean(msg.complete)}`);
+    }
+    const size = this.outgoingFileSizes.get(msg.id);
+    if (msg.complete || msg.failed) {
+      this.finalizingFiles.delete(msg.id);
+    } else if (size !== undefined && receivedBytes >= size && !this.finalizingFiles.has(msg.id)) {
+      this.finalizingFiles.add(msg.id);
+      this.events.onFileFinalizing?.(msg.id, size);
     }
   }
 
@@ -885,12 +976,32 @@ export class FlingRoom {
     const entry = this.incoming.get(id);
     if (!entry || entry.finalizing) return;
     entry.finalizing = true;
+    const manifest = entry.receiver.manifest;
+    const xfer = id.slice(0, 8);
     let bytes: Uint8Array;
+    const assembleStartedAt = Date.now();
+    this.events.onLog?.('xfer', `assemble/hash start (${xfer}): size=${manifest.size}`);
     try {
       bytes = await entry.receiver.assembleAsync();
-      await this.events.onFileComplete?.(id, entry.receiver.manifest, bytes);
+      this.events.onLog?.('xfer', `assemble/hash end (${xfer}): size=${manifest.size}, status=ok, elapsedMs=${Date.now() - assembleStartedAt}`);
     } catch (e) {
+      this.events.onLog?.('xfer', `assemble/hash end (${xfer}): size=${manifest.size}, status=error, elapsedMs=${Date.now() - assembleStartedAt}`);
       this.events.onFileError?.(id, (e as Error).message);
+      await this.publishFinalizeFailureAck(id, entry.receiver);
+      this.incoming.delete(id);
+      this.earlyChunks.delete(id);
+      return;
+    }
+
+    const saveStartedAt = Date.now();
+    this.events.onLog?.('xfer', `save callback start (${xfer}): size=${manifest.size}`);
+    try {
+      await this.events.onFileComplete?.(id, manifest, bytes);
+      this.events.onLog?.('xfer', `save callback end (${xfer}): size=${manifest.size}, status=ok, elapsedMs=${Date.now() - saveStartedAt}`);
+    } catch (e) {
+      this.events.onLog?.('xfer', `save callback end (${xfer}): size=${manifest.size}, status=error, elapsedMs=${Date.now() - saveStartedAt}`);
+      this.events.onFileError?.(id, (e as Error).message);
+      await this.publishFinalizeFailureAck(id, entry.receiver);
       this.incoming.delete(id);
       this.earlyChunks.delete(id);
       return;
@@ -903,6 +1014,8 @@ export class FlingRoom {
     // Do not wait for a queued progress publish: LiveKit can stall that
     // promise. The final ACK carries the monotonic total and resolveChunkAck
     // ignores any late/stale progress ACK, so it can safely be sent now.
+    const finalAckStartedAt = Date.now();
+    this.events.onLog?.('xfer', `final ACK publish start (${xfer}): size=${manifest.size}`);
     try {
       await this.send({
         kind: 'file-chunk-ack',
@@ -911,9 +1024,29 @@ export class FlingRoom {
         receivedBytes: entry.receiver.receivedByteCount,
         complete: true,
       });
+      this.events.onLog?.('xfer', `final ACK publish end (${xfer}): size=${manifest.size}, status=ok, elapsedMs=${Date.now() - finalAckStartedAt}`);
       this.events.onLog?.('xfer', `final chunk ACK sent (${id.slice(0, 8)}): bytes=${entry.receiver.receivedByteCount}`);
     } catch (e) {
+      this.events.onLog?.('xfer', `final ACK publish end (${xfer}): size=${manifest.size}, status=error, elapsedMs=${Date.now() - finalAckStartedAt}`);
       this.events.onLog?.('xfer', `final chunk ACK failed after save (${id.slice(0, 8)}): ${(e as Error).message}`);
+    }
+  }
+
+  private async publishFinalizeFailureAck(id: string, receiver: FileReceiver): Promise<void> {
+    const manifest = receiver.manifest;
+    const startedAt = Date.now();
+    try {
+      await this.send({
+        kind: 'file-chunk-ack',
+        id,
+        nextSeq: receiver.nextSeq,
+        receivedBytes: receiver.receivedByteCount,
+        complete: false,
+        failed: true,
+      });
+      this.events.onLog?.('xfer', `finalize failure ACK publish (${id.slice(0, 8)}): size=${manifest.size}, status=ok, elapsedMs=${Date.now() - startedAt}`);
+    } catch {
+      this.events.onLog?.('xfer', `finalize failure ACK publish (${id.slice(0, 8)}): size=${manifest.size}, status=error, elapsedMs=${Date.now() - startedAt}`);
     }
   }
 
@@ -1059,6 +1192,8 @@ export class FlingRoom {
     for (const resolve of this.manifestAckWaiters.values()) resolve(false);
     this.manifestAckWaiters.clear();
     this.chunkAckProgress.clear();
+    this.outgoingFileSizes.clear();
+    this.finalizingFiles.clear();
     this.chunkAckCapabilities.clear();
     this.binaryChunkCapabilities.clear();
     if (this.direct) {
