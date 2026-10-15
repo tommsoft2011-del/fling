@@ -11,6 +11,7 @@
   "name": "@fling/core",
   "scripts": {
     "test:v2": "bun test/loopback-v2.ts",
+    "test:stream": "bun test/file-stream.ts",
     "typecheck": "tsc --noEmit -p ."
   },
   "type": "module",

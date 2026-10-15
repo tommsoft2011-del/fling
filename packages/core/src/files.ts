@@ -68,17 +68,25 @@ export async function buildManifest(file: FileLike, kind: FileKind = 'file'): Pr
   };
 }
 
-/** Receiver-side reassembly with progress + sha256 verification. */
+/** Hard upper bound for one desktop write IPC payload. */
+export const FILE_RECEIVE_BATCH_SIZE = 1024 * 1024;
+
+/** Receiver-side chunk store with bounded streaming and a legacy array path. */
 export class FileReceiver {
   private chunks: (Uint8Array | undefined)[];
+  /** Compact presence map survives after chunk payloads are released. */
+  private present: Uint8Array;
   private receivedBytes = 0;
+  private receivedChunks = 0;
+  private consuming = false;
+  private consumed = false;
   /** The first chunk not yet present in the contiguous prefix. */
   private nextMissingSeq = 0;
 
   constructor(readonly manifest: FileManifest) {
-    // NOTE: must .fill() — a bare new Array(n) has holes which .every() skips,
-    // making isComplete() vacuously true.
+    // A presence bitmap avoids scanning payload references after streaming.
     this.chunks = new Array<Uint8Array | undefined>(manifest.totalChunks).fill(undefined);
+    this.present = new Uint8Array(manifest.totalChunks);
   }
 
   get totalBytes(): number {
@@ -101,7 +109,7 @@ export class FileReceiver {
     if (!Number.isInteger(seq) || seq < 0 || seq >= this.manifest.totalChunks) {
       throw new Error('invalid chunk sequence');
     }
-    if (this.chunks[seq]) return this.isComplete();
+    if (this.present[seq]) return this.isComplete();
     return this.addChunkBytes(seq, b64decode(dataB64));
   }
 
@@ -110,7 +118,8 @@ export class FileReceiver {
     if (!Number.isInteger(seq) || seq < 0 || seq >= this.manifest.totalChunks) {
       throw new Error('invalid chunk sequence');
     }
-    if (this.chunks[seq]) return this.isComplete();
+    if (this.present[seq]) return this.isComplete();
+    if (this.consuming || this.consumed) throw new Error('file finalization already started');
     const expectedBytes = Math.min(
       this.manifest.chunkSize,
       Math.max(0, this.manifest.size - seq * this.manifest.chunkSize),
@@ -119,11 +128,13 @@ export class FileReceiver {
       throw new Error(`invalid chunk size (got ${bytes.byteLength}, want ${expectedBytes})`);
     }
     this.chunks[seq] = bytes;
+    this.present[seq] = 1;
     this.receivedBytes += bytes.byteLength;
+    this.receivedChunks++;
     // Direct delivery is ordered today, but relay replay and a future
     // unordered channel are allowed to fill holes. Keep this incremental so
     // an ACK does not scan the whole file on every chunk.
-    while (this.nextMissingSeq < this.chunks.length && this.chunks[this.nextMissingSeq]) {
+    while (this.nextMissingSeq < this.chunks.length && this.present[this.nextMissingSeq]) {
       this.nextMissingSeq++;
     }
     return this.isComplete();
@@ -134,35 +145,96 @@ export class FileReceiver {
   }
 
   isComplete(): boolean {
-    return this.manifest.size === 0 || this.chunks.every((c) => c !== undefined);
+    return this.manifest.size === 0 || this.receivedChunks === this.manifest.totalChunks;
   }
 
-  /** Concatenate and verify in bounded turns so a large file cannot starve network callbacks. */
+  /**
+   * Consume a complete file in bounded batches. The callback is awaited before
+   * the next batch is allocated, providing backpressure to disk/IPC sinks.
+   * The sink is responsible for validating the manifest hash before commit.
+   */
+  async streamTo(
+    writeBatch: (bytes: Uint8Array, writtenBytes: number) => Promise<void>,
+    batchSize = FILE_RECEIVE_BATCH_SIZE,
+  ): Promise<void> {
+    if (!this.isComplete()) throw new Error('missing chunks');
+    if (this.consuming || this.consumed) throw new Error('file finalization already started');
+    if (!Number.isInteger(batchSize) || batchSize <= 0 || batchSize > FILE_RECEIVE_BATCH_SIZE) {
+      throw new Error(`invalid stream batch size (max ${FILE_RECEIVE_BATCH_SIZE})`);
+    }
+
+    this.consuming = true;
+    let seq = 0;
+    let chunkOffset = 0;
+    let written = 0;
+    try {
+      while (written < this.manifest.size) {
+        const length = Math.min(batchSize, this.manifest.size - written);
+        const batch = new Uint8Array(length);
+        let batchOffset = 0;
+        while (batchOffset < length) {
+          const chunk = this.chunks[seq];
+          if (!chunk) throw new Error('missing chunks');
+          const take = Math.min(chunk.byteLength - chunkOffset, length - batchOffset);
+          batch.set(chunk.subarray(chunkOffset, chunkOffset + take), batchOffset);
+          batchOffset += take;
+          chunkOffset += take;
+          if (chunkOffset === chunk.byteLength) {
+            this.chunks[seq] = undefined;
+            seq++;
+            chunkOffset = 0;
+          }
+        }
+        await writeBatch(batch, written + length);
+        written += length;
+        // Give network/UI callbacks a turn even when the sink resolves quickly.
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      if (written !== this.manifest.size) throw new Error('streamed size mismatch');
+    } finally {
+      // On success or failure, release all references; duplicate frames remain
+      // recognizable through `present` without retaining their payload.
+      this.chunks.fill(undefined);
+      this.consuming = false;
+      this.consumed = true;
+    }
+  }
+
+  /** Concatenate and verify for legacy non-desktop consumers such as the CLI. */
   async assembleAsync(): Promise<Uint8Array> {
-    const out = new Uint8Array(this.manifest.size);
+    if (!this.isComplete()) throw new Error('missing chunks');
+    if (this.consuming || this.consumed) throw new Error('file finalization already started');
+    this.consuming = true;
     const hash = sha256.create();
     let off = 0;
     let nextYieldAt = 4 * 1024 * 1024;
-    for (let i = 0; i < this.chunks.length; i++) {
-      if (this.manifest.size === 0) break;
-      const c = this.chunks[i];
-      if (!c) throw new Error('missing chunks');
-      out.set(c, off);
-      hash.update(c);
-      off += c.length;
-      // The completed file is now represented by `out`; release each chunk
-      // reference as soon as it has been copied and hashed.
-      this.chunks[i] = undefined;
-      if (off >= nextYieldAt) {
-        await new Promise<void>((resolve) => setTimeout(resolve, 0));
-        nextYieldAt = off + 4 * 1024 * 1024;
+    try {
+      const out = new Uint8Array(this.manifest.size);
+      for (let i = 0; i < this.chunks.length; i++) {
+        if (this.manifest.size === 0) break;
+        const c = this.chunks[i];
+        if (!c) throw new Error('missing chunks');
+        out.set(c, off);
+        hash.update(c);
+        off += c.length;
+        // The completed file is now represented by `out`; release each chunk
+        // reference as soon as it has been copied and hashed.
+        this.chunks[i] = undefined;
+        if (off >= nextYieldAt) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          nextYieldAt = off + 4 * 1024 * 1024;
+        }
       }
+      const digest = bytesToHex(hash.digest());
+      if (digest !== this.manifest.sha256) {
+        throw new Error(`sha256 mismatch (got ${digest.slice(0, 12)}…, want ${this.manifest.sha256.slice(0, 12)}…)`);
+      }
+      return out;
+    } finally {
+      this.chunks.fill(undefined);
+      this.consuming = false;
+      this.consumed = true;
     }
-    const digest = bytesToHex(hash.digest());
-    if (digest !== this.manifest.sha256) {
-      throw new Error(`sha256 mismatch (got ${digest.slice(0, 12)}…, want ${this.manifest.sha256.slice(0, 12)}…)`);
-    }
-    return out;
   }
 
   static encodeChunk(bytes: Uint8Array): string {

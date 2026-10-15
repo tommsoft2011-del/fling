@@ -304,15 +304,21 @@ async function main(): Promise<void> {
   const saveGate = new Promise<void>((resolve) => { releaseSave = resolve; });
   let firstFilePersisted = false;
   const completionOrder: string[] = [];
-  receiverEvents.onFileComplete = async (id, manifest, bytes) => {
+  receiverEvents.onFileCompleteStream = async (id, manifest, receiver) => {
+    if (manifest.name === 'disk-full.bin') throw new Error('simulated disk failure');
+    let gateUsed = false;
+    await receiver.streamTo(async () => {
+      if (manifest.name === 'large.bin' && !gateUsed) {
+        gateUsed = true;
+        signalSaveStarted();
+        await saveGate;
+      }
+    });
     if (manifest.name === 'large.bin') {
-      signalSaveStarted();
-      await saveGate;
       firstFilePersisted = true;
       completionOrder.push('persisted');
     }
-    if (manifest.name === 'disk-full.bin') throw new Error('simulated disk failure');
-    receiverCollected.completed.push({ id, manifest, bytes });
+    receiverCollected.completed.push({ id, manifest, bytes: new Uint8Array(0) });
   };
   await senderRoom.connect('mock://local', 'sender-token', 'FINALIZE1', senderEvents);
   await receiverRoom.connect('mock://local', 'receiver-token', 'FINALIZE1', receiverEvents);

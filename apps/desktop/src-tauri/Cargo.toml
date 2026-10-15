@@ -1,6 +1,6 @@
 [package]
 name = "fling-desktop"
-version = "0.5.42"
+version = "0.5.43"
 description = "Fling — fling text and files between your devices"
 authors = ["tommsoft2011-del"]
 edition = "2021"
@@ -27,6 +27,7 @@ dirs = "6"
 hostname = "0.4"
 rand = "0.9"
 open = "5"
+sha2 = "0.10"
 
 [features]
 default = [ "custom-protocol" ]

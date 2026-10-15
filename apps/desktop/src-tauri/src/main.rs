@@ -11,8 +11,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
 
@@ -504,6 +507,291 @@ fn save_received_file(
     }
     let _ = std::fs::remove_file(&temp_path);
     Err("无法生成不重名的文件名".to_string())
+}
+
+fn received_file_target(
+    dir: &str,
+    name: &str,
+    rel_path: Option<&str>,
+) -> Result<(std::path::PathBuf, String), String> {
+    let base = std::path::Path::new(name)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let clean: String = base
+        .chars()
+        .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        .collect();
+    let clean = clean.trim();
+    let clean = if clean.is_empty() { "file".to_string() } else { clean.to_string() };
+    let dir_path = std::path::PathBuf::from(dir);
+    let target_dir = match rel_path {
+        Some(rel) if !rel.trim().is_empty() => {
+            let mut sub = std::path::PathBuf::new();
+            for comp in rel.replace('\\', "/").split('/') {
+                let c = comp.trim();
+                if c.is_empty() || c == "." || c == ".." {
+                    continue;
+                }
+                let safe: String = c
+                    .chars()
+                    .filter(|ch| !matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+                    .collect();
+                let safe = safe.trim();
+                if !safe.is_empty() {
+                    sub.push(safe);
+                }
+            }
+            sub.pop();
+            let target = dir_path.join(sub);
+            std::fs::create_dir_all(&target).map_err(|e| format!("创建目录失败: {e}"))?;
+            target
+        }
+        _ => {
+            std::fs::create_dir_all(&dir_path).map_err(|e| format!("创建目录失败: {e}"))?;
+            dir_path
+        }
+    };
+    Ok((target_dir, clean))
+}
+
+fn create_received_temp_file(
+    target_dir: &std::path::Path,
+) -> Result<(std::path::PathBuf, std::fs::File), String> {
+    loop {
+        let temp = target_dir.join(format!(".fling-{}.tmp", new_device_id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("创建临时文件失败: {e}")),
+        }
+    }
+}
+
+fn commit_received_temp_file(
+    temp_path: &std::path::Path,
+    target_dir: &std::path::Path,
+    clean: &str,
+    write_all_ms: f64,
+    sync_all_ms: f64,
+) -> Result<SaveReceivedFileResult, String> {
+    let (stem, ext) = match clean.rfind('.') {
+        Some(i) if i > 0 => (clean[..i].to_string(), clean[i..].to_string()),
+        _ => (clean.to_string(), String::new()),
+    };
+    for i in 0..10_000u32 {
+        let filename = if i == 0 { clean.to_string() } else { format!("{stem} ({i}){ext}") };
+        let candidate = target_dir.join(filename);
+        match std::fs::hard_link(temp_path, &candidate) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(temp_path);
+                return Ok(SaveReceivedFileResult {
+                    path: candidate.to_string_lossy().into_owned(),
+                    write_all_ms,
+                    sync_all_ms,
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput) => {
+                match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+                    Ok(mut destination) => {
+                        let copied = (|| -> Result<(), String> {
+                            let mut source = std::fs::File::open(temp_path)
+                                .map_err(|err| format!("重开临时文件失败: {err}"))?;
+                            std::io::copy(&mut source, &mut destination)
+                                .map_err(|err| format!("写入失败: {err}"))?;
+                            destination.sync_all().map_err(|err| format!("写入失败: {err}"))?;
+                            Ok(())
+                        })();
+                        if let Err(err) = copied {
+                            let _ = std::fs::remove_file(&candidate);
+                            let _ = std::fs::remove_file(temp_path);
+                            return Err(err);
+                        }
+                        let _ = std::fs::remove_file(temp_path);
+                        return Ok(SaveReceivedFileResult {
+                            path: candidate.to_string_lossy().into_owned(),
+                            write_all_ms,
+                            sync_all_ms,
+                        });
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => {
+                        let _ = std::fs::remove_file(temp_path);
+                        return Err(format!("创建目标文件失败: {err}"));
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(temp_path);
+                return Err(format!("原子保存失败: {e}"));
+            }
+        }
+    }
+    let _ = std::fs::remove_file(temp_path);
+    Err("无法生成不重名的文件名".to_string())
+}
+
+struct StreamingReceivedFile {
+    temp_path: std::path::PathBuf,
+    file: Option<std::fs::File>,
+    target_dir: std::path::PathBuf,
+    clean_name: String,
+    expected_size: u64,
+    expected_sha256: String,
+    written: u64,
+    hasher: Sha256,
+    write_all_ms: f64,
+}
+
+impl Drop for StreamingReceivedFile {
+    fn drop(&mut self) {
+        self.file.take();
+        let _ = std::fs::remove_file(&self.temp_path);
+    }
+}
+
+#[derive(Clone, Default)]
+struct ReceivedFileStore {
+    sessions: Arc<Mutex<HashMap<String, StreamingReceivedFile>>>,
+}
+
+impl ReceivedFileStore {
+    fn begin(
+        &self,
+        dir: String,
+        name: String,
+        rel_path: Option<String>,
+        expected_size: u64,
+        expected_sha256: String,
+    ) -> Result<String, String> {
+        if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("invalid expected sha256".to_string());
+        }
+        let (target_dir, clean_name) = received_file_target(&dir, &name, rel_path.as_deref())?;
+        let mut sessions = self.sessions.lock().map_err(|e| format!("receive file lock: {e}"))?;
+        let (temp_path, file) = create_received_temp_file(&target_dir)?;
+        let session_id = loop {
+            let id = new_device_id();
+            if !sessions.contains_key(&id) {
+                break id;
+            }
+        };
+        sessions.insert(session_id.clone(), StreamingReceivedFile {
+            temp_path,
+            file: Some(file),
+            target_dir,
+            clean_name,
+            expected_size,
+            expected_sha256,
+            written: 0,
+            hasher: Sha256::new(),
+            write_all_ms: 0.0,
+        });
+        Ok(session_id)
+    }
+
+    fn append(&self, session_id: &str, data: &[u8]) -> Result<(), String> {
+        let result = (|| -> Result<(), String> {
+            let mut sessions = self.sessions.lock().map_err(|e| format!("receive file lock: {e}"))?;
+            let session = sessions.get_mut(session_id).ok_or_else(|| "unknown receive file session".to_string())?;
+            let next_size = session.written.checked_add(data.len() as u64)
+                .ok_or_else(|| "received file size overflow".to_string())?;
+            if next_size > session.expected_size {
+                return Err("received more bytes than declared".to_string());
+            }
+            let started = std::time::Instant::now();
+            session.file.as_mut().ok_or_else(|| "receive file is already closed".to_string())?
+                .write_all(data).map_err(|e| format!("写入失败: {e}"))?;
+            session.write_all_ms += started.elapsed().as_secs_f64() * 1000.0;
+            session.hasher.update(data);
+            session.written = next_size;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = self.abort(session_id);
+        }
+        result
+    }
+
+    fn finish(&self, session_id: &str) -> Result<SaveReceivedFileResult, String> {
+        let mut session = self.sessions.lock()
+            .map_err(|e| format!("receive file lock: {e}"))?
+            .remove(session_id)
+            .ok_or_else(|| "unknown receive file session".to_string())?;
+        if session.written != session.expected_size {
+            return Err(format!("received file size mismatch (got {}, want {})", session.written, session.expected_size));
+        }
+        let digest = format!("{:x}", session.hasher.clone().finalize());
+        if !digest.eq_ignore_ascii_case(&session.expected_sha256) {
+            return Err("sha256 mismatch while saving received file".to_string());
+        }
+        let file = session.file.take().ok_or_else(|| "receive file is already closed".to_string())?;
+        let sync_started = std::time::Instant::now();
+        file.sync_all().map_err(|e| format!("写入失败: {e}"))?;
+        let sync_all_ms = sync_started.elapsed().as_secs_f64() * 1000.0;
+        drop(file);
+        commit_received_temp_file(
+            &session.temp_path,
+            &session.target_dir,
+            &session.clean_name,
+            session.write_all_ms,
+            sync_all_ms,
+        )
+    }
+
+    fn abort(&self, session_id: &str) -> Result<(), String> {
+        let session = self.sessions.lock()
+            .map_err(|e| format!("receive file lock: {e}"))?
+            .remove(session_id);
+        drop(session);
+        Ok(())
+    }
+}
+
+#[tauri::command]
+async fn begin_received_file(
+    store: tauri::State<'_, ReceivedFileStore>,
+    dir: String,
+    name: String,
+    rel_path: Option<String>,
+    expected_size: u64,
+    expected_sha256: String,
+) -> Result<String, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.begin(dir, name, rel_path, expected_size, expected_sha256))
+        .await.map_err(|e| format!("开始接收文件失败: {e}"))?
+}
+
+#[tauri::command]
+async fn append_received_file_chunk(
+    store: tauri::State<'_, ReceivedFileStore>,
+    session_id: String,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.append(&session_id, &data))
+        .await.map_err(|e| format!("写入接收文件失败: {e}"))?
+}
+
+#[tauri::command]
+async fn finish_received_file(
+    store: tauri::State<'_, ReceivedFileStore>,
+    session_id: String,
+) -> Result<SaveReceivedFileResult, String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.finish(&session_id))
+        .await.map_err(|e| format!("完成接收文件失败: {e}"))?
+}
+
+#[tauri::command]
+async fn abort_received_file(
+    store: tauri::State<'_, ReceivedFileStore>,
+    session_id: String,
+) -> Result<(), String> {
+    let store = store.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.abort(&session_id))
+        .await.map_err(|e| format!("清理接收文件失败: {e}"))?
 }
 
 fn history_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -1025,6 +1313,7 @@ fn main() {
             let (_, cfg) = ensure_config(app.handle())?;
             let (tx, rx) = mpsc::channel::<DiscoveryCmd>();
             app.manage(ConfigLock(Mutex::new(())));
+            app.manage(ReceivedFileStore::default());
             app.manage(RemoteConfig(Mutex::new(None)));
             app.manage(DiscoveryState { tx });
             let handle = app.handle().clone();
@@ -1043,6 +1332,10 @@ fn main() {
             pick_save_path,
             write_binary_file,
             save_received_file,
+            begin_received_file,
+            append_received_file_chunk,
+            finish_received_file,
+            abort_received_file,
             get_device_info,
             set_device_name,
             get_download_dir,
@@ -1209,6 +1502,98 @@ mod tests {
         .path;
         assert!(std::path::Path::new(&nested).starts_with(&dir));
         assert_eq!(std::fs::read(nested).unwrap(), vec![4]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn streaming_save_handles_123mb_hash_and_repeated_name_without_overwrite() {
+        use std::io::Read;
+        let dir = std::env::temp_dir().join(format!("fling-stream-large-{}", new_device_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_string_lossy().into_owned();
+        let store = ReceivedFileStore::default();
+        let size = 122_891_016u64;
+        let mut expected_hasher = Sha256::new();
+        let mut offset = 0u64;
+        let mut batch = vec![0u8; 1024 * 1024];
+        while offset < size {
+            let length = std::cmp::min(batch.len() as u64, size - offset) as usize;
+            for (index, byte) in batch[..length].iter_mut().enumerate() {
+                *byte = ((offset + index as u64) % 251) as u8;
+            }
+            expected_hasher.update(&batch[..length]);
+            offset += length as u64;
+        }
+        let expected_hash = format!("{:x}", expected_hasher.finalize());
+        let session = store.begin(dir_str.clone(), "../large.bin".into(), None, size, expected_hash.clone()).unwrap();
+        offset = 0;
+        while offset < size {
+            let length = std::cmp::min(batch.len() as u64, size - offset) as usize;
+            for (index, byte) in batch[..length].iter_mut().enumerate() {
+                *byte = ((offset + index as u64) % 251) as u8;
+            }
+            store.append(&session, &batch[..length]).unwrap();
+            offset += length as u64;
+        }
+        let first = store.finish(&session).unwrap();
+        assert_eq!(std::fs::metadata(&first.path).unwrap().len(), size);
+        assert!(first.write_all_ms.is_finite() && first.write_all_ms >= 0.0);
+        assert!(first.sync_all_ms.is_finite() && first.sync_all_ms >= 0.0);
+        let mut file = std::fs::File::open(&first.path).unwrap();
+        let mut actual_hasher = Sha256::new();
+        let mut read_buffer = vec![0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut read_buffer).unwrap();
+            if read == 0 { break; }
+            actual_hasher.update(&read_buffer[..read]);
+        }
+        assert_eq!(format!("{:x}", actual_hasher.finalize()), expected_hash);
+
+        let second_bytes = b"second file";
+        let second_hash = format!("{:x}", Sha256::digest(second_bytes));
+        let second_session = store.begin(dir_str, "large.bin".into(), None, second_bytes.len() as u64, second_hash).unwrap();
+        store.append(&second_session, second_bytes).unwrap();
+        let second = store.finish(&second_session).unwrap();
+        assert_ne!(first.path, second.path);
+        assert_eq!(std::fs::read(&first.path).unwrap().len() as u64, size);
+        assert_eq!(std::fs::read(&second.path).unwrap(), second_bytes);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn streaming_save_supports_multiple_sessions_and_cleans_interrupted_or_invalid_files() {
+        let dir = std::env::temp_dir().join(format!("fling-stream-cleanup-{}", new_device_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_string_lossy().into_owned();
+        let store = ReceivedFileStore::default();
+        let a = b"alpha";
+        let b = b"bravo-two";
+        let a_session = store.begin(dir_str.clone(), "a.bin".into(), Some("batch/a.bin".into()), a.len() as u64, format!("{:x}", Sha256::digest(a))).unwrap();
+        let b_session = store.begin(dir_str.clone(), "b.bin".into(), Some("batch/b.bin".into()), b.len() as u64, format!("{:x}", Sha256::digest(b))).unwrap();
+        store.append(&a_session, &a[..2]).unwrap();
+        store.append(&b_session, &b[..4]).unwrap();
+        store.append(&a_session, &a[2..]).unwrap();
+        store.append(&b_session, &b[4..]).unwrap();
+        let saved_a = store.finish(&a_session).unwrap();
+        let saved_b = store.finish(&b_session).unwrap();
+        assert_eq!(std::fs::read(saved_a.path).unwrap(), a);
+        assert_eq!(std::fs::read(saved_b.path).unwrap(), b);
+
+        let aborted = store.begin(dir_str.clone(), "interrupted.bin".into(), None, 100, format!("{:x}", Sha256::digest(b"x"))).unwrap();
+        store.append(&aborted, b"partial").unwrap();
+        store.abort(&aborted).unwrap();
+        let invalid = store.begin(dir_str.clone(), "bad-hash.bin".into(), None, 3, "0".repeat(64)).unwrap();
+        store.append(&invalid, b"bad").unwrap();
+        assert!(store
+            .finish(&invalid)
+            .err()
+            .unwrap()
+            .contains("sha256 mismatch"));
+        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| {
+            !entry.unwrap().file_name().to_string_lossy().starts_with(".fling-")
+        }));
+        assert!(!dir.join("interrupted.bin").exists());
+        assert!(!dir.join("bad-hash.bin").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

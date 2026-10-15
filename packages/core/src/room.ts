@@ -31,6 +31,8 @@ export interface FlingRoomEvents {
   onFileProgress?(id: string, receivedBytes: number, totalBytes: number): void;
   onFileRoute?(route: 'p2p' | 'relay', id: string): void;
   onFileComplete?(id: string, manifest: FileManifest, bytes: Uint8Array): void | Promise<void>;
+  /** Desktop sinks consume bounded batches and verify before finalizing the save. */
+  onFileCompleteStream?(id: string, manifest: FileManifest, receiver: FileReceiver): void | Promise<void>;
   /** All bytes arrived; receiver is assembling, hashing, or persisting the file. */
   onFileFinalizing?(id: string, size: number): void;
   onFileError?(id: string, error: string): void;
@@ -978,29 +980,27 @@ export class FlingRoom {
     entry.finalizing = true;
     const manifest = entry.receiver.manifest;
     const xfer = id.slice(0, 8);
-    let bytes: Uint8Array;
-    const assembleStartedAt = Date.now();
-    this.events.onLog?.('xfer', `assemble/hash start (${xfer}): size=${manifest.size}`);
+    let stage = 'assemble/hash';
+    let stageStartedAt = Date.now();
     try {
-      bytes = await entry.receiver.assembleAsync();
-      this.events.onLog?.('xfer', `assemble/hash end (${xfer}): size=${manifest.size}, status=ok, elapsedMs=${Date.now() - assembleStartedAt}`);
+      if (this.events.onFileCompleteStream) {
+        stage = 'stream save callback';
+        this.events.onLog?.('xfer', `stream save callback start (${xfer}): size=${manifest.size}`);
+        await this.events.onFileCompleteStream(id, manifest, entry.receiver);
+        this.events.onLog?.('xfer', `stream save callback end (${xfer}): size=${manifest.size}, status=ok, elapsedMs=${Date.now() - stageStartedAt}`);
+      } else {
+        this.events.onLog?.('xfer', `assemble/hash start (${xfer}): size=${manifest.size}`);
+        const bytes = await entry.receiver.assembleAsync();
+        this.events.onLog?.('xfer', `assemble/hash end (${xfer}): size=${manifest.size}, status=ok, elapsedMs=${Date.now() - stageStartedAt}`);
+        stage = 'save callback';
+        stageStartedAt = Date.now();
+        this.events.onLog?.('xfer', `save callback start (${xfer}): size=${manifest.size}`);
+        await this.events.onFileComplete?.(id, manifest, bytes);
+        this.events.onLog?.('xfer', `save callback end (${xfer}): size=${manifest.size}, status=ok, elapsedMs=${Date.now() - stageStartedAt}`);
+      }
     } catch (e) {
-      this.events.onLog?.('xfer', `assemble/hash end (${xfer}): size=${manifest.size}, status=error, elapsedMs=${Date.now() - assembleStartedAt}`);
-      this.events.onFileError?.(id, (e as Error).message);
-      await this.publishFinalizeFailureAck(id, entry.receiver);
-      this.incoming.delete(id);
-      this.earlyChunks.delete(id);
-      return;
-    }
-
-    const saveStartedAt = Date.now();
-    this.events.onLog?.('xfer', `save callback start (${xfer}): size=${manifest.size}`);
-    try {
-      await this.events.onFileComplete?.(id, manifest, bytes);
-      this.events.onLog?.('xfer', `save callback end (${xfer}): size=${manifest.size}, status=ok, elapsedMs=${Date.now() - saveStartedAt}`);
-    } catch (e) {
-      this.events.onLog?.('xfer', `save callback end (${xfer}): size=${manifest.size}, status=error, elapsedMs=${Date.now() - saveStartedAt}`);
-      this.events.onFileError?.(id, (e as Error).message);
+      this.events.onLog?.('xfer', `${stage} end (${xfer}): size=${manifest.size}, status=error, elapsedMs=${Date.now() - stageStartedAt}`);
+      this.events.onFileError?.(id, e instanceof Error ? e.message : String(e));
       await this.publishFinalizeFailureAck(id, entry.receiver);
       this.incoming.delete(id);
       this.earlyChunks.delete(id);

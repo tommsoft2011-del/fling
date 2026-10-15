@@ -5,6 +5,7 @@ import { listen } from '@tauri-apps/api/event';
 import { writeText as writeClipboardText } from '@tauri-apps/plugin-clipboard-manager';
 import {
   wrapWebFile,
+  type FileReceiver,
   type FileManifest,
   type FlingMessage,
   type OfferItem,
@@ -61,20 +62,35 @@ async function saveReceivedFile(
   transferId: string,
   dir: string,
   name: string,
-  data: Uint8Array,
+  receiver: FileReceiver,
   relPath: string | null,
+  onBatch?: (bytes: Uint8Array) => void,
+  onProgress?: (writtenBytes: number) => void,
 ): Promise<string> {
   const xfer = transferId.slice(0, 8);
-  const size = data.byteLength;
+  const size = receiver.totalBytes;
   const startedAt = Date.now();
-  log('xfer', 'Tauri save IPC start', { taskId, xfer, size });
+  let sessionId: string | undefined;
+  let lastProgressLog = 0;
+  log('xfer', 'Tauri streaming save IPC start', { taskId, xfer, size });
   try {
-    const result = await invoke<SavedReceivedFileResult>('save_received_file', {
+    sessionId = await invoke<string>('begin_received_file', {
       dir,
       name,
-      data,
       relPath,
+      expectedSize: size,
+      expectedSha256: receiver.manifest.sha256,
     });
+    await receiver.streamTo(async (bytes, writtenBytes) => {
+      await invoke('append_received_file_chunk', { sessionId, data: bytes });
+      onBatch?.(bytes);
+      onProgress?.(writtenBytes);
+      if (writtenBytes - lastProgressLog >= 8 * 1024 * 1024 || writtenBytes === size) {
+        log('xfer', 'stream save progress', { taskId, xfer, size, writtenBytes });
+        lastProgressLog = writtenBytes;
+      }
+    });
+    const result = await invoke<SavedReceivedFileResult>('finish_received_file', { sessionId });
     log('xfer', 'Rust write_all stage', {
       taskId, xfer, size, status: 'ok', elapsedMs: result.writeAllMs,
     });
@@ -86,6 +102,13 @@ async function saveReceivedFile(
     });
     return result.path;
   } catch (e) {
+    if (sessionId) {
+      try {
+        await invoke('abort_received_file', { sessionId });
+      } catch {
+        // The backend also drops unfinished temp files when a session fails.
+      }
+    }
     log('xfer', 'Tauri save IPC end', {
       taskId, xfer, size, status: 'error', elapsedMs: Date.now() - startedAt,
     });
@@ -1110,9 +1133,9 @@ export class RecvTask {
           const item = this.manifestToItem.get(id);
           if (item) item.transport = mergeTransport(item.transport, route);
         },
-        onFileComplete: (id, m, bytes) => {
+        onFileCompleteStream: (id, m, receiver) => {
           // 落盘是异步的：跟踪起来，finish(true) 需要等它们全部完成再发 task-ack
-          const p = this.onFileComplete(id, m, bytes);
+          const p = this.onFileComplete(id, m, receiver);
           this.pendingSaves.add(p);
           void p.finally(() => this.pendingSaves.delete(p)).catch(() => {});
           return p;
@@ -1300,27 +1323,37 @@ export class RecvTask {
     this.notify();
   }
 
-  private async onFileComplete(id: string, m: FileManifest, bytes: Uint8Array): Promise<void> {
+  private async onFileComplete(id: string, m: FileManifest, receiver: FileReceiver): Promise<void> {
     const item = this.manifestToItem.get(id);
     if (!item) return;
     // A small file may finish within the 1s throttle window. Send its exact
     // received byte count immediately so the sender can advance to the next
     // file without relying on the final task-ack.
     this.reportProgress(true);
-    // sha256 已在 assemble() 里校验过（不一致会抛错进 catch），这里记录供历史核对
+    // Rust 在增量写入时核对 SHA-256；这里只记录通过保存验证后的 manifest 值供历史核对。
     item.sha256 = m.sha256;
     try {
+      const keepImageBytes = m.kind === 'clipboard-image' && m.size < HIST_IMAGE_LIMIT
+        ? new Uint8Array(m.size)
+        : undefined;
+      let imageOffset = 0;
+      const onBatch = keepImageBytes
+        ? (batch: Uint8Array) => {
+            keepImageBytes.set(batch, imageOffset);
+            imageOffset += batch.byteLength;
+          }
+        : undefined;
       if (m.kind === 'clipboard-image') {
         // 剪贴板图片存为 PNG 文件，不直接写入系统剪贴板（避免覆盖用户剪贴板内容）；
         // 用户需要时去历史记录里点"复制到剪贴板"
         const name = /\.png$/i.test(m.name) ? m.name : m.name + '.png';
-        const savedPath = await saveReceivedFile(this.taskId, id, this.savedDir, name, bytes, null);
-        log('xfer', 'clipboard image saved', { taskId: this.taskId, xfer: id.slice(0, 8), size: bytes.length });
+        const savedPath = await saveReceivedFile(this.taskId, id, this.savedDir, name, receiver, null, onBatch, () => this.notify());
+        log('xfer', 'clipboard image saved', { taskId: this.taskId, xfer: id.slice(0, 8), size: m.size });
         item.savedPath = savedPath;
-        if (bytes.length < HIST_IMAGE_LIMIT) this.clipImages.set(item.uid, bytes);
+        if (keepImageBytes) this.clipImages.set(item.uid, keepImageBytes);
       } else {
-        const savedPath = await saveReceivedFile(this.taskId, id, this.savedDir, m.name, bytes, m.path ?? null);
-        log('xfer', 'item saved', { taskId: this.taskId, xfer: id.slice(0, 8), size: bytes.length });
+        const savedPath = await saveReceivedFile(this.taskId, id, this.savedDir, m.name, receiver, m.path ?? null, onBatch, () => this.notify());
+        log('xfer', 'item saved', { taskId: this.taskId, xfer: id.slice(0, 8), size: m.size });
         item.savedPath = savedPath;
       }
       item.status = 'done';
@@ -1328,7 +1361,7 @@ export class RecvTask {
     } catch (e) {
       item.status = 'error';
       item.error = errText(e);
-      log('xfer', 'item save failed', { taskId: this.taskId, xfer: id.slice(0, 8), size: bytes.length, status: 'error' });
+      log('xfer', 'item save failed', { taskId: this.taskId, xfer: id.slice(0, 8), size: m.size, status: 'error' });
       this.notify();
       throw e;
     } finally {
