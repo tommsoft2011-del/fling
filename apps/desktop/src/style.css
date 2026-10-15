@@ -424,7 +424,7 @@ button { font: inherit; cursor: pointer; }
 .tdetail-row .tdot.active { color: var(--accent); }
 /* 固定列宽：文件名截断、进度条等长、大小右对齐 */
 .tdetail-row .tname { width: 180px; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
-.tdetail-row .tprog { width: 44px; flex-shrink: 0; font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 600; }
+.tdetail-row .tprog { width: 136px; flex-shrink: 0; white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 600; }
 .tdetail-row .pbar { flex: 1; min-width: 80px; }
 .tdetail-row .tsize { width: 70px; flex-shrink: 0; text-align: right; font-variant-numeric: tabular-nums; }
 /* ---------- 接收页：底部任务抽屉（与发送页同构，ListView 风格） ---------- */

@@ -644,6 +644,14 @@ struct StreamingReceivedFile {
     write_all_ms: f64,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppendReceivedFileResult {
+    bytes: usize,
+    cumulative_bytes: u64,
+    write_elapsed_ms: f64,
+}
+
 impl Drop for StreamingReceivedFile {
     fn drop(&mut self) {
         self.file.take();
@@ -691,8 +699,8 @@ impl ReceivedFileStore {
         Ok(session_id)
     }
 
-    fn append(&self, session_id: &str, data: &[u8]) -> Result<(), String> {
-        let result = (|| -> Result<(), String> {
+    fn append(&self, session_id: &str, data: &[u8]) -> Result<AppendReceivedFileResult, String> {
+        let result = (|| -> Result<AppendReceivedFileResult, String> {
             let mut sessions = self.sessions.lock().map_err(|e| format!("receive file lock: {e}"))?;
             let session = sessions.get_mut(session_id).ok_or_else(|| "unknown receive file session".to_string())?;
             let next_size = session.written.checked_add(data.len() as u64)
@@ -703,10 +711,15 @@ impl ReceivedFileStore {
             let started = std::time::Instant::now();
             session.file.as_mut().ok_or_else(|| "receive file is already closed".to_string())?
                 .write_all(data).map_err(|e| format!("写入失败: {e}"))?;
-            session.write_all_ms += started.elapsed().as_secs_f64() * 1000.0;
+            let write_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            session.write_all_ms += write_elapsed_ms;
             session.hasher.update(data);
             session.written = next_size;
-            Ok(())
+            Ok(AppendReceivedFileResult {
+                bytes: data.len(),
+                cumulative_bytes: next_size,
+                write_elapsed_ms,
+            })
         })();
         if result.is_err() {
             let _ = self.abort(session_id);
@@ -768,7 +781,7 @@ async fn append_received_file_chunk(
     store: tauri::State<'_, ReceivedFileStore>,
     session_id: String,
     data: Vec<u8>,
-) -> Result<(), String> {
+) -> Result<AppendReceivedFileResult, String> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || store.append(&session_id, &data))
         .await.map_err(|e| format!("写入接收文件失败: {e}"))?
@@ -1515,7 +1528,7 @@ mod tests {
         let size = 122_891_016u64;
         let mut expected_hasher = Sha256::new();
         let mut offset = 0u64;
-        let mut batch = vec![0u8; 1024 * 1024];
+        let mut batch = vec![0u8; 4 * 1024 * 1024];
         while offset < size {
             let length = std::cmp::min(batch.len() as u64, size - offset) as usize;
             for (index, byte) in batch[..length].iter_mut().enumerate() {
@@ -1527,14 +1540,23 @@ mod tests {
         let expected_hash = format!("{:x}", expected_hasher.finalize());
         let session = store.begin(dir_str.clone(), "../large.bin".into(), None, size, expected_hash.clone()).unwrap();
         offset = 0;
+        let mut last_append = None;
         while offset < size {
             let length = std::cmp::min(batch.len() as u64, size - offset) as usize;
             for (index, byte) in batch[..length].iter_mut().enumerate() {
                 *byte = ((offset + index as u64) % 251) as u8;
             }
-            store.append(&session, &batch[..length]).unwrap();
+            last_append = Some(store.append(&session, &batch[..length]).unwrap());
             offset += length as u64;
         }
+        let final_append = last_append.unwrap();
+        assert_eq!(final_append.cumulative_bytes, size);
+        assert_eq!(final_append.bytes as u64, size % (4 * 1024 * 1024));
+        assert!(final_append.write_elapsed_ms.is_finite() && final_append.write_elapsed_ms >= 0.0);
+        let append_ipc = serde_json::to_value(&final_append).unwrap();
+        assert_eq!(append_ipc.get("bytes").and_then(|v| v.as_u64()), Some(final_append.bytes as u64));
+        assert_eq!(append_ipc.get("cumulativeBytes").and_then(|v| v.as_u64()), Some(size));
+        assert!(append_ipc.get("writeElapsedMs").is_some());
         let first = store.finish(&session).unwrap();
         assert_eq!(std::fs::metadata(&first.path).unwrap().len(), size);
         assert!(first.write_all_ms.is_finite() && first.write_all_ms >= 0.0);
@@ -1589,6 +1611,17 @@ mod tests {
             .err()
             .unwrap()
             .contains("sha256 mismatch"));
+        let overflow = store
+            .begin(
+                dir_str.clone(),
+                "overflow.bin".into(),
+                None,
+                3,
+                format!("{:x}", Sha256::digest(b"ok")),
+            )
+            .unwrap();
+        assert!(store.append(&overflow, b"four").is_err());
+        assert!(store.finish(&overflow).is_err());
         assert!(std::fs::read_dir(&dir).unwrap().all(|entry| {
             !entry.unwrap().file_name().to_string_lossy().starts_with(".fling-")
         }));

@@ -69,7 +69,7 @@ export async function buildManifest(file: FileLike, kind: FileKind = 'file'): Pr
 }
 
 /** Hard upper bound for one desktop write IPC payload. */
-export const FILE_RECEIVE_BATCH_SIZE = 1024 * 1024;
+export const FILE_RECEIVE_BATCH_SIZE = 4 * 1024 * 1024;
 
 /** Receiver-side chunk store with bounded streaming and a legacy array path. */
 export class FileReceiver {
@@ -96,6 +96,13 @@ export class FileReceiver {
   /** Aggregate bytes already present, including chunks after a hole. */
   get receivedByteCount(): number {
     return this.receivedBytes;
+  }
+
+  /** Payload bytes still retained in memory (released progressively by streamTo). */
+  get retainedChunkBytes(): number {
+    let bytes = 0;
+    for (const chunk of this.chunks) bytes += chunk?.byteLength ?? 0;
+    return bytes;
   }
 
   /** The next contiguous chunk needed by a sender doing windowed replay. */
@@ -149,7 +156,7 @@ export class FileReceiver {
   }
 
   /**
-   * Consume a complete file in bounded batches. The callback is awaited before
+   * Consume a complete file in bounded 4 MiB batches. The callback is awaited before
    * the next batch is allocated, providing backpressure to disk/IPC sinks.
    * The sink is responsible for validating the manifest hash before commit.
    */
@@ -168,9 +175,10 @@ export class FileReceiver {
     let chunkOffset = 0;
     let written = 0;
     try {
+      const batchBuffer = new Uint8Array(batchSize);
       while (written < this.manifest.size) {
         const length = Math.min(batchSize, this.manifest.size - written);
-        const batch = new Uint8Array(length);
+        const batch = batchBuffer.subarray(0, length);
         let batchOffset = 0;
         while (batchOffset < length) {
           const chunk = this.chunks[seq];

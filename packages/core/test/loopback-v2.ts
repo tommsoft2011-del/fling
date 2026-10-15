@@ -287,7 +287,7 @@ async function main(): Promise<void> {
   check(m2.kind === 'file', 'default kind is file');
   check(colB.manifests[colB.manifests.length - 1]?.manifest.kind === 'file', 'receiver sees kind=file');
 
-  console.log('== loopback: 36MiB multi-file finalize ACK regression ==');
+  console.log('== loopback: 122,891,016-byte multi-file finalize ACK regression ==');
   const delayedHub = new Hub();
   const senderRoom = new FlingRoom(new MockTransport(delayedHub, 'sender-large'), 'Sender');
   const receiverRoom = new FlingRoom(new MockTransport(delayedHub, 'receiver-large'), 'Receiver');
@@ -330,7 +330,7 @@ async function main(): Promise<void> {
   directReceiver.peer = directSender;
   senderRoom.setDirectChannel(directSender);
   receiverRoom.setDirectChannel(directReceiver);
-  const largeBytes = new Uint8Array(36 * 1024 * 1024);
+  const largeBytes = new Uint8Array(122_891_016);
   largeBytes.fill(0xa5);
   let firstSendReturned = false;
   let senderObservedSaved = false;

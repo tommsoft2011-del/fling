@@ -62,12 +62,15 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
   };
   const renderDetail = () => {
     detail.innerHTML = '';
+    const savingProgress = dir === 'recv' ? (task as RecvTask).savingProgress : undefined;
     // "正在传送 x/y" 提示
     const activeIdx = task.items.findIndex((i) => i.status === 'active');
     const doneCount = task.items.filter((i) => i.status === 'done').length;
     if (task.active) {
       const hint = el('div', 'tdetail-hint',
-        activeIdx >= 0 ? `正在传送 ${activeIdx + 1}/${task.items.length}` : `已完成 ${doneCount}/${task.items.length}`);
+        savingProgress && activeIdx >= 0 ? `正在保存 ${activeIdx + 1}/${task.items.length}`
+          : activeIdx >= 0 ? `正在传送 ${activeIdx + 1}/${task.items.length}`
+            : `已完成 ${doneCount}/${task.items.length}`);
       detail.appendChild(hint);
     }
     // 发送端：按接收端上报的总进度，依文件顺序推算每个文件"对方已确认"字节。
@@ -78,6 +81,8 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
       const r = el('div', 'tdetail-row');
       let fileDoneB = it.doneBytes;
       let confirmedDone = it.status === 'done';
+      const saving = dir === 'recv' && it.saving === true;
+      if (saving) fileDoneB = it.saveBytes ?? 0;
       if (remainingConfirmed >= 0 && it.kind !== 'text') {
         const itConfirmed = Math.max(0, Math.min(it.totalBytes, remainingConfirmed));
         remainingConfirmed -= itConfirmed;
@@ -89,7 +94,8 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
       }
       const st = confirmedDone ? '✓' : it.status === 'error' ? '✗' : it.status === 'active' ? '…' : '○';
       const p = it.totalBytes > 0 ? Math.min(100, Math.round((fileDoneB / it.totalBytes) * 100)) : 0;
-      const ptxt = confirmedDone ? '100%' : it.status === 'error' ? (it.error ?? '失败') : p + '%';
+      const ptxt = saving ? `${fmtSize(fileDoneB)} / ${fmtSize(it.totalBytes)}`
+        : confirmedDone ? '100%' : it.status === 'error' ? (it.error ?? '失败') : p + '%';
       const bar = el('div', 'pbar thin');
       const fill = el('div', 'pfill');
       fill.style.width = (confirmedDone ? 100 : p) + '%';
@@ -151,6 +157,9 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
     let statusCls = '';
     if (phase === 'preparing' || phase === 'waiting') {
       status = dir === 'send' ? (task as SendTask).waitLabel + '…' : '连接中…';
+    } else if (dir === 'recv' && (task as RecvTask).savingProgress) {
+      const saving = (task as RecvTask).savingProgress!;
+      status = `保存中 ${fmtSize(saving.bytes)} / ${fmtSize(saving.totalBytes)}`;
     } else if (phase === 'sending' || (phase as string) === 'receiving') {
       // 字节推进跟踪：3s 无推进速度显示为 0；15s 无推进显示"停滞"
       if (doneB !== lastDoneB) {

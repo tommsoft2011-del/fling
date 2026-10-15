@@ -57,6 +57,12 @@ interface SavedReceivedFileResult {
   syncAllMs: number;
 }
 
+interface AppendedReceivedFileBatchResult {
+  bytes: number;
+  cumulativeBytes: number;
+  writeElapsedMs: number;
+}
+
 async function saveReceivedFile(
   taskId: string,
   transferId: string,
@@ -72,6 +78,7 @@ async function saveReceivedFile(
   const startedAt = Date.now();
   let sessionId: string | undefined;
   let lastProgressLog = 0;
+  let failurePhase = 'begin';
   log('xfer', 'Tauri streaming save IPC start', { taskId, xfer, size });
   try {
     sessionId = await invoke<string>('begin_received_file', {
@@ -81,8 +88,20 @@ async function saveReceivedFile(
       expectedSize: size,
       expectedSha256: receiver.manifest.sha256,
     });
+    failurePhase = 'append';
     await receiver.streamTo(async (bytes, writtenBytes) => {
-      await invoke('append_received_file_chunk', { sessionId, data: bytes });
+      const invokeStartedAt = performance.now();
+      const result = await invoke<AppendedReceivedFileBatchResult>('append_received_file_chunk', { sessionId, data: bytes });
+      const invokeElapsedMs = performance.now() - invokeStartedAt;
+      if (result.bytes !== bytes.byteLength || result.cumulativeBytes !== writtenBytes) {
+        throw new Error('received file append accounting mismatch');
+      }
+      // streamTo awaits every append, so there are no queued batches behind this one.
+      log('xfer', 'stream save batch', {
+        taskId, xfer, bytes: result.bytes, invokeElapsedMs,
+        rustWriteElapsedMs: result.writeElapsedMs,
+        cumulativeBytes: result.cumulativeBytes, queueDepth: 0,
+      });
       onBatch?.(bytes);
       onProgress?.(writtenBytes);
       if (writtenBytes - lastProgressLog >= 8 * 1024 * 1024 || writtenBytes === size) {
@@ -90,6 +109,7 @@ async function saveReceivedFile(
         lastProgressLog = writtenBytes;
       }
     });
+    failurePhase = 'verify-sync-commit';
     const result = await invoke<SavedReceivedFileResult>('finish_received_file', { sessionId });
     log('xfer', 'Rust write_all stage', {
       taskId, xfer, size, status: 'ok', elapsedMs: result.writeAllMs,
@@ -111,6 +131,7 @@ async function saveReceivedFile(
     }
     log('xfer', 'Tauri save IPC end', {
       taskId, xfer, size, status: 'error', elapsedMs: Date.now() - startedAt,
+      failurePhase,
     });
     throw e;
   }
@@ -148,6 +169,9 @@ export interface ItemState {
   error?: string;
   /** 接收端落盘后的完整路径（历史记录用） */
   savedPath?: string;
+  /** 临时文件中已写入的字节；只有 durable commit 成功后 status 才会变为 done。 */
+  saveBytes?: number;
+  saving?: boolean;
   /** 文件 sha256（用于完整性核对） */
   sha256?: string;
   mimeType?: string;
@@ -1073,6 +1097,11 @@ export class RecvTask {
     return this.phase === 'receiving';
   }
 
+  get savingProgress(): { bytes: number; totalBytes: number } | undefined {
+    const item = this.items.find((candidate) => candidate.saving);
+    return item ? { bytes: item.saveBytes ?? 0, totalBytes: item.totalBytes } : undefined;
+  }
+
   private lastNotify = 0;
   private notifyTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -1326,6 +1355,9 @@ export class RecvTask {
   private async onFileComplete(id: string, m: FileManifest, receiver: FileReceiver): Promise<void> {
     const item = this.manifestToItem.get(id);
     if (!item) return;
+    item.saving = true;
+    item.saveBytes = 0;
+    this.notify();
     // A small file may finish within the 1s throttle window. Send its exact
     // received byte count immediately so the sender can advance to the next
     // file without relying on the final task-ack.
@@ -1347,18 +1379,27 @@ export class RecvTask {
         // 剪贴板图片存为 PNG 文件，不直接写入系统剪贴板（避免覆盖用户剪贴板内容）；
         // 用户需要时去历史记录里点"复制到剪贴板"
         const name = /\.png$/i.test(m.name) ? m.name : m.name + '.png';
-        const savedPath = await saveReceivedFile(this.taskId, id, this.savedDir, name, receiver, null, onBatch, () => this.notify());
+        const savedPath = await saveReceivedFile(this.taskId, id, this.savedDir, name, receiver, null, onBatch, (writtenBytes) => {
+          item.saveBytes = writtenBytes;
+          this.notify();
+        });
         log('xfer', 'clipboard image saved', { taskId: this.taskId, xfer: id.slice(0, 8), size: m.size });
         item.savedPath = savedPath;
         if (keepImageBytes) this.clipImages.set(item.uid, keepImageBytes);
       } else {
-        const savedPath = await saveReceivedFile(this.taskId, id, this.savedDir, m.name, receiver, m.path ?? null, onBatch, () => this.notify());
+        const savedPath = await saveReceivedFile(this.taskId, id, this.savedDir, m.name, receiver, m.path ?? null, onBatch, (writtenBytes) => {
+          item.saveBytes = writtenBytes;
+          this.notify();
+        });
         log('xfer', 'item saved', { taskId: this.taskId, xfer: id.slice(0, 8), size: m.size });
         item.savedPath = savedPath;
       }
+      item.saving = false;
+      item.saveBytes = item.totalBytes;
       item.status = 'done';
       item.doneBytes = item.totalBytes;
     } catch (e) {
+      item.saving = false;
       item.status = 'error';
       item.error = errText(e);
       log('xfer', 'item save failed', { taskId: this.taskId, xfer: id.slice(0, 8), size: m.size, status: 'error' });

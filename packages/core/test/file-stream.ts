@@ -45,10 +45,13 @@ async function testLargeBoundedBackpressureStream(): Promise<void> {
     check(complete === (seq === manifest.totalChunks - 1), 'completion becomes true only after all chunks arrive');
   }
   check(receiver.isComplete(), 'all 123 MB of chunks are present');
+  check(Number(receiver.retainedChunkBytes) === size, 'receive payload memory matches the declared file bytes before streaming');
 
   const receivedHash = sha256.create();
   let batches = 0;
   let maxBatchBytes = 0;
+  let batchBuffer: ArrayBufferLike | undefined;
+  let reusesSingleBatchBuffer = true;
   let activeWrites = 0;
   let maxConcurrentWrites = 0;
   let lastWritten = 0;
@@ -61,7 +64,9 @@ async function testLargeBoundedBackpressureStream(): Promise<void> {
       maxConcurrentWrites = Math.max(maxConcurrentWrites, activeWrites);
       batches++;
       maxBatchBytes = Math.max(maxBatchBytes, batch.byteLength);
-      check(batch.byteLength <= FILE_RECEIVE_BATCH_SIZE, 'IPC batch stays within the 1 MiB bound');
+      if (batchBuffer === undefined) batchBuffer = batch.buffer;
+      else if (batch.buffer !== batchBuffer) reusesSingleBatchBuffer = false;
+      check(batch.byteLength <= FILE_RECEIVE_BATCH_SIZE, 'IPC batch stays within the 4 MiB bound');
       check(writtenBytes > lastWritten && writtenBytes <= size, 'stream progress is monotonic');
       // Emulate a finite-speed Rust/IPC sink: the next batch must wait for this one.
       await new Promise<void>((resolve) => setTimeout(resolve, 1));
@@ -76,15 +81,17 @@ async function testLargeBoundedBackpressureStream(): Promise<void> {
   check(lastWritten === size, 'stream writes the exact manifest size');
   check(bytesToHex(receivedHash.digest()) === manifest.sha256, 'streamed bytes match the manifest SHA-256');
   check(maxBatchBytes <= FILE_RECEIVE_BATCH_SIZE, 'peak transient batch is bounded');
+  check(reusesSingleBatchBuffer, 'one reusable batch buffer bounds transient allocations');
   check(maxConcurrentWrites === 1, 'awaited sink provides strict backpressure');
   check(batches === Math.ceil(size / FILE_RECEIVE_BATCH_SIZE), 'sink receives the expected number of batches');
   check(uiTicks > 0, 'event loop remains responsive while streaming');
   check(elapsed > 0, 'stream path yields between batches');
+  check(receiver.retainedChunkBytes === 0, 'stream completion releases all received payload buffers');
   check(receiver.receivedByteCount === size && receiver.isComplete(), 'consuming chunks preserves receive accounting');
   // A late replay is still deduplicated although its original payload reference was released.
   receiver.addChunkBytes(0, new Uint8Array(FILE_CHUNK_SIZE));
   check(receiver.receivedByteCount === size, 'late duplicate after streaming remains deduplicated');
-  console.log(`PASS 123 MB bounded stream: ${batches} batches, max=${maxBatchBytes} bytes, ${elapsed} ms, UI ticks=${uiTicks}`);
+  console.log(`PASS 123 MB bounded stream: ${batches} awaited batches, max=${maxBatchBytes} bytes, one reusable buffer, payload bound <=${size + maxBatchBytes} bytes, ${elapsed} ms, UI ticks=${uiTicks}`);
 }
 
 async function testInterruptedStreamReleasesReceiver(): Promise<void> {
@@ -112,6 +119,7 @@ async function testInterruptedStreamReleasesReceiver(): Promise<void> {
     failed = error instanceof Error && error.message === 'simulated interrupted sink';
   }
   check(failed && calls === 1, 'sink interruption propagates immediately');
+  check(receiver.retainedChunkBytes === 0, 'interrupted stream releases all retained payload buffers');
   check(receiver.receivedByteCount === source.size && receiver.isComplete(), 'interrupted stream retains correct receive accounting');
   let retryRejected = false;
   try {
