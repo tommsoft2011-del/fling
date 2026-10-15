@@ -183,44 +183,51 @@ export class FlingRoom {
     kind: FileKind = 'file',
     /** Reuse the same id when a partially delivered file must be replayed. */
     existingManifest?: FileManifest,
+    /** Start a relay replay near the last confirmed receive position. */
+    fromSeq = 0,
   ): Promise<FileManifest> {
     const manifest = existingManifest ?? await buildManifest(file, kind);
     await this.sendManifestWithAck(manifest);
     const generationAtChunkStart = this.directGeneration;
-    let sent = 0;
-    let reported = 0;
-    let directChunksSent = false;
+    const firstSeq = Math.max(0, Math.min(manifest.totalChunks, Math.floor(fromSeq)));
+    let sent = Math.min(file.size, firstSeq * manifest.chunkSize);
+    let reported = sent;
+    const directSeqs: number[] = [];
 
     // Keep this loop reusable: if the direct path dies after accepting some
-    // chunks, replay the same manifest's chunks through the relay. The
-    // receiver de-duplicates already present chunks and fills the holes.
-    const sendChunks = async (): Promise<void> => {
-      for (let seq = 0; seq < manifest.totalChunks; seq++) {
-        const start = seq * manifest.chunkSize;
-        const bytes = await file.slice(start, Math.min(start + manifest.chunkSize, file.size));
-        const direct = this.direct?.readyState === 'open';
-        await this.send({
-          kind: 'file-chunk',
-          id: manifest.id,
-          seq,
-          data: FileReceiver.encodeChunk(bytes),
-        });
-        directChunksSent ||= direct;
-        sent += bytes.length;
-        // A replay must not make the sender UI go backwards. The task-level
-        // progress is still the receiver's authoritative value.
-        const nextReported = Math.min(file.size, Math.max(reported, sent));
-        if (nextReported > reported) {
-          reported = nextReported;
-          onProgress?.(reported, file.size);
-        }
+    // chunks, replay only the chunks that actually went through the direct
+    // path. The receiver de-duplicates already present chunks and fills the
+    // holes without flooding the relay with a second full-file copy.
+    const sendChunk = async (seq: number): Promise<void> => {
+      const start = seq * manifest.chunkSize;
+      const bytes = await file.slice(start, Math.min(start + manifest.chunkSize, file.size));
+      const route = await this.send({
+        kind: 'file-chunk',
+        id: manifest.id,
+        seq,
+        data: FileReceiver.encodeChunk(bytes),
+      });
+      if (route === 'direct') directSeqs.push(seq);
+      sent += bytes.length;
+      // A replay must not make the sender UI go backwards. The task-level
+      // progress is still the receiver's authoritative value.
+      const nextReported = Math.min(file.size, Math.max(reported, sent));
+      if (nextReported > reported) {
+        reported = nextReported;
+        onProgress?.(reported, file.size);
       }
     };
 
-    await sendChunks();
-    if (directChunksSent && this.directGeneration !== generationAtChunkStart) {
-      this.events.onLog?.('p2p', `direct path changed during ${manifest.name}; replaying chunks via relay`);
-      await sendChunks();
+    const sendChunks = async (startSeq: number): Promise<void> => {
+      for (let seq = startSeq; seq < manifest.totalChunks; seq++) {
+        await sendChunk(seq);
+      }
+    };
+
+    await sendChunks(firstSeq);
+    if (directSeqs.length > 0 && this.directGeneration !== generationAtChunkStart) {
+      this.events.onLog?.('p2p', `direct path changed during ${manifest.name}; replaying ${directSeqs.length} direct chunks via relay`);
+      for (const seq of directSeqs) await sendChunk(seq);
     }
     return manifest;
   }

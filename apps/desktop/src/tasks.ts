@@ -93,6 +93,8 @@ const WAIT_PEER_TIMEOUT_MS = 5 * 60 * 1000;
 /** Receiver reports are emitted once per second; five seconds is a dead-path watchdog. */
 const DIRECT_PEER_PROGRESS_TIMEOUT_MS = 5000;
 const DIRECT_HEALTH_CHECK_MS = 1000;
+/** Progress is an aggregate, throttled lower-bound; replay an overlap to cover interior holes. */
+const DIRECT_REPLAY_OVERLAP_CHUNKS = 64;
 
 function toOfferItem(c: ComposeItem): OfferItem {
   return {
@@ -402,19 +404,49 @@ export class SendTask {
               );
               if (!confirmed) {
                 const reason = `file progress stalled at ${this.peerDoneBytes}/${peerTarget}`;
+                const previousTarget = peerTarget - st.totalBytes;
+                const peerFileBytes = Math.min(
+                  st.totalBytes,
+                  Math.max(0, this.peerDoneBytes - previousTarget),
+                );
+                const replayFromSeq = Math.max(
+                  0,
+                  Math.floor(peerFileBytes / manifest.chunkSize) - DIRECT_REPLAY_OVERLAP_CHUNKS,
+                );
                 log('p2p', 'file confirmation stalled, replaying via relay', {
                   taskId: this.taskId,
                   name: st.name,
                   peerDoneBytes: this.peerDoneBytes,
                   peerTarget,
+                  peerFileBytes,
+                  replayFromSeq,
                   direct: this.room?.directActive ?? false,
                 });
                 this.room?.fallbackToRelay(reason);
-                await this.room!.sendFile(file, onFileProgress, src.kind, manifest);
-                await this.waitForPeerProgress(
+                await this.room!.sendFile(file, onFileProgress, src.kind, manifest, replayFromSeq);
+                let relayConfirmed = await this.waitForPeerProgress(
                   peerTarget,
                   DIRECT_PEER_PROGRESS_TIMEOUT_MS * 2,
                 );
+                // A throttled progress report can still be stale, or the first
+                // overlap may not cover an unusual interior hole. Use one full
+                // replay as a bounded last resort, but never advance to the next
+                // file while the receiver still has not confirmed this one.
+                if (!relayConfirmed && replayFromSeq > 0) {
+                  log('p2p', 'selective relay replay not confirmed, retrying full file', {
+                    taskId: this.taskId,
+                    name: st.name,
+                    replayFromSeq,
+                  });
+                  await this.room!.sendFile(file, onFileProgress, src.kind, manifest, 0);
+                  relayConfirmed = await this.waitForPeerProgress(
+                    peerTarget,
+                    DIRECT_PEER_PROGRESS_TIMEOUT_MS * 2,
+                  );
+                }
+                if (!relayConfirmed) {
+                  throw new Error('中继重传后对方仍未确认文件进度');
+                }
               }
             }
           }
