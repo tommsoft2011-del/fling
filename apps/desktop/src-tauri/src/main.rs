@@ -368,13 +368,10 @@ fn write_binary_file(path: String, data_b64: String) -> Result<(), String> {
 fn save_received_file(
     dir: String,
     name: String,
-    data_b64: String,
+    data: Vec<u8>,
     rel_path: Option<String>,
 ) -> Result<String, String> {
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&data_b64)
-        .map_err(|e| format!("base64: {e}"))?;
+    let bytes = data;
 
     // 取 basename，去掉非法字符
     let base = std::path::Path::new(&name)
@@ -743,14 +740,12 @@ fn discovery_set_discoverable(app: tauri::AppHandle, on: bool) -> Result<(), Str
 /// 读取拖放进来的文件内容（base64）。走 Rust 命令而不是 fs 插件，
 /// 避免 fs scope 挡住用户文件目录的任意路径。
 #[tauri::command]
-fn read_file_bytes(path: String) -> Result<String, String> {
-    use base64::Engine;
+fn read_file_bytes(path: String) -> Result<Vec<u8>, String> {
     let meta = std::fs::metadata(&path).map_err(|e| format!("读取文件失败: {e}"))?;
     if !meta.is_file() {
         return Err("仅支持拖入文件，暂不支持文件夹".into());
     }
-    let bytes = std::fs::read(&path).map_err(|e| format!("读取文件失败: {e}"))?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+    std::fs::read(&path).map_err(|e| format!("读取文件失败: {e}"))
 }
 
 /// 取文件大小（不读内容，供拖放时懒加载：只记路径+大小，发送时才读）。

@@ -26,7 +26,7 @@ import {
   KEY_CTX,
 } from './net.js';
 import { saveHistoryEntry, HIST_IMAGE_LIMIT, settings, type HistoryEntry } from './store.js';
-import { b64encode, b64decode, toast, uid, utf8bytes } from './ui.js';
+import { b64encode, toast, uid, utf8bytes } from './ui.js';
 import { P2PLink, type P2PState } from './p2p.js';
 import { log, flushLogs, type LogTag } from './log.js';
 import { notifyTaskDone } from './notify.js';
@@ -348,8 +348,9 @@ export class SendTask {
             // 文件夹/大文件可能是懒加载：发送时才从磁盘读
             let blob = src.blob;
             if (!blob && src.filePath) {
-              const b64 = (await invoke('read_file_bytes', { path: src.filePath })) as string;
-              blob = new Blob([b64decode(b64) as BlobPart]);
+              // read_file_bytes 直接返回 Uint8Array（Tauri 原生二进制，无 base64 开销）
+              const bytes = (await invoke('read_file_bytes', { path: src.filePath })) as unknown as Uint8Array;
+              blob = new Blob([bytes as BlobPart]);
             }
             if (!blob) throw new Error('文件内容不可用');
             await this.room!.sendFile(wrapWebFile(blob, src.name, src.relPath), (sent) => {
@@ -957,7 +958,7 @@ export class RecvTask {
         const savedPath = (await invoke('save_received_file', {
           dir: this.savedDir,
           name,
-          dataB64: b64encode(bytes),
+          data: bytes,
           relPath: null,
         })) as string;
         log('xfer', 'clipboard image saved', { taskId: this.taskId, name, size: bytes.length, path: savedPath });
@@ -967,7 +968,7 @@ export class RecvTask {
         const savedPath = (await invoke('save_received_file', {
           dir: this.savedDir,
           name: m.name,
-          dataB64: b64encode(bytes),
+          data: bytes,
           relPath: m.path ?? null,
         })) as string;
         log('xfer', 'item saved', { taskId: this.taskId, name: m.name, size: bytes.length, path: savedPath });
