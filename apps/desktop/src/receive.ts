@@ -210,14 +210,20 @@ function syncRecvDrawer(): void {
   const tasks = [...manager.recvTasks.values()].reverse();
   // 接收中行
   const host = $('#recvRows');
+  const orderedRows: HTMLElement[] = [];
   for (const t of tasks) {
     let h = rows.get(t.taskId);
     if (!h) {
       h = createTaskRow(t, 'recv');
       rows.set(t.taskId, h);
     }
-    if (!h.isGone()) host.appendChild(h.root);
+    if (!h.isGone()) orderedRows.push(h.root);
     h.update();
+  }
+  // Progress notifications should update rows in place, not move every row.
+  for (let index = 0; index < orderedRows.length; index++) {
+    const row = orderedRows[index];
+    if (host.children[index] !== row) host.insertBefore(row, host.children[index] ?? null);
   }
   for (const [id, h] of [...rows]) {
     if (!manager.recvTasks.has(id)) {

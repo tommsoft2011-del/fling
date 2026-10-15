@@ -167,9 +167,9 @@ export type FlingMessage =
   // 接收方中途取消：发送方收到后不得再标"成功"，应标"已取消"。
   | { kind: 'task-cancel'; taskId: string }
   | { kind: 'task-failed'; taskId: string; failures: { name: string; size: number; error: string }[] }
-  // 接收方周期性上报真实接收进度（发送端的"已发送"只是进了缓冲，
-  // 用接收端的数字才是用户真正关心的"对方收到了多少"）。
-  | { kind: 'task-progress'; taskId: string; doneBytes: number; totalBytes: number }
+  // 接收端上报已收到和已写入临时文件的字节数。doneBytes 保留为兼容旧版，
+  // 新版同时发送 receivedBytes 和 savedBytes，发送端不能以本机 send() 计数代替。
+  | { kind: 'task-progress'; taskId: string; doneBytes: number; receivedBytes?: number; savedBytes?: number; totalBytes: number }
   // P2P 直连信令：经 LiveKit 中继通道（端到端加密）交换 SDP / ICE，
   // 文件数据本身走直连的 RTCDataChannel，不经过 LiveKit SFU。
   | { kind: 'p2p-offer'; sdp: string }
@@ -179,6 +179,15 @@ export type FlingMessage =
 export function isFlingMessage(o: unknown): o is FlingMessage {
   if (typeof o !== 'object' || o === null) return false;
   const k = (o as { kind?: unknown }).kind;
+  if (k === 'task-progress') {
+    const msg = o as { taskId?: unknown; doneBytes?: unknown; receivedBytes?: unknown; savedBytes?: unknown; totalBytes?: unknown };
+    const isByteCount = (value: unknown): value is number =>
+      typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+    const receivedBytes = msg.receivedBytes ?? msg.doneBytes;
+    return typeof msg.taskId === 'string' &&
+      isByteCount(receivedBytes) && isByteCount(msg.totalBytes) &&
+      (msg.savedBytes === undefined || (isByteCount(msg.savedBytes) && msg.savedBytes <= receivedBytes));
+  }
   return (
     k === 'hello' ||
     k === 'text' ||
@@ -194,7 +203,6 @@ export function isFlingMessage(o: unknown): o is FlingMessage {
     k === 'task-ack' ||
     k === 'task-cancel' ||
     k === 'task-failed' ||
-    k === 'task-progress' ||
     k === 'p2p-offer' ||
     k === 'p2p-answer' ||
     k === 'p2p-ice'

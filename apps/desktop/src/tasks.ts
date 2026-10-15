@@ -81,17 +81,22 @@ async function saveReceivedFile(
   let failurePhase = 'begin';
   log('xfer', 'Tauri streaming save IPC start', { taskId, xfer, size });
   try {
-    sessionId = await invoke<string>('begin_received_file', {
+    const currentSessionId = await invoke<string>('begin_received_file', {
       dir,
       name,
       relPath,
       expectedSize: size,
       expectedSha256: receiver.manifest.sha256,
     });
+    sessionId = currentSessionId;
     failurePhase = 'append';
     await receiver.streamTo(async (bytes, writtenBytes) => {
       const invokeStartedAt = performance.now();
-      const result = await invoke<AppendedReceivedFileBatchResult>('append_received_file_chunk', { sessionId, data: bytes });
+      const result = await invoke<AppendedReceivedFileBatchResult>(
+        'append_received_file_chunk',
+        bytes,
+        { headers: { 'x-session-id': currentSessionId } },
+      );
       const invokeElapsedMs = performance.now() - invokeStartedAt;
       if (result.bytes !== bytes.byteLength || result.cumulativeBytes !== writtenBytes) {
         throw new Error('received file append accounting mismatch');
@@ -236,6 +241,8 @@ export class SendTask {
   private p2pReady: Promise<'open' | 'failed'> | null = null;
   /** 接收方上报的真实接收进度（task-progress），UI 显示"对方已接收" */
   peerDoneBytes = 0;
+  /** 接收端 Rust append 已确认的字节数；最终完成仍以提交后的 ACK 为准。 */
+  peerSavedBytes = 0;
   peerTotalBytes = 0;
   /** 等待接收方 task-ack 的 resolver（收到确认/对方离开/超时后置空） */
   private ackResolve: ((ok: boolean) => void) | null = null;
@@ -276,6 +283,9 @@ export class SendTask {
   }
   get waitLabel(): string {
     return this.target.type === 'nearby' ? '连接设备' : '等待对方加入';
+  }
+  get finalizing(): boolean {
+    return this.currentFileFinalizing;
   }
   get totalBytes(): number {
     return this.items.reduce((a, i) => a + i.totalBytes, 0);
@@ -374,6 +384,11 @@ export class SendTask {
         onTaskAck: (taskId) => {
           if (taskId === this.taskId) {
             log('task', 'task-ack received', { taskId });
+            this.peerDoneBytes = Math.max(this.peerDoneBytes, this.totalBytes);
+            this.peerSavedBytes = Math.max(this.peerSavedBytes, this.totalBytes);
+            this.peerTotalBytes = Math.max(this.peerTotalBytes, this.totalBytes);
+            this.currentFileFinalizing = false;
+            this.notify();
             this.ackResolve?.(true);
           }
         },
@@ -409,36 +424,40 @@ export class SendTask {
             xfer: id.slice(0, 8),
             size,
           });
+          this.notify();
         },
-        onTaskProgress: (taskId, doneBytes, totalBytes) => {
+        onTaskProgress: (taskId, receivedBytes, totalBytes, _from, savedBytes = 0) => {
           if (taskId === this.taskId) {
             const previousPeerDone = this.peerDoneBytes;
-            const progressAdvanced = doneBytes > previousPeerDone;
+            const received = Math.max(0, Math.floor(receivedBytes));
+            const saved = Math.max(0, Math.floor(savedBytes));
+            const progressAdvanced = received > previousPeerDone;
             if (this.phase === 'sending' && this.p2p === 'open' && this.room?.directActive && progressAdvanced) {
               this.lastPeerProgressAt = Date.now();
             }
             // 诊断：对方上报的已收到不应超过我已发送的；倒退/超发都说明计数错乱
             const mySent = this.doneBytes;
-            if (doneBytes > mySent + 65536) {
+            if (received > mySent + 65536) {
               log('xfer', 'PEER PROGRESS EXCEEDS SENT', {
-                taskId, peerDone: doneBytes, mySent, peerTotal: totalBytes,
+                taskId, peerDone: received, mySent, peerTotal: totalBytes,
               });
             }
-            if (doneBytes < this.peerDoneBytes) {
+            if (received < this.peerDoneBytes || saved < this.peerSavedBytes) {
               log('xfer', 'PEER PROGRESS BACKWARDS', {
-                taskId, was: this.peerDoneBytes, now: doneBytes,
+                taskId, receivedWas: this.peerDoneBytes, receivedNow: received,
+                savedWas: this.peerSavedBytes, savedNow: saved,
               });
-              // Relay delivery and an older direct/relay mix can expose a
-              // stale report after a newer one. Never let the UI or the
-              // direct-file confirmation target move backwards.
-              return;
             }
-            this.peerDoneBytes = doneBytes;
+            // Keep the two monotonic counters independent: a newer write ACK
+            // must not be lost behind an older received-byte report.
+            this.peerDoneBytes = Math.max(this.peerDoneBytes, received);
+            this.peerSavedBytes = Math.max(this.peerSavedBytes, Math.min(saved, received));
             this.peerTotalBytes = Math.max(this.peerTotalBytes, totalBytes);
             log('xfer', 'peer progress', {
               taskId,
-              doneBytes: this.peerDoneBytes,
-              delta: doneBytes - previousPeerDone,
+              receivedBytes: this.peerDoneBytes,
+              receivedDelta: this.peerDoneBytes - previousPeerDone,
+              savedBytes: this.peerSavedBytes,
               totalBytes: this.peerTotalBytes,
               direct: this.room?.directActive ?? false,
             });
@@ -532,6 +551,7 @@ export class SendTask {
               if (saved) {
                 receiverSaved = true;
                 this.currentFileFinalizing = false;
+                this.peerSavedBytes = Math.max(this.peerSavedBytes, peerTarget);
               }
               // A relay replay uses the same manifest and must not make the
               // local progress display jump backwards either.
@@ -1102,6 +1122,12 @@ export class RecvTask {
     return item ? { bytes: item.saveBytes ?? 0, totalBytes: item.totalBytes } : undefined;
   }
 
+  get savedBytes(): number {
+    return this.items.reduce((sum, item) => sum + (
+      item.kind === 'text' ? item.doneBytes : Math.min(item.saveBytes ?? 0, item.totalBytes)
+    ), 0);
+  }
+
   private lastNotify = 0;
   private notifyTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -1209,6 +1235,7 @@ export class RecvTask {
     }
     this.trackSpeed();
     this.notify();
+    this.reportProgress();
   }
 
   private onManifest(m: FileManifest): void {
@@ -1322,22 +1349,23 @@ export class RecvTask {
     this.lastProgressReport = now;
     const room = this.room;
     if (room) {
-      const d = this.doneBytes;
+      const receivedBytes = this.doneBytes;
+      const savedBytes = this.savedBytes;
       // 诊断：上报值不应超过 totalBytes；记录明细以便核对
-      if (d > this.totalBytes) {
+      if (receivedBytes > this.totalBytes || savedBytes > receivedBytes) {
         log('xfer', 'REPORT OVERFLOW', {
-          taskId: this.taskId, done: d, total: this.totalBytes,
-          items: this.items.map((i) => ({ name: i.name, done: i.doneBytes, total: i.totalBytes })),
+          taskId: this.taskId, receivedBytes, savedBytes, total: this.totalBytes,
+          items: this.items.map((i) => ({ name: i.name, received: i.doneBytes, saved: i.saveBytes ?? 0, total: i.totalBytes })),
         });
       }
-      void this.enqueueProgressReport(d, this.totalBytes);
+      void this.enqueueProgressReport(receivedBytes, this.totalBytes, savedBytes);
     }
   }
 
-  private enqueueProgressReport(doneBytes: number, totalBytes: number): Promise<void> {
+  private enqueueProgressReport(receivedBytes: number, totalBytes: number, savedBytes: number): Promise<void> {
     const room = this.room;
     if (!room) return Promise.resolve();
-    const next = this.progressSendChain.then(() => room.sendTaskProgress(this.taskId, doneBytes, totalBytes));
+    const next = this.progressSendChain.then(() => room.sendTaskProgress(this.taskId, receivedBytes, totalBytes, savedBytes));
     this.progressSendChain = next.catch(() => {});
     return this.progressSendChain;
   }
@@ -1382,6 +1410,7 @@ export class RecvTask {
         const savedPath = await saveReceivedFile(this.taskId, id, this.savedDir, name, receiver, null, onBatch, (writtenBytes) => {
           item.saveBytes = writtenBytes;
           this.notify();
+          this.reportProgress();
         });
         log('xfer', 'clipboard image saved', { taskId: this.taskId, xfer: id.slice(0, 8), size: m.size });
         item.savedPath = savedPath;
@@ -1390,6 +1419,7 @@ export class RecvTask {
         const savedPath = await saveReceivedFile(this.taskId, id, this.savedDir, m.name, receiver, m.path ?? null, onBatch, (writtenBytes) => {
           item.saveBytes = writtenBytes;
           this.notify();
+          this.reportProgress();
         });
         log('xfer', 'item saved', { taskId: this.taskId, xfer: id.slice(0, 8), size: m.size });
         item.savedPath = savedPath;
@@ -1398,6 +1428,8 @@ export class RecvTask {
       item.saveBytes = item.totalBytes;
       item.status = 'done';
       item.doneBytes = item.totalBytes;
+      // This exact report follows hash verification, fsync and atomic commit.
+      this.reportProgress(true);
     } catch (e) {
       item.saving = false;
       item.status = 'error';
@@ -1578,7 +1610,7 @@ export class RecvTask {
       };
       try {
         // 先发最终进度（100%），再发 ack：避免发送端停留在过期的百分比上
-        await this.enqueueProgressReport(this.doneBytes, this.totalBytes);
+        await this.enqueueProgressReport(this.doneBytes, this.totalBytes, this.savedBytes);
         sendAck();
         await room.flush().catch(() => {});
       } catch {

@@ -644,6 +644,31 @@ struct StreamingReceivedFile {
     write_all_ms: f64,
 }
 
+const MAX_RECEIVED_FILE_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
+fn raw_append_request_parts(
+    body: &tauri::ipc::InvokeBody,
+    session_id: Option<&str>,
+) -> Result<(String, Vec<u8>), String> {
+    let session_id = session_id.ok_or_else(|| "missing x-session-id header".to_string())?;
+    if session_id.len() != 32 || !session_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid receive file session id".to_string());
+    }
+    let data = match body {
+        tauri::ipc::InvokeBody::Raw(data) => data,
+        tauri::ipc::InvokeBody::Json(_) => {
+            return Err("append payload must use raw binary IPC".to_string());
+        }
+    };
+    if data.is_empty() || data.len() > MAX_RECEIVED_FILE_BATCH_BYTES {
+        return Err(format!(
+            "invalid receive batch size (got {}, max {})",
+            data.len(), MAX_RECEIVED_FILE_BATCH_BYTES
+        ));
+    }
+    Ok((session_id.to_string(), data.clone()))
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppendReceivedFileResult {
@@ -779,9 +804,13 @@ async fn begin_received_file(
 #[tauri::command]
 async fn append_received_file_chunk(
     store: tauri::State<'_, ReceivedFileStore>,
-    session_id: String,
-    data: Vec<u8>,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<AppendReceivedFileResult, String> {
+    let session_header = request
+        .headers()
+        .get("x-session-id")
+        .and_then(|value| value.to_str().ok());
+    let (session_id, data) = raw_append_request_parts(request.body(), session_header)?;
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || store.append(&session_id, &data))
         .await.map_err(|e| format!("写入接收文件失败: {e}"))?
@@ -1381,6 +1410,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn raw_append_ipc_accepts_binary_and_rejects_json_missing_headers_and_oversize() {
+        let id = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+        let raw = tauri::ipc::InvokeBody::Raw(vec![0, 1, 127, 255]);
+        let (session_id, bytes) = raw_append_request_parts(&raw, Some(id)).unwrap();
+        assert_eq!(session_id, id);
+        assert_eq!(bytes, vec![0, 1, 127, 255]);
+
+        let json = tauri::ipc::InvokeBody::Json(serde_json::json!({ "data": [0, 1, 127, 255] }));
+        assert!(raw_append_request_parts(&json, Some(id)).unwrap_err().contains("raw binary"));
+        assert!(raw_append_request_parts(&raw, None).unwrap_err().contains("missing x-session-id"));
+        assert!(raw_append_request_parts(&raw, Some("bad-session")).unwrap_err().contains("invalid receive file session id"));
+        assert!(raw_append_request_parts(&tauri::ipc::InvokeBody::Raw(Vec::new()), Some(id)).is_err());
+        assert!(raw_append_request_parts(
+            &tauri::ipc::InvokeBody::Raw(vec![0; MAX_RECEIVED_FILE_BATCH_BYTES + 1]),
+            Some(id),
+        ).unwrap_err().contains("invalid receive batch size"));
+    }
+
+    #[test]
     fn device_id_is_32_hex_and_unique() {
         let a = new_device_id();
         let b = new_device_id();
@@ -1521,6 +1569,7 @@ mod tests {
     #[test]
     fn streaming_save_handles_123mb_hash_and_repeated_name_without_overwrite() {
         use std::io::Read;
+        let benchmark_started = std::time::Instant::now();
         let dir = std::env::temp_dir().join(format!("fling-stream-large-{}", new_device_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_string_lossy().into_owned();
@@ -1541,12 +1590,15 @@ mod tests {
         let session = store.begin(dir_str.clone(), "../large.bin".into(), None, size, expected_hash.clone()).unwrap();
         offset = 0;
         let mut last_append = None;
+        let mut rust_append_elapsed_ms = 0.0;
         while offset < size {
             let length = std::cmp::min(batch.len() as u64, size - offset) as usize;
             for (index, byte) in batch[..length].iter_mut().enumerate() {
                 *byte = ((offset + index as u64) % 251) as u8;
             }
-            last_append = Some(store.append(&session, &batch[..length]).unwrap());
+            let append = store.append(&session, &batch[..length]).unwrap();
+            rust_append_elapsed_ms += append.write_elapsed_ms;
+            last_append = Some(append);
             offset += length as u64;
         }
         let final_append = last_append.unwrap();
@@ -1558,6 +1610,14 @@ mod tests {
         assert_eq!(append_ipc.get("cumulativeBytes").and_then(|v| v.as_u64()), Some(size));
         assert!(append_ipc.get("writeElapsedMs").is_some());
         let first = store.finish(&session).unwrap();
+        println!(
+            "BENCH receive-save bytes={} batches={} total_elapsed_ms={} rust_write_all_ms={:.3} sync_all_ms={:.3}",
+            size,
+            (size + (4 * 1024 * 1024 - 1)) / (4 * 1024 * 1024),
+            benchmark_started.elapsed().as_millis(),
+            rust_append_elapsed_ms,
+            first.sync_all_ms,
+        );
         assert_eq!(std::fs::metadata(&first.path).unwrap().len(), size);
         assert!(first.write_all_ms.is_finite() && first.write_all_ms >= 0.0);
         assert!(first.sync_all_ms.is_finite() && first.sync_all_ms >= 0.0);
@@ -1579,6 +1639,69 @@ mod tests {
         assert_ne!(first.path, second.path);
         assert_eq!(std::fs::read(&first.path).unwrap().len() as u64, size);
         assert_eq!(std::fs::read(&second.path).unwrap(), second_bytes);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn streaming_save_benchmarks_60mb_receive_size_and_verifies_hash() {
+        use std::io::Read;
+        let size = 63_116_252u64;
+        let benchmark_started = std::time::Instant::now();
+        let dir = std::env::temp_dir().join(format!("fling-stream-60m-{}", new_device_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = ReceivedFileStore::default();
+        let mut batch = vec![0u8; 4 * 1024 * 1024];
+        let fill_batch = |buffer: &mut [u8], offset: u64| {
+            for (index, byte) in buffer.iter_mut().enumerate() {
+                *byte = ((offset + index as u64) % 251) as u8;
+            }
+        };
+        let mut expected_hasher = Sha256::new();
+        let mut offset = 0u64;
+        while offset < size {
+            let length = std::cmp::min(batch.len() as u64, size - offset) as usize;
+            fill_batch(&mut batch[..length], offset);
+            expected_hasher.update(&batch[..length]);
+            offset += length as u64;
+        }
+        let expected_hash = format!("{:x}", expected_hasher.finalize());
+        let session = store.begin(
+            dir.to_string_lossy().into_owned(),
+            "60mib.bin".into(),
+            None,
+            size,
+            expected_hash.clone(),
+        ).unwrap();
+        offset = 0;
+        let mut rust_append_elapsed_ms = 0.0;
+        let mut batches = 0u64;
+        while offset < size {
+            let length = std::cmp::min(batch.len() as u64, size - offset) as usize;
+            fill_batch(&mut batch[..length], offset);
+            let result = store.append(&session, &batch[..length]).unwrap();
+            rust_append_elapsed_ms += result.write_elapsed_ms;
+            offset += length as u64;
+            batches += 1;
+        }
+        let saved = store.finish(&session).unwrap();
+        assert_eq!(std::fs::metadata(&saved.path).unwrap().len(), size);
+        let mut file = std::fs::File::open(&saved.path).unwrap();
+        let mut actual_hasher = Sha256::new();
+        let mut read_buffer = vec![0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut read_buffer).unwrap();
+            if read == 0 { break; }
+            actual_hasher.update(&read_buffer[..read]);
+        }
+        assert_eq!(format!("{:x}", actual_hasher.finalize()), expected_hash);
+        println!(
+            "BENCH receive-save bytes={} batches={} total_elapsed_ms={} rust_write_all_ms={:.3} sync_all_ms={:.3}",
+            size,
+            batches,
+            benchmark_started.elapsed().as_millis(),
+            rust_append_elapsed_ms,
+            saved.sync_all_ms,
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

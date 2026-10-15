@@ -49,8 +49,8 @@ export interface FlingRoomEvents {
   /** Receiver cancelled mid-transfer (see task-cancel). */
   onTaskCancel?(taskId: string, from: string): void;
   onTaskFailed?(taskId: string, failures: { name: string; size: number; error: string }[], from: string): void;
-  /** Receiver's periodic real progress report (see task-progress). */
-  onTaskProgress?(taskId: string, doneBytes: number, totalBytes: number, from: string): void;
+  /** Receiver-confirmed arrival and Rust append progress (see task-progress). */
+  onTaskProgress?(taskId: string, receivedBytes: number, totalBytes: number, from: string, savedBytes?: number): void;
   /** A direct path was found unhealthy; callers should close their P2P link. */
   onDirectFallback?(reason: string): void;
   /** Optional diagnostics sink (the app wires this to its log file). */
@@ -733,9 +733,10 @@ export class FlingRoom {
     await this.send({ kind: 'task-failed', taskId, failures: bounded });
   }
 
-  /** v2: receiver reports real receive progress (throttled by caller). */
-  async sendTaskProgress(taskId: string, doneBytes: number, totalBytes: number): Promise<void> {
-    await this.send({ kind: 'task-progress', taskId, doneBytes, totalBytes });
+  /** v2: receiver reports receive and Rust append progress (throttled by caller). */
+  async sendTaskProgress(taskId: string, receivedBytes: number, totalBytes: number, savedBytes = 0): Promise<void> {
+    // Keep doneBytes for older peers; new peers consume the explicit fields.
+    await this.send({ kind: 'task-progress', taskId, doneBytes: receivedBytes, receivedBytes, savedBytes, totalBytes });
   }
 
   private async send(msg: FlingMessage): Promise<'direct' | 'relay'> {
@@ -964,7 +965,7 @@ export class FlingRoom {
         }
         break;
       case 'task-progress':
-        this.events.onTaskProgress?.(msg.taskId, msg.doneBytes, msg.totalBytes, from);
+        this.events.onTaskProgress?.(msg.taskId, msg.receivedBytes ?? msg.doneBytes, msg.totalBytes, from, msg.savedBytes);
         break;
       case 'p2p-offer':
       case 'p2p-answer':

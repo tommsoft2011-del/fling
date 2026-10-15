@@ -11,6 +11,7 @@
 
 import { FlingRoom, type FlingRoomEvents } from '../src/room.js';
 import {
+  isFlingMessage,
   newTaskKey,
   randomId,
   type FileManifest,
@@ -177,6 +178,11 @@ function memFile(name: string, bytes: Uint8Array): FileLike {
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
+  console.log('== task-progress compatibility ==');
+  check(isFlingMessage({ kind: 'task-progress', taskId: 'old', doneBytes: 10, totalBytes: 20 }), 'legacy doneBytes task-progress remains valid');
+  check(isFlingMessage({ kind: 'task-progress', taskId: 'new', doneBytes: 15, receivedBytes: 15, savedBytes: 8, totalBytes: 20 }), 'new receivedBytes/savedBytes progress is valid');
+  check(!isFlingMessage({ kind: 'task-progress', taskId: 'bad', doneBytes: 5, receivedBytes: 5, savedBytes: 6, totalBytes: 20 }), 'rejects saved progress beyond received progress');
+
   console.log('== pairing helpers ==');
   const lobby = await lobbyNameForCode('K7Q2M9');
   check(lobby.startsWith('fling-lobby-') && lobby.length === 'fling-lobby-'.length + 16, `lobbyNameForCode format (${lobby})`);
@@ -202,10 +208,19 @@ async function main(): Promise<void> {
   const roomB = new FlingRoom(new MockTransport(hub, 'bob'), 'BobPhone');
   const colA = newCollected();
   const colB = newCollected();
-  await roomA.connect('mock://local', 'token-a', CODE, makeEvents(colA));
+  let mappedProgress: { receivedBytes: number; savedBytes?: number } | undefined;
+  const eventsA = makeEvents(colA);
+  eventsA.onTaskProgress = (_taskId, receivedBytes, _totalBytes, _from, savedBytes) => {
+    mappedProgress = { receivedBytes, savedBytes };
+  };
+  await roomA.connect('mock://local', 'token-a', CODE, eventsA);
   await roomB.connect('mock://local', 'token-b', CODE, makeEvents(colB));
   await roomA.flush();
   await roomB.flush();
+
+  await roomB.sendTaskProgress('progress-mapping', 15, 20, 8);
+  await roomA.flush();
+  check(mappedProgress?.receivedBytes === 15 && mappedProgress.savedBytes === 8, 'task-progress dispatch keeps receive and saved counters distinct');
 
   const offer: OfferMessage = {
     kind: 'offer',

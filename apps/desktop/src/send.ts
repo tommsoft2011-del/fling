@@ -608,14 +608,21 @@ function syncTaskRows(): void {
   const drawer = $('#taskDrawer');
   const list = $('#taskRows');
   const tasks = [...manager.sendTasks.values()].reverse(); // 最新在上
+  const orderedRows: HTMLElement[] = [];
   for (const t of tasks) {
     let h = rows.get(t.taskId);
     if (!h) {
       h = createTaskRow(t, 'send');
       rows.set(t.taskId, h);
     }
-    if (!h.isGone()) list.appendChild(h.root);
+    if (!h.isGone()) orderedRows.push(h.root);
     h.update();
+  }
+  // Do not re-append every row on each progress tick; move nodes only when
+  // insertion or task-order changes actually require it.
+  for (let index = 0; index < orderedRows.length; index++) {
+    const row = orderedRows[index];
+    if (list.children[index] !== row) list.insertBefore(row, list.children[index] ?? null);
   }
   for (const [id, h] of [...rows]) {
     if (!manager.sendTasks.has(id)) {

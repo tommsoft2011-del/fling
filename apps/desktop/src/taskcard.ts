@@ -2,6 +2,7 @@
 // DOM 只建一次，之后原地更新
 import type { SendTask, RecvTask } from './tasks.js';
 import { fmtSize, fmtSpeed, el } from './ui.js';
+import { replaceChildrenPreservingScroll } from './dom-utils.js';
 
 type AnyTask = SendTask | RecvTask;
 
@@ -39,16 +40,24 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
   const closeBtn = el('button', 'x', '✕') as HTMLButtonElement;
   closeBtn.title = '取消';
   top.append(arrow, peer, sum, pct, closeBtn);
-  // 总进度条置顶（纵向布局的第一条）
+  // 发送端主进度采用接收端 append 确认值，另列真实网络接收进度。
   const bars = el('div', 'trow-bars');
   const totalRow = el('div', 'tbar-row');
-  const totalLabel = el('span', 'tfile', '总计');
+  const totalLabel = el('span', 'tfile', dir === 'send' ? '对方已写入' : '总计');
   const totalBar = el('div', 'pbar thin');
   const totalFill = el('div', 'pfill');
   totalBar.appendChild(totalFill);
   const eta = el('span', 'teta', '');
   totalRow.append(totalLabel, totalBar, eta);
   bars.append(totalRow);
+  const receivedRow = dir === 'send' ? el('div', 'tbar-row') : undefined;
+  const receivedFill = dir === 'send' ? el('div', 'pfill') : undefined;
+  if (receivedRow && receivedFill) {
+    const receivedBar = el('div', 'pbar thin');
+    receivedBar.appendChild(receivedFill);
+    receivedRow.append(el('span', 'tfile', '对方已接收'), receivedBar, el('span', 'tfpct', '0%'));
+    bars.append(receivedRow);
+  }
   // 文件列表：点击上行展开/收起，每个文件自带进度条
   const detail = el('div', 'trow-detail');
   detail.hidden = true;
@@ -61,40 +70,44 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
     if (!detail.hidden) renderDetail();
   };
   const renderDetail = () => {
-    detail.innerHTML = '';
+    const content: Node[] = [];
     const savingProgress = dir === 'recv' ? (task as RecvTask).savingProgress : undefined;
     // "正在传送 x/y" 提示
     const activeIdx = task.items.findIndex((i) => i.status === 'active');
     const doneCount = task.items.filter((i) => i.status === 'done').length;
     if (task.active) {
       const hint = el('div', 'tdetail-hint',
-        savingProgress && activeIdx >= 0 ? `正在保存 ${activeIdx + 1}/${task.items.length}`
+        dir === 'send' && (task as SendTask).finalizing ? '对方已接收，正在校验并最终保存…'
+          : savingProgress && activeIdx >= 0 ? `正在保存 ${activeIdx + 1}/${task.items.length}`
           : activeIdx >= 0 ? `正在传送 ${activeIdx + 1}/${task.items.length}`
             : `已完成 ${doneCount}/${task.items.length}`);
-      detail.appendChild(hint);
+      content.push(hint);
     }
-    // 发送端：按接收端上报的总进度，依文件顺序推算每个文件"对方已确认"字节。
-    // 文件是按顺序发送的，所以 peerDoneBytes 先填满文件1，再填文件2……
-    // 这样"✓ 100%"只在对方真正收到时显示，不会出现"发送端全完成但接收端还差2个"。
-    let remainingConfirmed = dir === 'send' ? ((task as SendTask).peerDoneBytes ?? 0) : -1;
+    // 文件按顺序发送：分别把接收确认和 Rust append 确认分配到文件行。
+    let remainingReceived = dir === 'send' ? (task as SendTask).peerDoneBytes : -1;
+    let remainingSaved = dir === 'send' ? (task as SendTask).peerSavedBytes : -1;
     for (const it of task.items) {
       const r = el('div', 'tdetail-row');
       let fileDoneB = it.doneBytes;
+      let fileReceivedB = it.doneBytes;
       let confirmedDone = it.status === 'done';
       const saving = dir === 'recv' && it.saving === true;
       if (saving) fileDoneB = it.saveBytes ?? 0;
-      if (remainingConfirmed >= 0 && it.kind !== 'text') {
-        const itConfirmed = Math.max(0, Math.min(it.totalBytes, remainingConfirmed));
-        remainingConfirmed -= itConfirmed;
-        fileDoneB = itConfirmed;
-        // 只有对方确认收完才算 done（而非"我发出去了"）
-        confirmedDone = itConfirmed >= it.totalBytes && it.totalBytes > 0;
+      if (remainingReceived >= 0) {
+        fileReceivedB = Math.max(0, Math.min(it.totalBytes, remainingReceived));
+        remainingReceived -= fileReceivedB;
+        const itSaved = Math.max(0, Math.min(it.totalBytes, remainingSaved));
+        remainingSaved -= itSaved;
+        fileDoneB = itSaved;
+        // 只有 Rust append 确认、且文件最终 ACK 完成后才显示完成。
+        confirmedDone = itSaved >= it.totalBytes && it.status === 'done';
       } else if (dir !== 'send') {
         confirmedDone = it.status === 'done';
       }
       const st = confirmedDone ? '✓' : it.status === 'error' ? '✗' : it.status === 'active' ? '…' : '○';
       const p = it.totalBytes > 0 ? Math.min(100, Math.round((fileDoneB / it.totalBytes) * 100)) : 0;
-      const ptxt = saving ? `${fmtSize(fileDoneB)} / ${fmtSize(it.totalBytes)}`
+      const ptxt = dir === 'send' ? `写入 ${fmtSize(fileDoneB)} · 收到 ${fmtSize(fileReceivedB)}`
+        : saving ? `${fmtSize(fileDoneB)} / ${fmtSize(it.totalBytes)}`
         : confirmedDone ? '100%' : it.status === 'error' ? (it.error ?? '失败') : p + '%';
       const bar = el('div', 'pbar thin');
       const fill = el('div', 'pfill');
@@ -108,8 +121,9 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
         el('span', 'tsize', fmtSize(it.size)),
       );
       (r.querySelector('.tname') as HTMLElement).title = it.name;
-      detail.appendChild(r);
+      content.push(r);
     }
+    replaceChildrenPreservingScroll(detail, content);
   };
   root.append(top, bars, detail);
 
@@ -126,19 +140,27 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
     // 详情展开时跟随刷新
     if (!detail.hidden) renderDetail();
 
-    // 进度：发送端优先用对方真实接收进度
+    // 主进度：发送端以接收端的 Rust append 确认作为已写入，不采纳本机 send() 数字。
     let doneB = task.doneBytes;
     let totalB = task.totalBytes;
+    let receivedB = doneB;
     if (dir === 'send') {
-      const pd = (task as SendTask).peerDoneBytes ?? 0;
-      const pt = (task as SendTask).peerTotalBytes ?? 0;
+      const sendTask = task as SendTask;
+      const pd = sendTask.peerSavedBytes;
+      const pt = sendTask.peerTotalBytes;
+      receivedB = sendTask.peerDoneBytes;
+      doneB = pd;
       if (pt > 0) {
-        doneB = pd;
         totalB = pt;
       }
     }
     const pctNum = phase === 'done' ? 100 : totalB > 0 ? Math.min(100, Math.round((doneB / totalB) * 100)) : 0;
     totalFill.style.width = pctNum + '%';
+    if (receivedFill && receivedRow) {
+      const receivedPct = totalB > 0 ? Math.min(100, Math.round((receivedB / totalB) * 100)) : 0;
+      receivedFill.style.width = receivedPct + '%';
+      (receivedRow.querySelector('.tfpct') as HTMLElement).textContent = `${receivedPct}%`;
+    }
     totalBar.classList.toggle('live', active && (phase === 'sending' || (phase as string) === 'receiving'));
     // 右上角总百分比
     pct.textContent = pctNum + '%';
@@ -162,15 +184,22 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
       status = `保存中 ${fmtSize(saving.bytes)} / ${fmtSize(saving.totalBytes)}`;
     } else if (phase === 'sending' || (phase as string) === 'receiving') {
       // 字节推进跟踪：3s 无推进速度显示为 0；15s 无推进显示"停滞"
-      if (doneB !== lastDoneB) {
-        lastDoneB = doneB;
+      const sendTask = dir === 'send' ? task as SendTask : undefined;
+      const activityBytes = sendTask ? sendTask.peerDoneBytes : doneB;
+      if (activityBytes !== lastDoneB) {
+        lastDoneB = activityBytes;
         lastAdvanceT = Date.now();
       }
       const idleMs = Date.now() - lastAdvanceT;
       const effSpeed = idleMs > 3000 ? 0 : task.speedBps;
-      if (idleMs > 15000 && pctNum < 100) {
+      if (sendTask?.finalizing) {
+        status = '对方已接收，正在校验并最终保存…';
+      } else if (idleMs > 15000 && pctNum < 100 && !(sendTask && receivedB >= totalB)) {
         status = `⚠ 停滞 ${pctNum}%`;
         statusCls = 'bad';
+      } else if (sendTask) {
+        const receivedPct = totalB > 0 ? Math.min(100, Math.round((receivedB / totalB) * 100)) : 0;
+        status = `写入 ${pctNum}% · 已收 ${receivedPct}%` + (effSpeed > 0 ? ` · ${fmtSpeed(effSpeed)}` : '');
       } else {
         status = `${pctNum}%` + (effSpeed > 0 ? ` · ${fmtSpeed(effSpeed)}` : '');
       }
