@@ -11,6 +11,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::ReceivedFileStore;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -48,6 +49,8 @@ struct NativePeer {
     pc: Arc<RTCPeerConnection>,
     data_channel: tokio::sync::Mutex<Option<Arc<DetachedDataChannel>>>,
     receive_ack: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
+    receive_store: ReceivedFileStore,
+    files: tokio::sync::Mutex<HashMap<String, NativeFileBinding>>,
     closed: AtomicBool,
 }
 
@@ -59,11 +62,40 @@ struct NativeP2pEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     signal: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<Vec<u8>>,
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_frame: Option<NativeFileFrame>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_message_size: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct NativeFileFrame {
+    id: String,
+    seq: u32,
+    chunk_count: u32,
+    next_seq: u32,
+    received_bytes: u64,
+}
+
+#[derive(Clone)]
+struct NativeFileBinding {
+    save_session_id: String,
+    chunk_size: usize,
+    total_chunks: u32,
+    expected_size: u64,
+}
+
+struct DecodedDirectFileFrame {
+    id: String,
+    seq: u32,
+    chunk_count: u32,
+    chunk_size: Option<usize>,
+    payload_start: usize,
+    payload_len: usize,
 }
 
 impl NativePeer {
@@ -71,14 +103,16 @@ impl NativePeer {
         &self,
         event: &str,
         signal: Option<Value>,
-        data: Option<Vec<u8>>,
+        text: Option<String>,
+        file_frame: Option<NativeFileFrame>,
         error: Option<String>,
     ) {
         let payload = NativeP2pEvent {
             session_id: self.session_id.clone(),
             event: event.to_owned(),
             signal,
-            data,
+            text,
+            file_frame,
             max_message_size: (event == "open").then_some(ADVERTISED_MAX_MESSAGE_SIZE),
             error,
         };
@@ -86,7 +120,7 @@ impl NativePeer {
     }
 
     fn emit_signal(&self, signal: Value) {
-        self.emit("signal", Some(signal), None, None);
+        self.emit("signal", Some(signal), None, None, None);
     }
 }
 
@@ -155,12 +189,13 @@ fn wire_data_channel(peer: Arc<NativePeer>, channel: Arc<RTCDataChannel>) {
             match channel.detach().await {
                 Ok(detached) => {
                     *peer.data_channel.lock().await = Some(detached.clone());
-                    peer.emit("open", None, None, None);
+                    peer.emit("open", None, None, None, None);
                     tokio::spawn(read_data_channel(peer.clone(), detached));
                 }
                 Err(error) => {
                     peer.emit(
                         "failed",
+                        None,
                         None,
                         None,
                         Some(format!("DataChannel detach failed: {error}")),
@@ -175,10 +210,60 @@ fn wire_data_channel(peer: Arc<NativePeer>, channel: Arc<RTCDataChannel>) {
         let peer = close_peer.clone();
         Box::pin(async move {
             if !peer.closed.load(Ordering::SeqCst) {
-                peer.emit("closed", None, None, None);
+                peer.emit("closed", None, None, None, None);
             }
         })
     }));
+}
+
+fn decode_direct_file_frame(data: &[u8]) -> Result<Option<DecodedDirectFileFrame>, String> {
+    if data.len() < 4 || &data[..4] != b"FLNG" {
+        return Ok(None);
+    }
+    if data.len() < 26 || data.len() > MAX_FRAME_BYTES {
+        return Err("truncated or oversized direct file frame".into());
+    }
+    if data[4] != 1 || (data[5] != 1 && data[5] != 2) {
+        return Err("unsupported direct file frame".into());
+    }
+    let batch = data[5] == 2;
+    let header_size = if batch { 30 } else { 26 };
+    if data.len() < header_size {
+        return Err("truncated direct file batch frame".into());
+    }
+    let seq = u32::from_be_bytes(data[18..22].try_into().unwrap());
+    let payload_len = u32::from_be_bytes(data[22..26].try_into().unwrap()) as usize;
+    if payload_len != data.len() - header_size {
+        return Err("invalid direct file frame length".into());
+    }
+    let (chunk_size, chunk_count) = if batch {
+        let size = u16::from_be_bytes(data[26..28].try_into().unwrap()) as usize;
+        let count = u16::from_be_bytes(data[28..30].try_into().unwrap()) as u32;
+        if size == 0
+            || count < 2
+            || seq.checked_add(count - 1).is_none()
+            || payload_len <= (count as usize - 1) * size
+            || payload_len > count as usize * size
+        {
+            return Err("invalid coalesced direct chunk metadata".into());
+        }
+        (Some(size), count)
+    } else {
+        (None, 1)
+    };
+    let mut id = String::with_capacity(24);
+    for byte in &data[6..18] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut id, "{byte:02x}");
+    }
+    Ok(Some(DecodedDirectFileFrame {
+        id,
+        seq,
+        chunk_count,
+        chunk_size,
+        payload_start: header_size,
+        payload_len,
+    }))
 }
 
 async fn read_data_channel(peer: Arc<NativePeer>, channel: Arc<DetachedDataChannel>) {
@@ -191,30 +276,170 @@ async fn read_data_channel(peer: Arc<NativePeer>, channel: Arc<DetachedDataChann
         }
         match channel.read_data_channel(&mut buffer).await {
             Ok((0, _)) => break,
-            Ok((n, is_string)) => {
-                if is_string || n > MAX_FRAME_BYTES {
+            Ok((n, _is_string)) => {
+                if n > MAX_FRAME_BYTES {
                     peer.emit(
                         "failed",
+                        None,
                         None,
                         None,
                         Some("invalid or oversized direct frame".into()),
                     );
                     break;
                 }
-                let (ack_tx, ack_rx) = oneshot::channel();
-                *peer.receive_ack.lock().await = Some(ack_tx);
-                peer.emit("message", None, Some(buffer[..n].to_vec()), None);
-                match tokio::time::timeout(std::time::Duration::from_secs(15), ack_rx).await {
-                    Ok(Ok(())) => {}
-                    _ if peer.closed.load(Ordering::SeqCst) => break,
-                    _ => {
-                        peer.emit(
-                            "failed",
-                            None,
-                            None,
-                            Some("native receive handoff ACK timed out".into()),
-                        );
+                let delivery = match decode_direct_file_frame(&buffer[..n]) {
+                    Ok(Some(frame)) => {
+                        let binding = peer.files.lock().await.get(&frame.id).cloned();
+                        let Some(binding) = binding else {
+                            peer.emit(
+                                "failed",
+                                None,
+                                None,
+                                None,
+                                Some("direct file frame has no active manifest binding".into()),
+                            );
+                            break;
+                        };
+                        if frame.seq.checked_add(frame.chunk_count).is_none()
+                            || frame.seq + frame.chunk_count > binding.total_chunks
+                            || frame
+                                .chunk_size
+                                .is_some_and(|size| size != binding.chunk_size)
+                        {
+                            peer.emit(
+                                "failed",
+                                None,
+                                None,
+                                None,
+                                Some("direct file frame does not match its manifest".into()),
+                            );
+                            break;
+                        }
+                        let mut payload_offset = frame.payload_start;
+                        let payload_end = payload_offset + frame.payload_len;
+                        let mut last_append = None;
+                        let mut valid = true;
+                        for index in 0..frame.chunk_count {
+                            let seq = frame.seq + index;
+                            let file_offset = seq as u64 * binding.chunk_size as u64;
+                            let expected_len = std::cmp::min(
+                                binding.chunk_size as u64,
+                                binding.expected_size.saturating_sub(file_offset),
+                            ) as usize;
+                            if payload_offset + expected_len > payload_end {
+                                valid = false;
+                                break;
+                            }
+                            match peer.receive_store.append_chunk(
+                                &binding.save_session_id,
+                                seq,
+                                &buffer[payload_offset..payload_offset + expected_len],
+                            ) {
+                                Ok(result) => {
+                                    payload_offset += expected_len;
+                                    last_append = Some(result);
+                                }
+                                Err(error) => {
+                                    peer.emit(
+                                        "failed",
+                                        None,
+                                        None,
+                                        None,
+                                        Some(format!("native file append failed: {error}")),
+                                    );
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !valid || payload_offset != payload_end {
+                            if valid {
+                                peer.emit(
+                                    "failed",
+                                    None,
+                                    None,
+                                    None,
+                                    Some(
+                                        "direct file frame payload does not match chunk lengths"
+                                            .into(),
+                                    ),
+                                );
+                            }
+                            break;
+                        }
+                        let Some(append) = last_append else {
+                            peer.emit(
+                                "failed",
+                                None,
+                                None,
+                                None,
+                                Some("direct file frame contained no chunks".into()),
+                            );
+                            break;
+                        };
+                        Some(NativeFileFrame {
+                            id: frame.id,
+                            seq: frame.seq,
+                            chunk_count: frame.chunk_count,
+                            next_seq: append.next_seq,
+                            received_bytes: append.cumulative_bytes,
+                        })
+                    }
+                    Ok(None) => {
+                        let text = match std::str::from_utf8(&buffer[..n]) {
+                            Ok(text) => text.to_owned(),
+                            Err(_) => {
+                                peer.emit(
+                                    "failed",
+                                    None,
+                                    None,
+                                    None,
+                                    Some("invalid UTF-8 control message".into()),
+                                );
+                                break;
+                            }
+                        };
+                        let (ack_tx, ack_rx) = oneshot::channel();
+                        *peer.receive_ack.lock().await = Some(ack_tx);
+                        peer.emit("message", None, Some(text), None, None);
+                        match tokio::time::timeout(std::time::Duration::from_secs(15), ack_rx).await
+                        {
+                            Ok(Ok(())) => continue,
+                            _ if peer.closed.load(Ordering::SeqCst) => break,
+                            _ => {
+                                peer.emit(
+                                    "failed",
+                                    None,
+                                    None,
+                                    None,
+                                    Some("native receive handoff ACK timed out".into()),
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        peer.emit("failed", None, None, None, Some(error));
                         break;
+                    }
+                };
+                if let Some(file_frame) = delivery {
+                    let (ack_tx, ack_rx) = oneshot::channel();
+                    *peer.receive_ack.lock().await = Some(ack_tx);
+                    peer.emit("file-frame", None, None, Some(file_frame), None);
+                    match tokio::time::timeout(std::time::Duration::from_secs(15), ack_rx).await {
+                        Ok(Ok(())) => {}
+                        _ if peer.closed.load(Ordering::SeqCst) => break,
+                        _ => {
+                            peer.emit(
+                                "failed",
+                                None,
+                                None,
+                                None,
+                                Some("native receive handoff ACK timed out".into()),
+                            );
+                            break;
+                        }
                     }
                 }
             }
@@ -222,6 +447,7 @@ async fn read_data_channel(peer: Arc<NativePeer>, channel: Arc<DetachedDataChann
                 if !peer.closed.load(Ordering::SeqCst) {
                     peer.emit(
                         "failed",
+                        None,
                         None,
                         None,
                         Some(format!("DataChannel read failed: {error}")),
@@ -254,6 +480,7 @@ fn emit_local_candidate(
 pub async fn native_p2p_start(
     app: AppHandle,
     state: State<'_, NativeP2pState>,
+    receive_store: State<'_, ReceivedFileStore>,
     session_id: String,
     role: String,
     ice_servers: Vec<IceServerInput>,
@@ -291,6 +518,8 @@ pub async fn native_p2p_start(
         pc: pc.clone(),
         data_channel: tokio::sync::Mutex::new(None),
         receive_ack: tokio::sync::Mutex::new(None),
+        receive_store: receive_store.inner().clone(),
+        files: tokio::sync::Mutex::new(HashMap::new()),
         closed: AtomicBool::new(false),
     });
 
@@ -308,6 +537,7 @@ pub async fn native_p2p_start(
             if connection_state == RTCPeerConnectionState::Failed {
                 peer.emit(
                     "failed",
+                    None,
                     None,
                     None,
                     Some("native ICE/DTLS peer connection failed".into()),
@@ -348,6 +578,47 @@ pub async fn native_p2p_start(
             .ok_or_else(|| "native local offer missing".to_owned())?;
         peer.emit_signal(serde_json::json!({ "kind": "p2p-offer", "sdp": local.sdp }));
     }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn native_p2p_bind_file(
+    state: State<'_, NativeP2pState>,
+    session_id: String,
+    transfer_id: String,
+    save_session_id: String,
+    chunk_size: usize,
+    total_chunks: u32,
+    expected_size: u64,
+) -> Result<(), String> {
+    let peer = get_peer(state.inner(), &session_id)?;
+    if transfer_id.len() != 24 || !transfer_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid native transfer id".into());
+    }
+    validate_session_id(&save_session_id)?;
+    if chunk_size == 0 || chunk_size > 128 * 1024 || total_chunks == 0 {
+        return Err("invalid native receive manifest".into());
+    }
+    peer.files.lock().await.insert(
+        transfer_id,
+        NativeFileBinding {
+            save_session_id,
+            chunk_size,
+            total_chunks,
+            expected_size,
+        },
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn native_p2p_unbind_file(
+    state: State<'_, NativeP2pState>,
+    session_id: String,
+    transfer_id: String,
+) -> Result<(), String> {
+    let peer = get_peer(state.inner(), &session_id)?;
+    peer.files.lock().await.remove(&transfer_id);
     Ok(())
 }
 
@@ -423,13 +694,24 @@ pub async fn native_p2p_handle_signal(
 #[tauri::command]
 pub async fn native_p2p_send(
     state: State<'_, NativeP2pState>,
-    session_id: String,
-    data: Vec<u8>,
+    request: tauri::ipc::Request<'_>,
 ) -> Result<usize, String> {
+    let session_id = request
+        .headers()
+        .get("x-session-id")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| "missing x-session-id header".to_string())?;
+    validate_session_id(session_id)?;
+    let data = match request.body() {
+        tauri::ipc::InvokeBody::Raw(data) => data.clone(),
+        tauri::ipc::InvokeBody::Json(_) => {
+            return Err("native P2P send requires raw binary IPC".into())
+        }
+    };
     if data.is_empty() || data.len() > MAX_FRAME_BYTES {
         return Err(format!("invalid direct frame size (max {MAX_FRAME_BYTES})"));
     }
-    let peer = get_peer(state.inner(), &session_id)?;
+    let peer = get_peer(state.inner(), session_id)?;
     let channel = peer
         .data_channel
         .lock()
@@ -479,4 +761,58 @@ pub async fn native_p2p_close(
             .map_err(|e| format!("close native peer connection: {e}"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(id: [u8; 12], seq: u32, payload: &[u8], batch: Option<(u16, u16)>) -> Vec<u8> {
+        let header_size = if batch.is_some() { 30 } else { 26 };
+        let mut bytes = vec![0u8; header_size + payload.len()];
+        bytes[..4].copy_from_slice(b"FLNG");
+        bytes[4] = 1;
+        bytes[5] = if batch.is_some() { 2 } else { 1 };
+        bytes[6..18].copy_from_slice(&id);
+        bytes[18..22].copy_from_slice(&seq.to_be_bytes());
+        bytes[22..26].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        if let Some((chunk_size, chunk_count)) = batch {
+            bytes[26..28].copy_from_slice(&chunk_size.to_be_bytes());
+            bytes[28..30].copy_from_slice(&chunk_count.to_be_bytes());
+        }
+        bytes[header_size..].copy_from_slice(payload);
+        bytes
+    }
+
+    #[test]
+    fn direct_file_frame_parser_handles_single_batch_and_rejects_corruption() {
+        let id = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let single = frame(id, 7, b"chunk", None);
+        let decoded = decode_direct_file_frame(&single).unwrap().unwrap();
+        assert_eq!(decoded.id, "000102030405060708090a0b");
+        assert_eq!(decoded.seq, 7);
+        assert_eq!(decoded.chunk_count, 1);
+        assert_eq!(
+            &single[decoded.payload_start..decoded.payload_start + decoded.payload_len],
+            b"chunk"
+        );
+
+        let batch = frame(id, 12, b"1234567", Some((4, 2)));
+        let decoded = decode_direct_file_frame(&batch).unwrap().unwrap();
+        assert_eq!(decoded.seq, 12);
+        assert_eq!(decoded.chunk_size, Some(4));
+        assert_eq!(decoded.chunk_count, 2);
+        assert_eq!(decoded.payload_len, 7);
+
+        assert!(decode_direct_file_frame(b"control message")
+            .unwrap()
+            .is_none());
+        let mut corrupt = single.clone();
+        corrupt[22..26].copy_from_slice(&999u32.to_be_bytes());
+        assert!(decode_direct_file_frame(&corrupt).is_err());
+        let mut invalid_batch = frame(id, 12, b"1234", Some((4, 2)));
+        assert!(decode_direct_file_frame(&invalid_batch).is_err());
+        invalid_batch.truncate(25);
+        assert!(decode_direct_file_frame(&invalid_batch).is_err());
+    }
 }

@@ -332,10 +332,26 @@ async function main(): Promise<void> {
     return { cur: null };
   }
   let done = freshBox();
+  let lossScheduled = false;
+  let dropProgressAckForId: string | null = null;
   const receiverAckLogs: string[] = [];
   const eventsB: FlingRoomEvents = {
-    onLog: (_tag, message) => receiverAckLogs.push(message),
+    onLog: (_tag, message) => {
+      receiverAckLogs.push(message);
+      if (
+        dropProgressAckForId &&
+        message.includes(`chunk ACK queued (${dropProgressAckForId.slice(0, 8)})`) &&
+        message.includes('complete=false')
+      ) {
+        // Arm the mock before the queued publish microtask runs, and only for
+        // this file's non-final progress ACK (never its durable final ACK).
+        tB.dropNextPublish = true;
+        lossScheduled = true;
+        dropProgressAckForId = null;
+      }
+    },
     onFileManifest: (manifest) => {
+      if (manifest.name === 'lost-progress-ack.bin') dropProgressAckForId = manifest.id;
       if (manifest.name === 'hello.bin') {
         // Simulate SCTP data queued from before the first raw chunk. This is
         // between bufferedamountlow (256 KiB) and the old per-frame target.
@@ -507,14 +523,10 @@ async function main(): Promise<void> {
 
   // --- 1ab. one lost progress ACK is repaired by the later saved-file ACK ---
   done = freshBox();
-  let lossScheduled = false;
+  lossScheduled = false;
+  dropProgressAckForId = null;
   const droppedBefore = tB.droppedPublishes;
-  const lostAckSend = roomA.sendFile(fileLike('lost-progress-ack.bin', 100_000), () => {
-    if (!lossScheduled) {
-      tB.dropNextPublish = true;
-      lossScheduled = true;
-    }
-  });
+  const lostAckSend = roomA.sendFile(fileLike('lost-progress-ack.bin', 100_000));
   for (let i = 0; i < 200 && !done.cur; i++) {
     wire();
     await new Promise((r) => setTimeout(r, 5));

@@ -140,8 +140,25 @@ export class FileReceiver {
       throw new Error(`invalid chunk size (got ${bytes.byteLength}, want ${expectedBytes})`);
     }
     this.chunks[seq] = bytes;
+    return this.markChunkStored(seq, bytes.byteLength);
+  }
+
+  /** Mark a chunk whose bytes have already been durably staged outside JS memory. */
+  markChunkStored(seq: number, byteLength: number): boolean {
+    if (!Number.isInteger(seq) || seq < 0 || seq >= this.manifest.totalChunks) {
+      throw new Error('invalid chunk sequence');
+    }
+    if (this.present[seq]) return this.isComplete();
+    if (this.consuming || this.consumed) throw new Error('file finalization already started');
+    const expectedBytes = Math.min(
+      this.manifest.chunkSize,
+      Math.max(0, this.manifest.size - seq * this.manifest.chunkSize),
+    );
+    if (byteLength !== expectedBytes) {
+      throw new Error(`invalid chunk size (got ${byteLength}, want ${expectedBytes})`);
+    }
     this.present[seq] = 1;
-    this.receivedBytes += bytes.byteLength;
+    this.receivedBytes += byteLength;
     this.receivedChunks++;
     // Direct delivery is ordered today, but relay replay and a future
     // unordered channel are allowed to fill holes. Keep this incremental so
@@ -150,6 +167,10 @@ export class FileReceiver {
       this.nextMissingSeq++;
     }
     return this.isComplete();
+  }
+
+  hasChunk(seq: number): boolean {
+    return Number.isInteger(seq) && seq >= 0 && seq < this.present.length && this.present[seq] === 1;
   }
 
   get progress(): number {
@@ -252,5 +273,9 @@ export class FileReceiver {
 
   static encodeChunk(bytes: Uint8Array): string {
     return b64encode(bytes);
+  }
+
+  static decodeChunk(dataB64: string): Uint8Array {
+    return b64decode(dataB64);
   }
 }

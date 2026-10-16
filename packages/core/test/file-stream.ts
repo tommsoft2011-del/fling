@@ -53,6 +53,32 @@ async function testMissingChunksBlockFinalization(): Promise<void> {
   console.log('PASS missing-chunk ACK position and finalization guard');
 }
 
+async function testExternallyStoredChunksStayBounded(): Promise<void> {
+  const size = 128 * 1024 * 1024 + 123;
+  const source = patternFile(size);
+  const manifest: FileManifest = {
+    id: 'stream-native-sink-test',
+    name: source.name,
+    size,
+    sha256: await hashFile(source),
+    chunkSize: FILE_CHUNK_SIZE,
+    totalChunks: Math.ceil(size / FILE_CHUNK_SIZE),
+    kind: 'file',
+  };
+  const receiver = new FileReceiver(manifest);
+  for (let seq = 0; seq < manifest.totalChunks; seq++) {
+    const byteLength = Math.min(FILE_CHUNK_SIZE, size - seq * FILE_CHUNK_SIZE);
+    receiver.markChunkStored(seq, byteLength);
+    if (seq % 257 === 0 || seq === manifest.totalChunks - 1) {
+      check(receiver.retainedChunkBytes === 0, 'native sink metadata path retains no chunk payload');
+    }
+  }
+  check(receiver.isComplete(), 'metadata-only receiver reaches completion after every chunk is accounted');
+  check(receiver.nextSeq === manifest.totalChunks, 'metadata-only ACK prefix advances monotonically to EOF');
+  check(receiver.receivedByteCount === size, 'metadata-only received byte accounting equals the manifest size');
+  console.log(`PASS metadata-only native sink: ${size} bytes, ${manifest.totalChunks} chunks, retained_payload_bytes=${receiver.retainedChunkBytes}`);
+}
+
 async function testLargeBoundedBackpressureStream(): Promise<void> {
   const size = 122_891_016;
   const source = patternFile(size);
@@ -223,6 +249,7 @@ async function testBatchSizeAB(): Promise<void> {
 }
 
 await testMissingChunksBlockFinalization();
+await testExternallyStoredChunksStayBounded();
 await testLargeBoundedBackpressureStream();
 await testBatchSizeAB();
 await testInterruptedStreamReleasesReceiver();

@@ -9,6 +9,7 @@ import {
   P2P_DRAIN_THRESHOLD,
   P2P_DRAIN_TIMEOUT_MS,
   randomId,
+  type FileManifest,
   type DirectChannel,
   type FlingMessage,
   type FlingRoom,
@@ -35,9 +36,16 @@ export function getIceServers(): RTCIceServer[] {
 
 interface NativeP2PEvent {
   sessionId: string;
-  event: 'signal' | 'open' | 'message' | 'closed' | 'failed';
+  event: 'signal' | 'open' | 'message' | 'file-frame' | 'closed' | 'failed';
   signal?: P2PSignal;
-  data?: number[];
+  text?: string;
+  fileFrame?: {
+    id: string;
+    seq: number;
+    chunkCount: number;
+    nextSeq: number;
+    receivedBytes: number;
+  };
   maxMessageSize?: number;
   error?: string;
 }
@@ -58,7 +66,8 @@ interface DrainWaiter {
 class RustDirectChannel implements DirectChannel {
   readonly label: string;
   readonly maxMessageSize = 64 * 1024;
-  onmessage: ((data: Uint8Array<ArrayBuffer>) => void) | null = null;
+  onmessage: ((data: Uint8Array<ArrayBuffer>) => void | Promise<void>) | null = null;
+  onfileframe: DirectChannel['onfileframe'] = null;
   onclose: (() => void) | null = null;
 
   private state: 'connecting' | 'open' | 'closed' = 'connecting';
@@ -82,17 +91,23 @@ class RustDirectChannel implements DirectChannel {
     if (this.state !== 'closed') this.state = 'open';
   }
 
-  deliver(data: Uint8Array): void {
+  async deliverText(text: string): Promise<void> {
     if (this.state !== 'open') return;
-    if (data.byteLength > 128 * 1024 + 30) {
-      this.markClosed(new Error('native frame exceeds the POC limit'));
-      return;
-    }
     try {
-      this.onmessage?.(new Uint8Array(data) as Uint8Array<ArrayBuffer>);
+      await this.onmessage?.(new TextEncoder().encode(text) as Uint8Array<ArrayBuffer>);
     } finally {
       // Rust waits for this handoff before reading the next DataChannel message.
-      void invoke('native_p2p_ack_receive', { sessionId: this.sessionId }).catch(() => {});
+      await invoke('native_p2p_ack_receive', { sessionId: this.sessionId }).catch(() => {});
+    }
+  }
+
+  async deliverFileFrame(frame: NonNullable<NativeP2PEvent['fileFrame']>): Promise<void> {
+    if (this.state !== 'open') return;
+    try {
+      if (!this.onfileframe) throw new Error('native file-frame receiver is not attached');
+      await this.onfileframe(frame);
+    } finally {
+      await invoke('native_p2p_ack_receive', { sessionId: this.sessionId }).catch(() => {});
     }
   }
 
@@ -103,10 +118,9 @@ class RustDirectChannel implements DirectChannel {
     if (this.queuedBytes + length > this.maxQueuedBytes) {
       throw new Error('native direct send queue reached its 1 MiB bound');
     }
-    const payload = Array.from(data);
     this.queuedBytes += length;
     const operation = this.queue.then(async () => {
-      await invoke<number>('native_p2p_send', { sessionId: this.sessionId, data: payload });
+      await invoke<number>('native_p2p_send', data, { headers: { 'x-session-id': this.sessionId } });
     });
     this.queue = operation.catch((error: unknown) => {
       this.markClosed(error instanceof Error ? error : new Error(String(error)));
@@ -180,6 +194,7 @@ export class P2PLink {
   private remoteSet = false;
   private pendingIce: string[] = [];
   private pendingAnswer: P2PSignal | null = null;
+  private pendingFiles = new Map<string, { saveSessionId: string; manifest: FileManifest }>();
   onstate: ((s: P2PState) => void) | null = null;
 
   constructor(
@@ -223,6 +238,9 @@ export class P2PLink {
             this.timer = null;
             this.channel.markOpen();
             this.room.setDirectChannel(this.channel);
+            void this.flushFileBindings().catch((error) => {
+              this.fail(`native file binding failed: ${error instanceof Error ? error.message : String(error)}`);
+            });
             log('p2p', 'Rust-owned direct channel open', {
               peer: this.peerLabel,
               maxMessageSize: payload.maxMessageSize,
@@ -231,7 +249,14 @@ export class P2PLink {
             this.setState('open');
             break;
           case 'message':
-            if (Array.isArray(payload.data)) this.channel.deliver(new Uint8Array(payload.data));
+            if (typeof payload.text === 'string') {
+              void this.channel.deliverText(payload.text).catch((error) => this.fail(`native message handoff failed: ${String(error)}`));
+            }
+            break;
+          case 'file-frame':
+            if (payload.fileFrame) {
+              void this.channel.deliverFileFrame(payload.fileFrame).catch((error) => this.fail(`native file-frame handoff failed: ${String(error)}`));
+            }
             break;
           case 'closed':
             this.channel.markClosed();
@@ -262,6 +287,33 @@ export class P2PLink {
       iceServers: this.iceServers,
     });
     this.nativeStarted = true;
+    await this.flushFileBindings();
+  }
+
+  async bindFile(manifest: FileManifest, saveSessionId: string): Promise<void> {
+    this.pendingFiles.set(manifest.id, { manifest, saveSessionId });
+    await this.flushFileBindings();
+  }
+
+  async unbindFile(transferId: string): Promise<void> {
+    this.pendingFiles.delete(transferId);
+    if (!this.nativeStarted || this.closed) return;
+    await invoke('native_p2p_unbind_file', { sessionId: this.sessionId, transferId }).catch(() => {});
+  }
+
+  private async flushFileBindings(): Promise<void> {
+    if (!this.nativeStarted || this.closed || this.pendingFiles.size === 0) return;
+    for (const [transferId, entry] of this.pendingFiles) {
+      await invoke('native_p2p_bind_file', {
+        sessionId: this.sessionId,
+        transferId,
+        saveSessionId: entry.saveSessionId,
+        chunkSize: entry.manifest.chunkSize,
+        totalChunks: entry.manifest.totalChunks,
+        expectedSize: entry.manifest.size,
+      });
+      this.pendingFiles.delete(transferId);
+    }
   }
 
   /** Initiator: Rust creates the DataChannel and emits the existing p2p-offer. */
@@ -372,6 +424,7 @@ export class P2PLink {
 
   private disposeNative(): void {
     this.closed = true;
+    this.pendingFiles.clear();
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     this.room.setDirectChannel(null);

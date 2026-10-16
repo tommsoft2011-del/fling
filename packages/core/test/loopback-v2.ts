@@ -147,7 +147,7 @@ function makeEvents(c: Collected): FlingRoomEvents {
     onText: () => {},
     onPeerJoined: () => {},
     onPeerLeft: () => {},
-    onFileManifest: (manifest, from) => c.manifests.push({ manifest, from }),
+    onFileManifest: (manifest, from) => { c.manifests.push({ manifest, from }); },
     onFileProgress: () => {},
     onFileComplete: (id, manifest, bytes) => { c.completed.push({ id, manifest, bytes }); },
     onFileError: (id, err) => {

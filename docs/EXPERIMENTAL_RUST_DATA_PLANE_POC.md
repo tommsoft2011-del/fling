@@ -7,19 +7,19 @@
 - Rust（`webrtc-rs`）负责 WebRTC `RTCPeerConnection` 与可靠、有序的 DataChannel（`fling-file`），包括 DTLS/SCTP 数据传输；**不引入自定义 UDP/QUIC 传输**。
 - 信令/控制仍走现有加密 LiveKit room；Rust 桥接原有 `p2p-offer`、`p2p-answer`、`p2p-ice` 信令及 FLNG 二进制帧。
 - 继续使用 v0.6.3 的 manifest、32 KiB 逻辑分块、直连窗口/进度 ACK、SHA-256 校验、`sync_all`、不覆盖既有文件的原子提交、最终 `task-ack` 与 relay fallback。
-- Rust 接收端最多保留一帧（最大为现有 128 KiB 批帧加 30 字节头），交付 WebView 后等待该帧的 handoff ACK 再读取下一帧；WebView 发往 Rust 的待发队列上限为 1 MiB。现有应用 ACK、窗口和恢复逻辑仍负责端到端流控。
-- 接收文件仍由既有 TypeScript `FileReceiver` 组装，再顺序流式写入 Rust 临时文件。因此，**本 POC 尚未证明接收端堆内存下降**；目前只改变 DataChannel 所有权，并测量已有的流式写盘/校验路径。
+- Rust 端直接解析收到的 FLNG 数据帧，并将 payload 顺序追加到受 manifest 约束的临时文件，同时增量计算 SHA-256；一次只允许一个原生帧等待 WebView 的元数据 handoff ACK。relay 接收通过 Tauri raw binary IPC 逐逻辑 chunk 追加，单次 IPC 上限为 128 KiB；早于 manifest 的竞态缓存上限为 32 帧/1 MiB。既有应用 ACK、窗口和恢复逻辑仍负责端到端流控。
+- 桌面接收路径只在 TypeScript `FileReceiver` 中保留 chunk 元数据，不缓存 payload；Rust 完成大小/哈希验证、`sync_all` 与原子无覆盖提交后才发送最终完成 ACK。direct 失败时同一会话可由 relay 顺序修复；取消、错序、写入错误或任务断连会清理未完成临时文件。
 - Tauri app identifier 为 `app.fling.desktop.rust-poc`，产品名/窗口标题为 `Fling Rust Data Plane POC (EXPERIMENTAL)`；设置配置与生产版 `app.fling.desktop` 分开。
 
 ## 当前互操作结论
 
-- **实现/编译：** Rust/Tauri 与 TypeScript 均可编译；现有协议回归测试通过，包括 32 KiB chunk 重组、流式保存/哈希、ACK/最终确认和 relay 修复。
+- **实现/编译：** Rust/Tauri 与 TypeScript 均可编译；Rust 17 项单测通过。Core 类型检查、128 MiB metadata-only 接收检查、123 MB 序列化写入/增量哈希模拟、P2P 路由/direct window、relay 修复及持久化后 final ACK 顺序回归均通过。
 - **真实 v0.6.3 WebView ↔ Rust DataChannel 两机互操作：尚未实测确认。** 编译与内存模拟测试不能证明两个物理设备间 SDP/ICE 一定互通。请按下方流程实测并记录是否完成直连协商、双向数据传输及文件哈希校验。失败本身就是 POC 结果；不要改成另一种自定义传输。
 - **尚无速度提升结论。** 现有内存测试不是物理网络、真实磁盘或 Rust POC 的性能数据，不可据此声称提速。
 
 ## Windows EXE 与首次启动
 
-专用 GitHub Actions workflow 从 `experiment/rust-data-plane-poc` 分支构建 Windows 测试产物。本次成功运行：[#38840251305](https://github.com/tommsoft2011-del/fling/actions/runs/38840251305)，源代码提交为 `d023669033ebed9147d7c398439624d5e92eba7d`。从 [fling-desktop-Windows artifact](https://github.com/tommsoft2011-del/fling/actions/runs/38840251305/artifacts/12020983330) 下载并解压；可运行 `Fling-portable-x64.exe`，也附带 MSI/NSIS 安装包。portable EXE 的 SHA-256：`02147508527fc9910aa591f2c0b78f9c7de37c87bc9a6cd5dc8b9a2018cfa721`。**不要卸载或覆盖现有 v0.6.3 安装。** 该 workflow 在实验分支上只上传 Actions artifact；不创建版本 tag，也不发布 GitHub Release。
+Windows 测试 EXE 使用仓库现有 `.github/workflows/release.yml` 的 `workflow_dispatch`，指定 `experiment/rust-data-plane-poc` 分支；其 `desktop (windows-latest)` job 会从该分支构建 Tauri 桌面端并上传 `fling-desktop-Windows` artifact，其中包括 `Fling-portable-x64.exe` 和 Windows 安装包。`release` job 明确要求 `github.ref` 以 `refs/tags/v` 开头，因此分支手动构建会跳过 Release job，不创建 tag 或 GitHub Release。下载 artifact 后可用 PowerShell `Get-FileHash .\Fling-portable-x64.exe -Algorithm SHA256` 核对 EXE；**不要卸载或覆盖现有 v0.6.3 安装。**
 
 首次启动时，在 POC 中填写与 v0.6.3 测试端相同的 Fling Server URL/API 配置。因为应用标识不同，POC 不会读取或覆盖生产版本地配置。
 
@@ -41,7 +41,7 @@
 
 - `send end.elapsedMs`、`recv end.elapsedMs`：任务端到端墙钟时间。
 - `receive payload phase.elapsedMs`：每个文件从首个正向接收进度到最后一段 payload 回调的时间。
-- `Tauri streaming save IPC end.elapsedMs`：接收端保存管线总耗时。
+- `Rust receive chunk appended.invokeElapsedMs`、`writeElapsedMs`、`hashUpdateMs`：逐 chunk 的 raw IPC、文件追加与增量哈希耗时；`Rust receive finalize end.elapsedMs`：最终验证、sync 与提交阶段总耗时。
 - `Rust write_all stage.elapsedMs`、`Rust incremental SHA-256 update stage.elapsedMs`、`Rust SHA-256 final verify stage.elapsedMs`、`Rust sync_all stage.elapsedMs`、`Rust atomic commit stage.elapsedMs`：写盘、增量/最终校验、持久化和原子提交分段耗时。
 - `task-ack sent.receiverFinalizationMs`：接收端收到 `task-done` 后，等待分块/保存完成直到发出首个最终 ACK 的时间。
 - `final task-ack phase.elapsedMs`：发送端从发出 `task-done` 到收到最终 ACK（或超时）的时间。
@@ -59,8 +59,8 @@ CPU 和峰值内存请在 Windows Task Manager 中分别记录 POC 与 v0.6.3 �
 
 ## 已完成的构建/回归检查
 
-- `apps/desktop/src-tauri` 下 `cargo check`
-- 桌面 Vite production build，以及对 `p2p.ts` / `tasks.ts` 的 TypeScript 类型检查
-- Core P2P-routing、file-stream、direct-window 回归测试
+- `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml`（17 passed）
+- 桌面 Vite production build，以及对 `p2p.ts` / `tasks.ts` 的 TypeScript 严格类型检查
+- Core typecheck、file-stream（含 128 MiB metadata-only sink）、P2P routing、direct-window、loopback（含 durable final ACK 顺序）回归测试
 
 这些检查验证了编译与既有协议语义，不代替上面的物理双设备互操作测试。

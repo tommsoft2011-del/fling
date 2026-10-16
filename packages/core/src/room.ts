@@ -30,7 +30,11 @@ export interface FlingRoomEvents {
   onText?(text: string, from: string): void;
   onPeerJoined?(identity: string): void;
   onPeerLeft?(identity: string): void;
-  onFileManifest?(manifest: FileManifest, from: string): void;
+  onFileManifest?(manifest: FileManifest, from: string): void | Promise<void>;
+  /** Optional sequential byte sink; awaited before a chunk is acknowledged. */
+  onFileChunk?(id: string, seq: number, bytes: Uint8Array, source: 'relay' | 'direct'): Promise<number | void>;
+  /** Saved-byte progress for chunks appended by a native data-plane reader. */
+  onFileSavedProgress?(id: string, savedBytes: number): void;
   onFileProgress?(id: string, receivedBytes: number, totalBytes: number): void;
   onFileRoute?(route: 'p2p' | 'relay', id: string): void;
   onFileComplete?(id: string, manifest: FileManifest, bytes: Uint8Array): void | Promise<void>;
@@ -133,6 +137,9 @@ interface ReceivedFileChunk {
   source: 'relay' | 'direct';
   dataB64?: string;
   bytes?: Uint8Array<ArrayBuffer>;
+  alreadySaved?: boolean;
+  byteLength?: number;
+  savedBytes?: number;
 }
 
 export class FlingRoom {
@@ -158,6 +165,14 @@ export class FlingRoom {
    * race; buffer it and replay when the manifest arrives instead of dropping.
    */
   private earlyChunks = new Map<string, ReceivedFileChunk[]>();
+  private earlyChunkBytes = new Map<string, number>();
+  private earlyChunkTotalBytes = 0;
+  private clearEarlyChunks(id: string): void {
+    const bytes = this.earlyChunkBytes.get(id) ?? 0;
+    this.earlyChunkTotalBytes = Math.max(0, this.earlyChunkTotalBytes - bytes);
+    this.earlyChunkBytes.delete(id);
+    this.earlyChunks.delete(id);
+  }
   // Data channels are ordered, but decrypt+parse is async — serialize
   // handling so a chunk can never overtake its manifest.
   private handleQueue: Promise<void> = Promise.resolve();
@@ -221,19 +236,35 @@ export class FlingRoom {
     const old = this.direct;
     if (old) {
       old.onmessage = null;
+      old.onfileframe = null;
       // NOTE: do NOT touch onclose — it belongs to the link that owns the
       // channel lifecycle (overwriting it broke the link's failure path).
     }
     this.direct = ch;
     if (ch) {
       this.events.onLog?.('p2p', `direct channel attached (${ch.label})`);
-      ch.onmessage = (data) => {
-        // Synchronous: see handleDirectMessage. Never chain onto handleQueue.
+      ch.onmessage = async (data) => {
         try {
-          this.handleDirectMessage(data, ch.label);
+          await this.handleDirectMessage(data, ch.label);
         } catch (e) {
           console.error('fling: direct payload handling failed:', e);
         }
+      };
+      ch.onfileframe = async (frame) => {
+        for (let index = 0; index < frame.chunkCount; index++) {
+          await this.handleChunkMessage({
+            id: frame.id,
+            seq: frame.seq + index,
+            source: 'direct',
+            alreadySaved: true,
+          });
+        }
+        const entry = this.incoming.get(frame.id);
+        if (!entry) throw new Error(`native file frame arrived before manifest (${frame.id.slice(0, 8)})`);
+        if (entry.receiver.nextSeq !== frame.nextSeq || entry.receiver.receivedByteCount !== frame.receivedBytes) {
+          throw new Error(`native receive accounting mismatch (${frame.id.slice(0, 8)})`);
+        }
+        this.events.onFileSavedProgress?.(frame.id, frame.receivedBytes);
       };
     } else {
       this.events.onLog?.('p2p', 'direct channel detached (relay mode)');
@@ -1068,17 +1099,17 @@ export class FlingRoom {
     }
     if (!isFlingMessage(msg)) return;
     if (msg.kind === 'file-chunk') this.events.onFileRoute?.('relay', msg.id);
-    this.dispatchMessage(msg, from, 'relay', receivedAtMonoMs);
+    await this.dispatchMessage(msg, from, 'relay', receivedAtMonoMs);
   }
 
   /**
    * Inbound message from the direct P2P channel (already DTLS-encrypted).
-   * Synchronous fast path: no AES-GCM, just JSON parse. Handled immediately
+   * Fast path: no AES-GCM, just JSON parse. Handled immediately
    * in onmessage instead of chaining onto the shared handleQueue, so a slow
    * relay trickle (decrypt-bound) can never head-of-line-block direct chunks.
    * Manifest/chunk races are covered by early-chunk buffering.
    */
-  private handleDirectMessage(data: Uint8Array, from: string): void {
+  private async handleDirectMessage(data: Uint8Array, from: string): Promise<void> {
     let frame: DirectFileChunkFrame | undefined;
     try {
       frame = decodeDirectFileChunkFrame(data);
@@ -1093,13 +1124,13 @@ export class FlingRoom {
       this.directChunkCounts.set(frame.id, n);
       if (n % 20 === 0) this.events.onLog?.('xfer', `direct binary chunks received: ${n} (${frame.id.slice(0, 8)})`);
       if (chunkCount === 1) {
-        this.handleChunkMessage({ id: frame.id, seq: frame.seq, bytes: frame.payload, source: 'direct' });
+        await this.handleChunkMessage({ id: frame.id, seq: frame.seq, bytes: frame.payload, source: 'direct' });
       } else {
         const chunkSize = frame.chunkSize!;
         for (let index = 0; index < chunkCount; index++) {
           const start = index * chunkSize;
           const end = Math.min(start + chunkSize, frame.payload.byteLength);
-          this.handleChunkMessage({
+          await this.handleChunkMessage({
             id: frame.id,
             seq: frame.seq + index,
             bytes: frame.payload.subarray(start, end) as Uint8Array<ArrayBuffer>,
@@ -1128,18 +1159,18 @@ export class FlingRoom {
         this.events.onLog?.('xfer', `direct chunks received: ${n} (${msg.id.slice(0, 8)})`);
       }
     }
-    this.dispatchMessage(msg, from, 'direct');
+    await this.dispatchMessage(msg, from, 'direct');
   }
 
   /** Per-file direct-chunk counters (diagnostics). Cleared in finishFile. */
   private directChunkCounts = new Map<string, number>();
 
-  private dispatchMessage(
+  private async dispatchMessage(
     msg: FlingMessage,
     from: string,
     source: 'relay' | 'direct' = 'relay',
     receivedAtMonoMs = performance.now(),
-  ): void {
+  ): Promise<void> {
     switch (msg.kind) {
       case 'text':
         this.events.onText?.(msg.text, from);
@@ -1199,18 +1230,27 @@ export class FlingRoom {
           finalizing: false,
         });
         this.events.onLog?.('xfer', `manifest received ${manifest.name} (${manifest.id.slice(0, 8)}) source=${source}, chunks=${manifest.totalChunks}, size=${manifest.size}`);
+        try {
+          await this.events.onFileManifest?.(manifest, from);
+        } catch (error) {
+          this.incoming.delete(manifest.id);
+          this.clearEarlyChunks(manifest.id);
+          const message = error instanceof Error ? error.message : String(error);
+          this.events.onFileError?.(manifest.id, message);
+          this.events.onLog?.('xfer', `manifest receiver preparation failed (${manifest.id.slice(0, 8)}): ${message}`);
+          return;
+        }
         // The acknowledgement is deliberately not a directKinds message, so
         // it always travels over LiveKit even while the data channel is sick.
         void this.send({ kind: 'file-manifest-ack', id: manifest.id, chunkAck: true, binaryChunks: true, directFramePayloadBytes }).catch(() => {});
-        this.events.onFileManifest?.(manifest, from);
         // Replay any chunks that beat the manifest here.
         const buffered = this.earlyChunks.get(manifest.id);
         if (buffered) {
-          this.earlyChunks.delete(manifest.id);
+          this.clearEarlyChunks(manifest.id);
           this.events.onLog?.('xfer', `replaying ${buffered.length} early chunks for ${manifest.name}`);
           for (const c of buffered) {
             this.events.onFileRoute?.(c.source === 'direct' ? 'p2p' : 'relay', c.id);
-            this.handleChunkMessage(c);
+            await this.handleChunkMessage(c);
           }
         }
         // Empty file: complete immediately.
@@ -1220,7 +1260,7 @@ export class FlingRoom {
         break;
       }
       case 'file-chunk': {
-        this.handleChunkMessage({ id: msg.id, seq: msg.seq, dataB64: msg.data, source });
+        await this.handleChunkMessage({ id: msg.id, seq: msg.seq, dataB64: msg.data, source });
         break;
       }
       case 'file-manifest-ack':
@@ -1306,13 +1346,13 @@ export class FlingRoom {
       this.events.onFileError?.(id, e instanceof Error ? e.message : String(e));
       await this.publishFinalizeFailureAck(id, entry.receiver);
       this.incoming.delete(id);
-      this.earlyChunks.delete(id);
+      this.clearEarlyChunks(id);
       return;
     }
 
     this.completedFiles.add(id);
     this.incoming.delete(id);
-    this.earlyChunks.delete(id);
+    this.clearEarlyChunks(id);
     this.directChunkCounts.delete(id);
     // Do not wait for a queued progress publish: LiveKit can stall that
     // promise. The final ACK carries the monotonic total and resolveChunkAck
@@ -1362,34 +1402,69 @@ export class FlingRoom {
   }
 
   /** Single place that applies a file-chunk to its receiver. */
-  private handleChunkMessage(
+  private async handleChunkMessage(
     msg: ReceivedFileChunk,
-  ): void {
+  ): Promise<void> {
     if (this.completedFiles.has(msg.id)) return;
     const entry = this.incoming.get(msg.id);
     if (!entry) {
       // Manifest not seen yet (chunk beat it on a faster channel): buffer
-      // instead of dropping. Cap the buffer so a garbage id can't grow it.
+      // instead of dropping, with a small byte/count cap for strict memory bounds.
       const buf = this.earlyChunks.get(msg.id);
-      if (buf) {
-        if (buf.length < 2000) buf.push(msg);
+      const payloadBytes = msg.bytes?.byteLength ?? (typeof msg.dataB64 === 'string'
+        ? Math.floor(msg.dataB64.length * 3 / 4)
+        : (msg.byteLength ?? 0));
+      const bufferedBytes = this.earlyChunkBytes.get(msg.id) ?? 0;
+      const newTransfer = !buf;
+      if (
+        (buf?.length ?? 0) < 32 &&
+        (!newTransfer || this.earlyChunks.size < 16) &&
+        bufferedBytes + payloadBytes <= 1024 * 1024 &&
+        this.earlyChunkTotalBytes + payloadBytes <= 1024 * 1024
+      ) {
+        if (buf) buf.push(msg);
+        else this.earlyChunks.set(msg.id, [msg]);
+        this.earlyChunkBytes.set(msg.id, bufferedBytes + payloadBytes);
+        this.earlyChunkTotalBytes += payloadBytes;
+        if (!buf) {
+          this.events.onLog?.('xfer', `chunk before manifest (${msg.id.slice(0, 8)}): source=${msg.source}, seq=${msg.seq}`);
+        }
       } else {
-        this.earlyChunks.set(msg.id, [msg]);
-        this.events.onLog?.('xfer', `chunk before manifest (${msg.id.slice(0, 8)}): source=${msg.source}, seq=${msg.seq}`);
+        this.events.onLog?.('xfer', `dropping early chunk above 1 MiB/32 frame cap (${msg.id.slice(0, 8)})`);
       }
       return;
     }
     if (entry.finalizing) return;
     const { receiver } = entry;
+    if (receiver.hasChunk(msg.seq)) return;
     let complete = false;
     try {
-      if (msg.bytes) complete = receiver.addChunkBytes(msg.seq, msg.bytes);
-      else if (typeof msg.dataB64 === 'string') complete = receiver.addChunk(msg.seq, msg.dataB64);
-      else throw new Error('missing chunk payload');
+      if (msg.alreadySaved) {
+        const byteLength = msg.byteLength ?? Math.min(
+          receiver.manifest.chunkSize,
+          Math.max(0, receiver.manifest.size - msg.seq * receiver.manifest.chunkSize),
+        );
+        complete = receiver.markChunkStored(msg.seq, byteLength);
+      } else {
+        const bytes = msg.bytes ?? (typeof msg.dataB64 === 'string'
+          ? FileReceiver.decodeChunk(msg.dataB64)
+          : undefined);
+        if (!bytes) throw new Error('missing chunk payload');
+        if (this.events.onFileChunk) {
+          const savedBytes = await this.events.onFileChunk(msg.id, msg.seq, bytes, msg.source);
+          complete = receiver.markChunkStored(msg.seq, bytes.byteLength);
+          if (typeof savedBytes === 'number') msg.savedBytes = savedBytes;
+        } else {
+          complete = receiver.addChunkBytes(msg.seq, bytes);
+        }
+      }
     } catch (e) {
-      this.events.onFileError?.(msg.id, (e as Error).message);
+      const message = e instanceof Error ? e.message : String(e);
+      this.events.onFileError?.(msg.id, message);
       this.clearProgressAckHeartbeat(entry);
+      await this.publishFinalizeFailureAck(msg.id, receiver);
       this.incoming.delete(msg.id);
+      this.clearEarlyChunks(msg.id);
       return;
     }
     // Use the integer accumulator as the source of truth. Computing
@@ -1397,6 +1472,7 @@ export class FlingRoom {
     // into task-progress, which made sender/receiver progress comparisons
     // look inconsistent and could leave a target one fraction short.
     this.events.onFileProgress?.(msg.id, receiver.receivedByteCount, receiver.totalBytes);
+    if (typeof msg.savedBytes === 'number') this.events.onFileSavedProgress?.(msg.id, msg.savedBytes);
     // Both transports use the same application-level receive ACK. Direct
     // ACKs detect a UDP black hole; relay ACKs keep LiveKit's reliable queue
     // from being flooded by publish() calls that only completed locally.
@@ -1550,6 +1626,8 @@ export class FlingRoom {
   async close(): Promise<void> {
     if (this.helloTimer) clearInterval(this.helloTimer);
     this.earlyChunks.clear();
+    this.earlyChunkBytes.clear();
+    this.earlyChunkTotalBytes = 0;
     for (const entry of this.incoming.values()) this.clearProgressAckHeartbeat(entry);
     this.completedFiles.clear();
     this.cancelAllChunkAckWaiters();
