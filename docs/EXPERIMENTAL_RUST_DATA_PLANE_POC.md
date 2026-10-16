@@ -19,7 +19,7 @@
 
 ## Windows EXE 与首次启动
 
-专用 GitHub Actions workflow 从 `experiment/rust-data-plane-poc` 分支构建 Windows 测试产物。下载该次运行的 `fling-desktop-Windows` artifact，解压后运行其中独立的 `.exe`。**不要卸载或覆盖现有 v0.6.3 安装。** 该 workflow 在实验分支上只上传 Actions artifact；不创建版本 tag，也不发布 GitHub Release。
+专用 GitHub Actions workflow 从 `experiment/rust-data-plane-poc` 分支构建 Windows 测试产物。本次成功运行：[#38840251305](https://github.com/tommsoft2011-del/fling/actions/runs/38840251305)，源代码提交为 `d023669033ebed9147d7c398439624d5e92eba7d`。从 [fling-desktop-Windows artifact](https://github.com/tommsoft2011-del/fling/actions/runs/38840251305/artifacts/12020983330) 下载并解压；可运行 `Fling-portable-x64.exe`，也附带 MSI/NSIS 安装包。portable EXE 的 SHA-256：`02147508527fc9910aa591f2c0b78f9c7de37c87bc9a6cd5dc8b9a2018cfa721`。**不要卸载或覆盖现有 v0.6.3 安装。** 该 workflow 在实验分支上只上传 Actions artifact；不创建版本 tag，也不发布 GitHub Release。
 
 首次启动时，在 POC 中填写与 v0.6.3 测试端相同的 Fling Server URL/API 配置。因为应用标识不同，POC 不会读取或覆盖生产版本地配置。
 
