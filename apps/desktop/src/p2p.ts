@@ -1,16 +1,14 @@
-// P2P direct file channel over WebRTC.
-//
-// LiveKit stays the signaling pipe (SDP / ICE go through the end-to-end
-// encrypted relay) and provides the ICE/STUN hole-punching rendezvous.
-// File bytes then flow over a direct RTCPeerConnection data channel between
-// the two machines — LAN or WAN, wherever ICE can establish a path.
-// If the handshake fails or the channel drops, FlingRoom silently falls
-// back to relaying file chunks over LiveKit (per-chunk routing).
+// Experimental Rust-owned WebRTC data plane. The LiveKit room remains the
+// existing end-to-end encrypted signaling/control path; this bridge forwards
+// the unchanged p2p-* signals and FLNG frames to the native Rust peer.
 
+import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
   P2P_CONNECT_TIMEOUT_MS,
   P2P_DRAIN_THRESHOLD,
   P2P_DRAIN_TIMEOUT_MS,
+  randomId,
   type DirectChannel,
   type FlingMessage,
   type FlingRoom,
@@ -18,18 +16,15 @@ import {
 import { log } from './log.js';
 
 export type P2PState = 'idle' | 'connecting' | 'open' | 'failed';
+type P2PSignal = Extract<FlingMessage, { kind: `p2p-${string}` }>;
 
-/** Default STUN servers for ICE host/srflx discovery. No TURN here: when a
- *  direct path can't be built (e.g. symmetric NAT on both ends) we fall back
- *  to the LiveKit relay instead of paying for a TURN server. */
+/** Default STUN servers for ICE host/srflx discovery. */
 export const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
 ];
 
-const DC_LABEL = 'fling-file';
-
-/** 运行时覆盖 ICE（配置文件里配了 TURN 就追加到默认 STUN 后面） */
+/** Runtime TURN override. */
 let customIce: RTCIceServer[] | null = null;
 export function setCustomIceServers(servers: RTCIceServer[]): void {
   customIce = servers;
@@ -38,84 +33,153 @@ export function getIceServers(): RTCIceServer[] {
   return customIce ?? DEFAULT_ICE_SERVERS;
 }
 
-class RTCDirectChannel implements DirectChannel {
+interface NativeP2PEvent {
+  sessionId: string;
+  event: 'signal' | 'open' | 'message' | 'closed' | 'failed';
+  signal?: P2PSignal;
+  data?: number[];
+  maxMessageSize?: number;
+  error?: string;
+}
+
+interface DrainWaiter {
+  threshold: number;
+  resolve: () => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Implements the existing Fling DirectChannel contract over native Rust IPC.
+ * Rust and this bridge keep at most 1 MiB of unsent frames; FlingRoom's
+ * existing adaptive windows and application ACKs remain the authoritative
+ * transfer/backpressure/recovery mechanism.
+ */
+class RustDirectChannel implements DirectChannel {
+  readonly label: string;
+  readonly maxMessageSize = 64 * 1024;
   onmessage: ((data: Uint8Array<ArrayBuffer>) => void) | null = null;
   onclose: (() => void) | null = null;
 
-  constructor(
-    private dc: RTCDataChannel,
-    readonly label: string,
-    readonly maxMessageSize: number,
-  ) {
-    dc.binaryType = 'arraybuffer';
-    dc.bufferedAmountLowThreshold = P2P_DRAIN_THRESHOLD;
-    dc.onmessage = (e) => {
-      const data = e.data;
-      if (data instanceof ArrayBuffer) this.onmessage?.(new Uint8Array(data) as Uint8Array<ArrayBuffer>);
-      else if (data instanceof Blob) {
-        void data.arrayBuffer().then((buf) => this.onmessage?.(new Uint8Array(buf)));
-      }
-    };
-    dc.onclose = () => this.onclose?.();
+  private state: 'connecting' | 'open' | 'closed' = 'connecting';
+  private queuedBytes = 0;
+  private queue: Promise<void> = Promise.resolve();
+  private waiters = new Set<DrainWaiter>();
+  private readonly maxQueuedBytes = 1024 * 1024;
+
+  constructor(private readonly sessionId: string, label: string) {
+    this.label = label;
   }
 
   get readyState(): string {
-    return this.dc.readyState;
+    return this.state;
   }
   get bufferedAmount(): number {
-    return this.dc.bufferedAmount;
+    return this.queuedBytes;
   }
-  send(data: Uint8Array<ArrayBuffer>): void {
-    this.dc.send(data);
+
+  markOpen(): void {
+    if (this.state !== 'closed') this.state = 'open';
   }
-  close(): void {
+
+  deliver(data: Uint8Array): void {
+    if (this.state !== 'open') return;
+    if (data.byteLength > 128 * 1024 + 30) {
+      this.markClosed(new Error('native frame exceeds the POC limit'));
+      return;
+    }
     try {
-      this.dc.close();
-    } catch {
-      /* ignore */
+      this.onmessage?.(new Uint8Array(data) as Uint8Array<ArrayBuffer>);
+    } finally {
+      // Rust waits for this handoff before reading the next DataChannel message.
+      void invoke('native_p2p_ack_receive', { sessionId: this.sessionId }).catch(() => {});
     }
   }
-  waitForDrain(threshold: number): Promise<void> {
-    if (this.dc.bufferedAmount <= threshold) return Promise.resolve();
-    if (this.dc.readyState !== 'open') return Promise.reject(new Error('direct channel is not open'));
-    return new Promise((resolve, reject) => {
-      let timer: ReturnType<typeof setTimeout>;
-      let onLow: () => void;
-      let onClose: () => void;
-      const finish = (error?: Error) => {
-        clearTimeout(timer);
-        this.dc.removeEventListener('bufferedamountlow', onLow);
-        this.dc.removeEventListener('close', onClose);
-        if (error) reject(error);
-        else resolve();
-      };
-      onLow = () => {
-        if (this.dc.readyState === 'open' && this.dc.bufferedAmount <= threshold) finish();
-        else finish(new Error('direct channel did not drain'));
-      };
-      onClose = () => finish(new Error('direct channel closed while draining'));
-      timer = setTimeout(() => finish(new Error('direct channel drain timeout')), P2P_DRAIN_TIMEOUT_MS);
-      this.dc.addEventListener('bufferedamountlow', onLow);
-      this.dc.addEventListener('close', onClose);
-      if (this.dc.bufferedAmount <= threshold) onLow();
-      else if (this.dc.readyState !== 'open') onClose();
+
+  send(data: Uint8Array<ArrayBuffer>): void {
+    if (this.state !== 'open') throw new Error('native direct channel is not open');
+    const length = data.byteLength;
+    if (!length || length > 128 * 1024 + 30) throw new Error('invalid native direct frame size');
+    if (this.queuedBytes + length > this.maxQueuedBytes) {
+      throw new Error('native direct send queue reached its 1 MiB bound');
+    }
+    const payload = Array.from(data);
+    this.queuedBytes += length;
+    const operation = this.queue.then(async () => {
+      await invoke<number>('native_p2p_send', { sessionId: this.sessionId, data: payload });
     });
+    this.queue = operation.catch((error: unknown) => {
+      this.markClosed(error instanceof Error ? error : new Error(String(error)));
+    });
+    void operation.then(
+      () => this.completeSend(length),
+      () => this.completeSend(length),
+    );
+  }
+
+  private completeSend(length: number): void {
+    this.queuedBytes = Math.max(0, this.queuedBytes - length);
+    this.resolveDrainWaiters();
+  }
+
+  private resolveDrainWaiters(): void {
+    for (const waiter of [...this.waiters]) {
+      if (this.state === 'closed') {
+        clearTimeout(waiter.timer);
+        this.waiters.delete(waiter);
+        waiter.reject(new Error('native direct channel closed while draining'));
+      } else if (this.queuedBytes <= waiter.threshold) {
+        clearTimeout(waiter.timer);
+        this.waiters.delete(waiter);
+        waiter.resolve();
+      }
+    }
+  }
+
+  waitForDrain(threshold: number): Promise<void> {
+    if (this.queuedBytes <= threshold) return Promise.resolve();
+    if (this.state !== 'open') return Promise.reject(new Error('native direct channel is not open'));
+    return new Promise((resolve, reject) => {
+      const waiter: DrainWaiter = {
+        threshold,
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          this.waiters.delete(waiter);
+          reject(new Error('native direct channel drain timeout'));
+        }, P2P_DRAIN_TIMEOUT_MS),
+      };
+      this.waiters.add(waiter);
+      this.resolveDrainWaiters();
+    });
+  }
+
+  markClosed(error?: Error): void {
+    if (this.state === 'closed') return;
+    this.state = 'closed';
+    this.resolveDrainWaiters();
+    if (error) log('p2p', 'native direct channel closed', { error: error.message });
+    this.onclose?.();
+  }
+
+  close(): void {
+    if (this.state === 'closed') return;
+    this.markClosed();
   }
 }
 
 export class P2PLink {
-  private pc: RTCPeerConnection | null = null;
-  private pendingIce: RTCIceCandidateInit[] = [];
-  private remoteSet = false;
+  private readonly sessionId = randomId(16);
+  private readonly channel: RustDirectChannel;
+  private listeners: UnlistenFn[] = [];
+  private listenerPromise: Promise<void> | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private _state: P2PState = 'idle';
-  private iceLocal = 0;
-  private iceRemote = 0;
-  /** 诊断用：收集到的本地/远端 candidate 类型（host/srflx/relay + 协议） */
-  private iceLocalTypes = new Set<string>();
-  private iceRemoteTypes = new Set<string>();
-  /** 正常关闭（任务结束）时不报 failed，避免日志误导 */
   private closed = false;
+  private nativeStarted = false;
+  private remoteSet = false;
+  private pendingIce: string[] = [];
+  private pendingAnswer: P2PSignal | null = null;
   onstate: ((s: P2PState) => void) | null = null;
 
   constructor(
@@ -123,183 +187,62 @@ export class P2PLink {
     private role: 'initiator' | 'responder',
     private peerLabel: string,
     private iceServers: RTCIceServer[] = getIceServers(),
-  ) {}
+  ) {
+    this.channel = new RustDirectChannel(this.sessionId, this.peerLabel);
+    this.channel.onclose = () => {
+      if (!this.closed && this._state === 'open') this.fail('native data channel closed');
+    };
+  }
 
   get state(): P2PState {
     return this._state;
   }
 
-  /** 从 candidate SDP 行提取 "类型/协议"，如 "host/udp"、"relay/tcp"。失败不抛错。 */
-  private static candKind(cand: string): string {
+  private setState(state: P2PState): void {
+    if (this._state === state) return;
+    this._state = state;
     try {
-      const t = /typ (host|srflx|prflx|relay)/.exec(cand)?.[1] ?? '?';
-      const p = /\s(udp|tcp)\s/i.exec(cand)?.[1]?.toLowerCase() ?? '?';
-      return `${t}/${p}`;
+      this.onstate?.(state);
     } catch {
-      return '?/?';
+      /* ignore observer errors */
     }
   }
 
-  /**
-   * 诊断：直连建立后，从 getStats 里找出选中的 candidate pair 并记日志。
-   * 这是判断"到底走了直连/host、srflx 打洞还是 TURN 中转"的唯一可靠证据。
-   */
-  private logSelectedPair(pc: RTCPeerConnection): void {
-    void (async () => {
-      try {
-        const stats = await pc.getStats();
-        const locals = new Map<string, any>();
-        const remotes = new Map<string, any>();
-        let pair: any = null;
-        stats.forEach((s: any) => {
-          if (s.type === 'local-candidate') locals.set(s.id, s);
-          else if (s.type === 'remote-candidate') remotes.set(s.id, s);
-          else if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s;
-        });
-        if (!pair) {
-          stats.forEach((s: any) => {
-            if (s.type === 'candidate-pair' && s.state === 'succeeded' && (!pair || s.priority > pair.priority))
-              pair = s;
-          });
+  private async ensureListeners(): Promise<void> {
+    if (this.listenerPromise) return this.listenerPromise;
+    this.listenerPromise = (async () => {
+      this.listeners.push(await listen<NativeP2PEvent>('fling-native-p2p', (event) => {
+        const payload = event.payload;
+        if (payload.sessionId !== this.sessionId || this.closed) return;
+        switch (payload.event) {
+          case 'signal':
+            if (payload.signal) void this.room.sendSignal(payload.signal).catch(() => {});
+            break;
+          case 'open':
+            if (this.timer) clearTimeout(this.timer);
+            this.timer = null;
+            this.channel.markOpen();
+            this.room.setDirectChannel(this.channel);
+            log('p2p', 'Rust-owned direct channel open', {
+              peer: this.peerLabel,
+              maxMessageSize: payload.maxMessageSize,
+              signaling: 'existing encrypted LiveKit p2p-*',
+            });
+            this.setState('open');
+            break;
+          case 'message':
+            if (Array.isArray(payload.data)) this.channel.deliver(new Uint8Array(payload.data));
+            break;
+          case 'closed':
+            this.channel.markClosed();
+            break;
+          case 'failed':
+            this.fail(payload.error ?? 'native WebRTC failed');
+            break;
         }
-        if (pair) {
-          const l = locals.get(pair.localCandidateId);
-          const r = remotes.get(pair.remoteCandidateId);
-          const relayed = l?.candidateType === 'relay' || r?.candidateType === 'relay';
-          log('p2p', 'selected pair', {
-            role: this.role,
-            peer: this.peerLabel,
-            local: `${l?.candidateType ?? '?'}/${l?.protocol ?? '?'}`,
-            remote: `${r?.candidateType ?? '?'}/${r?.protocol ?? '?'}`,
-            localNetworkType: l?.networkType,
-            remoteNetworkType: r?.networkType,
-            relayed,
-            currentRoundTripTimeMs: Number.isFinite(pair.currentRoundTripTime)
-              ? Math.round(pair.currentRoundTripTime * 1_000)
-              : undefined,
-            availableOutgoingBitrateMbps: Number.isFinite(pair.availableOutgoingBitrate)
-              ? Math.round(pair.availableOutgoingBitrate / 1_000_000 * 100) / 100
-              : undefined,
-            pairBytesSent: Number.isFinite(pair.bytesSent) ? pair.bytesSent : undefined,
-            pairBytesReceived: Number.isFinite(pair.bytesReceived) ? pair.bytesReceived : undefined,
-          });
-        } else {
-          log('p2p', 'no selected pair in stats', { role: this.role, peer: this.peerLabel });
-        }
-      } catch {
-        /* 诊断失败不影响传输 */
-      }
+      }));
     })();
-  }
-
-  private setState(s: P2PState): void {
-    if (this._state === s) return;
-    this._state = s;
-    try {
-      this.onstate?.(s);
-    } catch {
-      /* ignore */
-    }
-  }
-
-  private fail(reason: string): void {
-    if (this._state === 'failed' || this.closed) return;
-    // Whether the handshake never completed or an established channel just
-    // dropped: detach the direct path so traffic falls back to the relay.
-    log('p2p', `link failed: ${reason}`, {
-      role: this.role,
-      peer: this.peerLabel,
-      was: this._state,
-      iceLocal: this.iceLocal,
-      iceRemote: this.iceRemote,
-      // 诊断关键：两端各收集到了什么类型的 candidate。
-      // 若本地没有 relay/udp，说明 TURN 没生效（配置未加载/凭证错/端口不通）；
-      // 若远端类型为空，说明对端 candidate 没送达（信令问题）。
-      iceLocalTypes: [...this.iceLocalTypes],
-      iceRemoteTypes: [...this.iceRemoteTypes],
-    });
-    this.setState('failed');
-    try {
-      // Route all established-path failures through the room's fallback
-      // transition so file replay, progress health, and the app-level link
-      // owner observe the same generation change.
-      this.room.fallbackToRelay(reason);
-    } catch {
-      /* ignore */
-    }
-    this.closePc();
-  }
-
-  /** Force an established but unresponsive path over to the relay. */
-  fallbackToRelay(reason: string): void {
-    this.fail(reason);
-  }
-
-  private newPc(): RTCPeerConnection | null {
-    if (typeof RTCPeerConnection === 'undefined') return null;
-    const pc = new RTCPeerConnection({ iceServers: this.iceServers });
-    pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        this.iceLocal++;
-        this.iceLocalTypes.add(P2PLink.candKind(e.candidate.candidate));
-      }
-      const candidate = e.candidate ? JSON.stringify(e.candidate.toJSON()) : null;
-      void this.room
-        .sendSignal({ kind: 'p2p-ice', candidate } as FlingMessage)
-        .catch(() => {});
-    };
-    pc.onconnectionstatechange = () => {
-      log('p2p', `pc connectionState -> ${pc.connectionState}`, {
-        role: this.role,
-        peer: this.peerLabel,
-      });
-      if (pc.connectionState === 'failed') this.fail('pc connection failed');
-    };
-    return pc;
-  }
-
-  private wireDataChannel(dc: RTCDataChannel): void {
-    dc.onopen = () => {
-      if (this.timer) {
-        clearTimeout(this.timer);
-        this.timer = null;
-      }
-      log('p2p', 'direct channel open', {
-        role: this.role,
-        peer: this.peerLabel,
-        iceLocal: this.iceLocal,
-        iceRemote: this.iceRemote,
-        iceLocalTypes: [...this.iceLocalTypes],
-        iceRemoteTypes: [...this.iceRemoteTypes],
-      });
-      // 诊断关键：记录最终选中的链路（host 直连 / srflx 打洞 / relay 中转）
-      if (this.pc) this.logSelectedPair(this.pc);
-      this.setState('open');
-      try {
-        const direct = new RTCDirectChannel(
-          dc,
-          this.peerLabel,
-          this.pc?.sctp?.maxMessageSize ?? 64 * 1024,
-        );
-        // RTCDirectChannel owns the native onclose slot after wrapping the
-        // browser channel, so wire the P2P link's failure path through the
-        // wrapper as well. Without this, a closed channel could remain
-        // attached to FlingRoom until the next send happened to notice it.
-        direct.onclose = () => {
-          if (!this.closed && this._state === 'open') this.fail('data channel closed');
-        };
-        this.room.setDirectChannel(direct);
-      } catch (e) {
-        this.fail(`setDirectChannel threw: ${(e as Error).message}`);
-      }
-    };
-    dc.onclose = () => {
-      if (this.closed) return;
-      if (this._state === 'open') this.fail('data channel closed');
-    };
-    dc.onerror = () => {
-      if (this._state !== 'open') this.fail('data channel error');
-    };
+    return this.listenerPromise;
   }
 
   private armTimeout(): void {
@@ -310,125 +253,131 @@ export class P2PLink {
     }, P2P_CONNECT_TIMEOUT_MS);
   }
 
-  /** Initiator: create offer and start ICE. */
+  private async startNativePeer(): Promise<void> {
+    if (this.nativeStarted) return;
+    await this.ensureListeners();
+    await invoke('native_p2p_start', {
+      sessionId: this.sessionId,
+      role: this.role,
+      iceServers: this.iceServers,
+    });
+    this.nativeStarted = true;
+  }
+
+  /** Initiator: Rust creates the DataChannel and emits the existing p2p-offer. */
   async start(): Promise<void> {
-    if (this.role !== 'initiator' || this.pc) return;
-    const pc = this.newPc();
-    if (!pc) {
-      this.fail('RTCPeerConnection unavailable');
-      return;
-    }
-    this.pc = pc;
+    if (this.role !== 'initiator' || this.nativeStarted || this.closed) return;
     this.setState('connecting');
     this.armTimeout();
-    log('p2p', 'initiator start', { peer: this.peerLabel });
+    log('p2p', 'starting Rust WebRTC initiator', { peer: this.peerLabel });
     try {
-      const dc = pc.createDataChannel(DC_LABEL, { ordered: true });
-      this.wireDataChannel(dc);
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      log('p2p', 'offer sent', { sdpBytes: (offer.sdp ?? '').length });
-      await this.room.sendSignal({ kind: 'p2p-offer', sdp: offer.sdp ?? '' });
-    } catch (e) {
-      this.fail(`initiator start threw: ${(e as Error).message}`);
+      await this.startNativePeer();
+      if (this.pendingAnswer) {
+        const answer = this.pendingAnswer;
+        this.pendingAnswer = null;
+        await this.applyAnswer(answer);
+      }
+    } catch (error) {
+      this.fail(`native initiator start failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  /** Responder: accept the initiator's offer. */
+  /** Responder: accept the unchanged offer and answer over LiveKit signaling. */
   async acceptOffer(sdp: string): Promise<void> {
-    if (this.role !== 'responder' || this.pc) return;
-    const pc = this.newPc();
-    if (!pc) {
-      this.fail('RTCPeerConnection unavailable');
-      return;
-    }
-    this.pc = pc;
+    if (this.role !== 'responder' || this.nativeStarted || this.closed) return;
     this.setState('connecting');
     this.armTimeout();
-    pc.ondatachannel = (e) => this.wireDataChannel(e.channel);
-    log('p2p', 'responder accept', { peer: this.peerLabel, sdpBytes: sdp.length });
+    log('p2p', 'starting Rust WebRTC responder', { peer: this.peerLabel, sdpBytes: sdp.length });
     try {
-      await pc.setRemoteDescription({ type: 'offer', sdp });
+      await this.startNativePeer();
+      await invoke('native_p2p_accept_offer', { sessionId: this.sessionId, sdp });
       this.remoteSet = true;
       await this.flushIce();
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      log('p2p', 'answer sent', { sdpBytes: (answer.sdp ?? '').length });
-      await this.room.sendSignal({ kind: 'p2p-answer', sdp: answer.sdp ?? '' });
-    } catch (e) {
-      this.fail(`responder accept threw: ${(e as Error).message}`);
+    } catch (error) {
+      this.fail(`native responder offer failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  /** Route an inbound p2p-* signal to this link. */
-  async handleSignal(sig: Extract<FlingMessage, { kind: `p2p-${string}` }>): Promise<void> {
-    const pc = this.pc;
-    if (!pc) return;
+  /** Route inbound p2p-answer / p2p-ice messages from the existing FlingRoom. */
+  async handleSignal(signal: P2PSignal): Promise<void> {
+    if (this.closed) return;
     try {
-      if (sig.kind === 'p2p-answer' && this.role === 'initiator') {
-        log('p2p', 'answer received');
-        await pc.setRemoteDescription({ type: 'answer', sdp: sig.sdp });
-        this.remoteSet = true;
-        await this.flushIce();
-      } else if (sig.kind === 'p2p-ice') {
-        if (!sig.candidate) return; // end-of-candidates
-        this.iceRemote++;
-        const init = JSON.parse(sig.candidate) as RTCIceCandidateInit;
-        if (init.candidate) this.iceRemoteTypes.add(P2PLink.candKind(init.candidate));
-        if (this.remoteSet) {
-          await pc.addIceCandidate(new RTCIceCandidate(init));
-        } else {
-          this.pendingIce.push(init);
+      if (signal.kind === 'p2p-answer' && this.role === 'initiator') {
+        if (!this.nativeStarted) {
+          this.pendingAnswer = signal;
+          return;
         }
+        await this.applyAnswer(signal);
+      } else if (signal.kind === 'p2p-ice' && signal.candidate) {
+        if (!this.nativeStarted || !this.remoteSet) {
+          this.pendingIce.push(signal.candidate);
+          return;
+        }
+        await invoke('native_p2p_handle_signal', { sessionId: this.sessionId, signal });
       }
     } catch {
-      /* a bad signal must not kill the relay fallback */
+      // Preserve the production relay path if an experimental signal is rejected.
     }
   }
 
-  /** offer 到达前就收到的远端 ICE candidate（task 层缓存转交），进 pending 队列等 setRemoteDescription 后 flush */
-  addRemoteIce(init: RTCIceCandidateInit): void {
-    this.pendingIce.push(init);
-    this.iceRemote++;
-    if (init.candidate) this.iceRemoteTypes.add(P2PLink.candKind(init.candidate));
+  private async applyAnswer(signal: P2PSignal): Promise<void> {
+    await invoke('native_p2p_handle_signal', { sessionId: this.sessionId, signal });
+    this.remoteSet = true;
+    await this.flushIce();
+  }
+
+  /** ICE can arrive before its offer/answer; keep it until the remote SDP is set. */
+  addRemoteIce(candidate: RTCIceCandidateInit): void {
+    this.pendingIce.push(JSON.stringify(candidate));
   }
 
   private async flushIce(): Promise<void> {
-    const pc = this.pc;
-    if (!pc) return;
+    if (!this.nativeStarted || !this.remoteSet) return;
     const pending = this.pendingIce;
     this.pendingIce = [];
-    for (const init of pending) {
-      try {
-        await pc.addIceCandidate(new RTCIceCandidate(init));
-      } catch {
-        /* ignore */
-      }
+    for (const candidate of pending) {
+      await invoke('native_p2p_handle_signal', {
+        sessionId: this.sessionId,
+        signal: { kind: 'p2p-ice', candidate },
+      });
     }
+  }
+
+  private fail(reason: string): void {
+    if (this._state === 'failed' || this.closed) return;
+    log('p2p', `Rust WebRTC link failed: ${reason}`, { role: this.role, peer: this.peerLabel });
+    this.setState('failed');
+    try {
+      this.room.fallbackToRelay(reason);
+    } catch {
+      /* keep existing transfer fallback available */
+    }
+    this.disposeNative();
+  }
+
+  fallbackToRelay(reason: string): void {
+    this.fail(reason);
   }
 
   close(): void {
+    if (this.closed) return;
     this.closed = true;
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-    this.closePc();
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    this.room.setDirectChannel(null);
+    this.channel.markClosed();
+    this.disposeNative();
     if (this._state !== 'idle') this.setState('idle');
   }
 
-  private closePc(): void {
-    const pc = this.pc;
-    this.pc = null;
-    if (pc) {
-      try {
-        pc.onicecandidate = null;
-        pc.ondatachannel = null;
-        pc.onconnectionstatechange = null;
-        pc.close();
-      } catch {
-        /* ignore */
-      }
-    }
+  private disposeNative(): void {
+    this.closed = true;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+    this.room.setDirectChannel(null);
+    this.channel.markClosed();
+    void invoke('native_p2p_close', { sessionId: this.sessionId }).catch(() => {});
+    for (const unlisten of this.listeners) unlisten();
+    this.listeners = [];
   }
 }

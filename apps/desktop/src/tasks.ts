@@ -55,13 +55,17 @@ export function errText(e: unknown): string {
 interface SavedReceivedFileResult {
   path: string;
   writeAllMs: number;
+  hashUpdateMs: number;
+  sha256FinalizeMs: number;
   syncAllMs: number;
+  commitElapsedMs: number;
 }
 
 interface AppendedReceivedFileBatchResult {
   bytes: number;
   cumulativeBytes: number;
   writeElapsedMs: number;
+  hashUpdateMs: number;
 }
 
 async function saveReceivedFile(
@@ -106,6 +110,7 @@ async function saveReceivedFile(
       log('xfer', 'stream save batch', {
         taskId, xfer, bytes: result.bytes, invokeElapsedMs,
         rustWriteElapsedMs: result.writeElapsedMs,
+        rustHashUpdateMs: result.hashUpdateMs,
         cumulativeBytes: result.cumulativeBytes, queueDepth: 0,
       });
       onBatch?.(bytes);
@@ -120,8 +125,17 @@ async function saveReceivedFile(
     log('xfer', 'Rust write_all stage', {
       taskId, xfer, size, status: 'ok', elapsedMs: result.writeAllMs,
     });
+    log('xfer', 'Rust incremental SHA-256 update stage', {
+      taskId, xfer, size, status: 'ok', elapsedMs: result.hashUpdateMs,
+    });
+    log('xfer', 'Rust SHA-256 final verify stage', {
+      taskId, xfer, size, status: 'ok', elapsedMs: result.sha256FinalizeMs,
+    });
     log('xfer', 'Rust sync_all stage', {
       taskId, xfer, size, status: 'ok', elapsedMs: result.syncAllMs,
+    });
+    log('xfer', 'Rust atomic commit stage', {
+      taskId, xfer, size, status: 'ok', elapsedMs: result.commitElapsedMs,
     });
     log('xfer', 'Tauri save IPC end', {
       taskId, xfer, size, status: 'ok', elapsedMs: Date.now() - startedAt,
@@ -725,9 +739,15 @@ export class SendTask {
       // final ACK. Waiting 30 seconds here used to hide the real item-level
       // relay failure and keep the broken room alive; close promptly after a
       // failed item, while preserving the full end-to-end wait for success.
+      const finalAckStartedAt = performance.now();
       const acked = okCount === this.items.length
         ? await this.waitForAck(30_000)
         : false;
+      log('task', 'final task-ack phase', {
+        taskId: this.taskId,
+        acked,
+        elapsedMs: performance.now() - finalAckStartedAt,
+      });
       this.stopDirectHealth();
       log('task', acked ? 'ack ok, closing' : 'ack timeout, closing anyway', {
         taskId: this.taskId,
@@ -759,6 +779,7 @@ export class SendTask {
         ok: `${okCount}/${this.items.length}`,
         p2p: this.p2p,
         acked,
+        elapsedMs: (this.endedAt ?? Date.now()) - this.startedAt,
       });
       void flushLogs();
       await this.archive();
@@ -1133,6 +1154,8 @@ export class RecvTask {
   private expectedManifests = 0;
   /** 已收到的 manifest 个数 */
   private manifestsReceived = 0;
+  /** Per-file first-byte timestamp for the receive phase measurement. */
+  private receiveStartedAt = new Map<string, number>();
   /** 收到的剪贴板图片（供"另存为文件"） */
   clipImages = new Map<string, Uint8Array>();
 
@@ -1369,6 +1392,7 @@ export class RecvTask {
   private onProgress(id: string, r: number, t: number): void {
     const item = this.manifestToItem.get(id);
     if (!item) return;
+    if (r > 0 && !this.receiveStartedAt.has(id)) this.receiveStartedAt.set(id, Date.now());
     // 诊断：doneBytes 倒退说明条目错配或重复计数
     if (r < item.doneBytes) {
       log('xfer', 'PROGRESS BACKWARDS', {
@@ -1442,6 +1466,17 @@ export class RecvTask {
   private async onFileComplete(id: string, m: FileManifest, receiver: FileReceiver): Promise<void> {
     const item = this.manifestToItem.get(id);
     if (!item) return;
+    const receiveEndedAt = Date.now();
+    const receiveStartedAt = this.receiveStartedAt.get(id) ?? receiveEndedAt;
+    log('xfer', 'receive payload phase', {
+      taskId: this.taskId,
+      xfer: id.slice(0, 8),
+      size: m.size,
+      status: 'complete',
+      elapsedMs: receiveEndedAt - receiveStartedAt,
+      route: item.transport ?? 'unknown',
+    });
+    this.receiveStartedAt.delete(id);
     item.saving = true;
     item.saveBytes = 0;
     this.notify();
@@ -1603,6 +1638,7 @@ export class RecvTask {
 
   private async finish(completed: boolean): Promise<void> {
     if (this.finished) return;
+    const receiverFinalizationStartedAt = performance.now();
     this.finished = true;
     if (this.progressTimer) {
       clearTimeout(this.progressTimer);
@@ -1652,6 +1688,7 @@ export class RecvTask {
       phase: this.phase,
       failed,
       p2p: this.p2p,
+      elapsedMs: (this.endedAt ?? Date.now()) - this.startedAt,
       items: this.items.map((i) => ({ kind: i.kind, size: i.totalBytes, status: i.status })),
     });
     void flushLogs();
@@ -1665,7 +1702,10 @@ export class RecvTask {
       const room = this.room;
       const sendAck = () => {
         room.sendTaskAck(this.taskId).catch(() => {});
-        log('task', 'task-ack sent', { taskId: this.taskId });
+        log('task', 'task-ack sent', {
+          taskId: this.taskId,
+          receiverFinalizationMs: performance.now() - receiverFinalizationStartedAt,
+        });
       };
       try {
         // 先发最终进度（100%），再发 ack：避免发送端停留在过期的百分比上

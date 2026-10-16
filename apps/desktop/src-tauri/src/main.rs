@@ -22,6 +22,7 @@ use tauri::{Emitter, Manager};
 static HISTORY_IO_LOCK: Mutex<()> = Mutex::new(());
 
 mod embedded_config;
+mod native_p2p;
 
 // ================================================================ config ==
 
@@ -374,7 +375,10 @@ fn write_binary_file(path: String, data_b64: String) -> Result<(), String> {
 struct SaveReceivedFileResult {
     path: String,
     write_all_ms: f64,
+    hash_update_ms: f64,
+    sha256_finalize_ms: f64,
     sync_all_ms: f64,
+    commit_elapsed_ms: f64,
 }
 
 #[tauri::command]
@@ -467,7 +471,10 @@ fn save_received_file(
                 return Ok(SaveReceivedFileResult {
                     path: candidate.to_string_lossy().into_owned(),
                     write_all_ms,
+                    hash_update_ms: 0.0,
+                    sha256_finalize_ms: 0.0,
                     sync_all_ms,
+                    commit_elapsed_ms: 0.0,
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -489,7 +496,10 @@ fn save_received_file(
                         return Ok(SaveReceivedFileResult {
                             path: candidate.to_string_lossy().into_owned(),
                             write_all_ms,
+                            hash_update_ms: 0.0,
+                            sha256_finalize_ms: 0.0,
                             sync_all_ms,
+                            commit_elapsed_ms: 0.0,
                         });
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -588,7 +598,10 @@ fn commit_received_temp_file(
                 return Ok(SaveReceivedFileResult {
                     path: candidate.to_string_lossy().into_owned(),
                     write_all_ms,
+                    hash_update_ms: 0.0,
+                    sha256_finalize_ms: 0.0,
                     sync_all_ms,
+                    commit_elapsed_ms: 0.0,
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -612,7 +625,10 @@ fn commit_received_temp_file(
                         return Ok(SaveReceivedFileResult {
                             path: candidate.to_string_lossy().into_owned(),
                             write_all_ms,
+                            hash_update_ms: 0.0,
+                            sha256_finalize_ms: 0.0,
                             sync_all_ms,
+                            commit_elapsed_ms: 0.0,
                         });
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -642,6 +658,7 @@ struct StreamingReceivedFile {
     written: u64,
     hasher: Sha256,
     write_all_ms: f64,
+    hash_update_ms: f64,
 }
 
 const MAX_RECEIVED_FILE_BATCH_BYTES: usize = 16 * 1024 * 1024;
@@ -675,6 +692,7 @@ struct AppendReceivedFileResult {
     bytes: usize,
     cumulative_bytes: u64,
     write_elapsed_ms: f64,
+    hash_update_ms: f64,
 }
 
 impl Drop for StreamingReceivedFile {
@@ -720,6 +738,7 @@ impl ReceivedFileStore {
             written: 0,
             hasher: Sha256::new(),
             write_all_ms: 0.0,
+            hash_update_ms: 0.0,
         });
         Ok(session_id)
     }
@@ -738,12 +757,16 @@ impl ReceivedFileStore {
                 .write_all(data).map_err(|e| format!("写入失败: {e}"))?;
             let write_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
             session.write_all_ms += write_elapsed_ms;
+            let hash_started = std::time::Instant::now();
             session.hasher.update(data);
+            let hash_update_ms = hash_started.elapsed().as_secs_f64() * 1000.0;
+            session.hash_update_ms += hash_update_ms;
             session.written = next_size;
             Ok(AppendReceivedFileResult {
                 bytes: data.len(),
                 cumulative_bytes: next_size,
                 write_elapsed_ms,
+                hash_update_ms,
             })
         })();
         if result.is_err() {
@@ -760,7 +783,9 @@ impl ReceivedFileStore {
         if session.written != session.expected_size {
             return Err(format!("received file size mismatch (got {}, want {})", session.written, session.expected_size));
         }
+        let hash_finalize_started = std::time::Instant::now();
         let digest = format!("{:x}", session.hasher.clone().finalize());
+        let sha256_finalize_ms = hash_finalize_started.elapsed().as_secs_f64() * 1000.0;
         if !digest.eq_ignore_ascii_case(&session.expected_sha256) {
             return Err("sha256 mismatch while saving received file".to_string());
         }
@@ -769,13 +794,18 @@ impl ReceivedFileStore {
         file.sync_all().map_err(|e| format!("写入失败: {e}"))?;
         let sync_all_ms = sync_started.elapsed().as_secs_f64() * 1000.0;
         drop(file);
-        commit_received_temp_file(
+        let commit_started = std::time::Instant::now();
+        let mut saved = commit_received_temp_file(
             &session.temp_path,
             &session.target_dir,
             &session.clean_name,
             session.write_all_ms,
             sync_all_ms,
-        )
+        )?;
+        saved.hash_update_ms = session.hash_update_ms;
+        saved.sha256_finalize_ms = sha256_finalize_ms;
+        saved.commit_elapsed_ms = commit_started.elapsed().as_secs_f64() * 1000.0;
+        Ok(saved)
     }
 
     fn abort(&self, session_id: &str) -> Result<(), String> {
@@ -1357,6 +1387,7 @@ fn main() {
             app.manage(ConfigLock(Mutex::new(())));
             app.manage(ReceivedFileStore::default());
             app.manage(RemoteConfig(Mutex::new(None)));
+            app.manage(native_p2p::NativeP2pState::default());
             app.manage(DiscoveryState { tx });
             let handle = app.handle().clone();
             let (device_id, device_name) = (cfg.device_id, cfg.device_name);
@@ -1397,7 +1428,13 @@ fn main() {
             read_history,
             append_history,
             get_remote_config_url,
-            apply_remote_config
+            apply_remote_config,
+            native_p2p::native_p2p_start,
+            native_p2p::native_p2p_accept_offer,
+            native_p2p::native_p2p_handle_signal,
+            native_p2p::native_p2p_send,
+            native_p2p::native_p2p_ack_receive,
+            native_p2p::native_p2p_close
         ])
         .run(tauri::generate_context!())
         .expect("error while running fling");

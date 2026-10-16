@@ -28,7 +28,9 @@ hostname = "0.4"
 rand = "0.9"
 open = "5"
 sha2 = "0.10"
-
+webrtc = "0.11"
+bytes = "1"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 [features]
 default = [ "custom-protocol" ]
 custom-protocol = [ "tauri/custom-protocol" ]
