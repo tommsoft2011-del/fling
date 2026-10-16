@@ -969,6 +969,7 @@ export class SendTask {
 
   cancel(): void {
     if (!this.active) return;
+    log('task', 'send cancellation requested', { taskId: this.taskId, phase: this.phase });
     this.cancelled = true;
     clearTimeout(this.waitTimer);
     this.stopAnnounce();
@@ -1003,6 +1004,7 @@ export class SendTask {
       this.notify();
       void this.archive();
       this.closeRooms();
+      log('task', 'send cancellation cleanup requested', { taskId: this.taskId, phase: this.phase });
       if (this.lobbyLeave) {
         this.lobbyLeave();
         this.lobbyLeave = undefined;
@@ -1488,6 +1490,12 @@ export class RecvTask {
 
   private async releaseReceiveSession(id: string, abort: boolean): Promise<void> {
     const sessionId = this.receiveSaveSessions.get(id);
+    log('p2p', 'receiver file cleanup', {
+      taskId: this.taskId,
+      xfer: id.slice(0, 8),
+      action: abort ? 'abort' : 'complete',
+      hasSaveSession: Boolean(sessionId),
+    });
     this.receiveSaveSessions.delete(id);
     this.receiveManifests.delete(id);
     await this.p2pLink?.unbindFile(id);
@@ -1781,6 +1789,7 @@ export class RecvTask {
 
   async cancel(): Promise<void> {
     if (!this.active) return;
+    log('task', 'receive cancellation requested', { taskId: this.taskId, phase: this.phase });
     this.cancelled = true;
     // 先告诉发送方"我取消了"再拆连接；flush 保证取消信令发出去，
     // 否则发送方等 ack 超时（以前还会误标"成功"）。
@@ -1794,9 +1803,10 @@ export class RecvTask {
     } catch {
       /* 忽略 */
     }
-    log('task', 'recv cancelled, task-cancel sent', { taskId: this.taskId });
+    log('task', 'receive cancel signal flushed', { taskId: this.taskId });
     void this.finish(false).then(() => {
       this.phase = 'cancelled';
+      log('task', 'receive cancellation cleanup complete', { taskId: this.taskId, phase: this.phase });
       this.notify();
     });
   }

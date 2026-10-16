@@ -1,12 +1,33 @@
 // 结构化诊断日志：批量写入 Rust 日志文件（按天分文件，保留 7 天）。
-// 用户复现问题后，从设置页打开日志目录，把当天文件发回来分析。
-// 注意：只记元数据（文件名/大小/状态/错误信息），不记文本内容与剪贴板内容。
+// 不写入文件名/路径、内容、设备名、地址、端口、SDP、凭据或原始异常文本。
 import { invoke } from '@tauri-apps/api/core';
 
 export type LogTag = 'app' | 'task' | 'p2p' | 'xfer' | 'net' | 'ui' | 'err';
 
 const queue: string[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
+const SENSITIVE_FIELDS = /^(?:name|filename|fileName|path|filePath|relPath|url|host|turnHost|peer|device|deviceName|sdp|candidate|token|secret|credential|password|apiKey|apiSecret|text|content|error|msg|message)$/i;
+
+function sanitizeText(value: string): string {
+  return value
+    .replace(/\b(?:https?|wss?|turns?|file):\/\/[^\s"'<>]+/gi, '[url-redacted]')
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b/g, '[address-redacted]')
+    .replace(/\b(?:[a-f0-9]{1,4}:){2,}[a-f0-9:]{1,}\b/gi, '[address-redacted]')
+    .replace(/\b(?:[a-z0-9-]+\.)+[a-z]{2,}:\d{1,5}\b/gi, '[address-redacted]')
+    .replace(/(?:[A-Za-z]:[\\/]|\\\\)[^\s"'<>]+/g, '[path-redacted]')
+    .replace(/(^|[\s=])\/(?:[^/\s"'<>]+\/)+[^/\s"'<>]*/g, '$1[path-redacted]')
+    .replace(/\b[^\s"'<>/\\]+\.(?:pdf|docx?|xlsx?|pptx?|rtf|txt|md|csv|json|png|jpe?g|gif|webp|bmp|svg|mp4|mkv|avi|mov|wmv|mp3|wav|flac|ogg|m4a|exe|msi|dll|so|dylib|zip|7z|tar|gz|bin|log)\b/gi, '[filename-redacted]');
+}
+
+function sanitizeValue(value: unknown, key = ''): unknown {
+  if (SENSITIVE_FIELDS.test(key)) return '[redacted]';
+  if (typeof value === 'string') return sanitizeText(value);
+  if (Array.isArray(value)) return value.map((item) => sanitizeValue(item));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([childKey, child]) => [childKey, sanitizeValue(child, childKey)]));
+  }
+  return value;
+}
 
 function dayStamp(d = new Date()): string {
   const p = (n: number) => String(n).padStart(2, '0');
@@ -27,7 +48,9 @@ function timeStamp(d = new Date()): string {
 
 export function log(tag: LogTag, msg: string, data?: Record<string, unknown>): void {
   try {
-    const line = `${timeStamp()} [${tag}] ${msg}${data ? ' ' + JSON.stringify(data) : ''}`;
+    const safeMsg = sanitizeText(msg);
+    const safeData = data ? sanitizeValue(data) as Record<string, unknown> : undefined;
+    const line = `${timeStamp()} [${tag}] ${safeMsg}${safeData ? ' ' + JSON.stringify(safeData) : ''}`;
     queue.push(line);
     // 顺手也打到控制台，方便 devtools 联调
     if (tag === 'err') console.error(line);

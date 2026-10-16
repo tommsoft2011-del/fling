@@ -312,10 +312,15 @@ async function main(): Promise<void> {
   const senderEvents = makeEvents(senderCollected);
   senderEvents.onFileFinalizing = () => { finalizingNotices++; };
   const handoffTrace: string[] = [];
+  const transferXfers: string[] = [];
   senderEvents.onLog = (_tag, message) => {
-    if (message.startsWith('direct window ACK large.bin')) handoffTrace.push('window-ack');
-    else if (message.startsWith('file finalize ACK confirmed')) handoffTrace.push('file-final-ack');
-    else if (message.startsWith('direct window start next.bin')) handoffTrace.push('next-first-window');
+    const selectedXfer = /^file route selected xfer=([^ ]+)/.exec(message)?.[1];
+    if (selectedXfer) transferXfers.push(selectedXfer);
+    const firstXfer = transferXfers[0];
+    const secondXfer = transferXfers[1];
+    if (firstXfer && message.startsWith(`direct window ACK xfer=${firstXfer} `)) handoffTrace.push('window-ack');
+    else if (firstXfer && message.startsWith(`file finalize ACK confirmed (${firstXfer})`)) handoffTrace.push('file-final-ack');
+    else if (secondXfer && message.startsWith(`direct window start xfer=${secondXfer} `)) handoffTrace.push('next-first-window');
   };
   const receiverEvents = makeEvents(receiverCollected);
   receiverEvents.onFileError = () => {};

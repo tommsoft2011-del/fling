@@ -22,6 +22,12 @@ export interface DirectChannel {
   readonly bufferedAmount: number;
   /** Negotiated SCTP maximum message size; Infinity/unknown is clamped by the sender. */
   readonly maxMessageSize: number;
+  /** Local native-send counters; these do not establish peer delivery. */
+  getSendDiagnostics?(): {
+    enqueuedFrames: number;
+    nativeAcceptedFrames: number;
+    nativeFailedFrames: number;
+  };
   /** Compact acknowledgement for a frame already appended by a native sink. */
   onfileframe?: ((frame: {
     id: string;
@@ -29,6 +35,8 @@ export interface DirectChannel {
     chunkCount: number;
     nextSeq: number;
     receivedBytes: number;
+    frameBytes?: number;
+    appendElapsedMs?: number;
   }) => void | Promise<void>) | null;
   send(data: Uint8Array<ArrayBuffer>): void;
   close(): void;

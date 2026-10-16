@@ -39,9 +39,8 @@ export async function initNet(): Promise<void> {
           credential: cfg.turn_password ?? '',
         },
       ]);
-      // 诊断：只记 TURN 主机（不记用户名/密码），确认配置真的进了 ICE 列表
-      const host = /^(?:turns?:)?([^/:;]+)/.exec(cfg.turn_url)?.[1] ?? '?';
-      log('p2p', 'ice servers: STUN x2 + TURN', { turnHost: host });
+      // 诊断只记是否配置，不记录 host、地址或端口。
+      log('p2p', 'ice servers: STUN x2 + TURN', { turnConfigured: true });
     } else {
       log('p2p', 'ice servers: STUN x2 only (no TURN configured)', {});
     }

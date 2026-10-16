@@ -1,0 +1,52 @@
+name: Diagnostic Windows test EXE
+
+on:
+  push:
+    branches:
+      - diag/diagnostic-test-exe-20261016
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic-windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build frontend
+        working-directory: apps/desktop
+        run: bun run build
+
+      - name: Build diagnostic desktop EXE
+        run: cargo build --locked --release --features custom-protocol --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+      - name: Prepare test artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $source = 'apps/desktop/src-tauri/target/release/fling-desktop.exe'
+          $commit = '${{ github.sha }}'
+          $shortCommit = $commit.Substring(0, 12)
+          $destination = "dist/Fling-diagnostic-$shortCommit.exe"
+          Copy-Item $source $destination
+          $hash = (Get-FileHash $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path $destination -Leaf)" | Set-Content 'dist/SHA256SUMS.txt'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Fling-diagnostic-Windows-${{ github.sha }}
+          path: |
+            dist/Fling-diagnostic-*.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14

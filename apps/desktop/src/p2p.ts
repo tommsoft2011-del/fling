@@ -5,6 +5,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
+  diagnosticReasonCode,
   P2P_CONNECT_TIMEOUT_MS,
   P2P_DRAIN_THRESHOLD,
   P2P_DRAIN_TIMEOUT_MS,
@@ -36,7 +37,7 @@ export function getIceServers(): RTCIceServer[] {
 
 interface NativeP2PEvent {
   sessionId: string;
-  event: 'signal' | 'open' | 'message' | 'file-frame' | 'closed' | 'failed';
+  event: 'signal' | 'open' | 'message' | 'file-frame' | 'closed' | 'failed' | 'state';
   signal?: P2PSignal;
   text?: string;
   fileFrame?: {
@@ -45,7 +46,11 @@ interface NativeP2PEvent {
     chunkCount: number;
     nextSeq: number;
     receivedBytes: number;
+    frameBytes?: number;
+    appendElapsedMs?: number;
   };
+  subsystem?: string;
+  state?: string;
   maxMessageSize?: number;
   error?: string;
 }
@@ -75,6 +80,7 @@ class RustDirectChannel implements DirectChannel {
   private queue: Promise<void> = Promise.resolve();
   private waiters = new Set<DrainWaiter>();
   private readonly maxQueuedBytes = 1024 * 1024;
+  private sendCounters = { enqueuedFrames: 0, nativeAcceptedFrames: 0, nativeFailedFrames: 0 };
 
   constructor(private readonly sessionId: string, label: string) {
     this.label = label;
@@ -87,8 +93,16 @@ class RustDirectChannel implements DirectChannel {
     return this.queuedBytes;
   }
 
+  getSendDiagnostics(): { enqueuedFrames: number; nativeAcceptedFrames: number; nativeFailedFrames: number } {
+    return { ...this.sendCounters };
+  }
+
   markOpen(): void {
-    if (this.state !== 'closed') this.state = 'open';
+    if (this.state !== 'closed' && this.state !== 'open') {
+      const previous = this.state;
+      this.state = 'open';
+      log('p2p', 'DataChannel state transition', { from: previous, to: this.state });
+    }
   }
 
   async deliverText(text: string): Promise<void> {
@@ -119,8 +133,15 @@ class RustDirectChannel implements DirectChannel {
       throw new Error('native direct send queue reached its 1 MiB bound');
     }
     this.queuedBytes += length;
+    this.sendCounters.enqueuedFrames++;
     const operation = this.queue.then(async () => {
-      await invoke<number>('native_p2p_send', data, { headers: { 'x-session-id': this.sessionId } });
+      try {
+        await invoke<number>('native_p2p_send', data, { headers: { 'x-session-id': this.sessionId } });
+        this.sendCounters.nativeAcceptedFrames++;
+      } catch (error) {
+        this.sendCounters.nativeFailedFrames++;
+        throw error;
+      }
     });
     this.queue = operation.catch((error: unknown) => {
       this.markClosed(error instanceof Error ? error : new Error(String(error)));
@@ -170,9 +191,14 @@ class RustDirectChannel implements DirectChannel {
 
   markClosed(error?: Error): void {
     if (this.state === 'closed') return;
+    const previous = this.state;
     this.state = 'closed';
     this.resolveDrainWaiters();
-    if (error) log('p2p', 'native direct channel closed', { error: error.message });
+    log('p2p', 'DataChannel state transition', {
+      from: previous,
+      to: this.state,
+      reason: error ? 'native-send-failed' : 'closed',
+    });
     this.onclose?.();
   }
 
@@ -242,7 +268,6 @@ export class P2PLink {
               this.fail(`native file binding failed: ${error instanceof Error ? error.message : String(error)}`);
             });
             log('p2p', 'Rust-owned direct channel open', {
-              peer: this.peerLabel,
               maxMessageSize: payload.maxMessageSize,
               signaling: 'existing encrypted LiveKit p2p-*',
             });
@@ -263,6 +288,14 @@ export class P2PLink {
             break;
           case 'failed':
             this.fail(payload.error ?? 'native WebRTC failed');
+            break;
+          case 'state':
+            if (payload.subsystem && payload.state) {
+              log('p2p', 'native transport state transition', {
+                subsystem: payload.subsystem,
+                state: payload.state,
+              });
+            }
             break;
         }
       }));
@@ -321,7 +354,7 @@ export class P2PLink {
     if (this.role !== 'initiator' || this.nativeStarted || this.closed) return;
     this.setState('connecting');
     this.armTimeout();
-    log('p2p', 'starting Rust WebRTC initiator', { peer: this.peerLabel });
+    log('p2p', 'starting Rust WebRTC initiator', { role: this.role });
     try {
       await this.startNativePeer();
       if (this.pendingAnswer) {
@@ -339,7 +372,7 @@ export class P2PLink {
     if (this.role !== 'responder' || this.nativeStarted || this.closed) return;
     this.setState('connecting');
     this.armTimeout();
-    log('p2p', 'starting Rust WebRTC responder', { peer: this.peerLabel, sdpBytes: sdp.length });
+    log('p2p', 'starting Rust WebRTC responder', { role: this.role, sdpBytes: sdp.length });
     try {
       await this.startNativePeer();
       await invoke('native_p2p_accept_offer', { sessionId: this.sessionId, sdp });
@@ -397,14 +430,14 @@ export class P2PLink {
 
   private fail(reason: string): void {
     if (this._state === 'failed' || this.closed) return;
-    log('p2p', `Rust WebRTC link failed: ${reason}`, { role: this.role, peer: this.peerLabel });
+    log('p2p', 'Rust WebRTC link failed', { reasonCode: diagnosticReasonCode(reason), role: this.role });
     this.setState('failed');
     try {
       this.room.fallbackToRelay(reason);
     } catch {
       /* keep existing transfer fallback available */
     }
-    this.disposeNative();
+    this.disposeNative('failed');
   }
 
   fallbackToRelay(reason: string): void {
@@ -418,18 +451,26 @@ export class P2PLink {
     this.timer = null;
     this.room.setDirectChannel(null);
     this.channel.markClosed();
-    this.disposeNative();
+    this.disposeNative('closed');
     if (this._state !== 'idle') this.setState('idle');
   }
 
-  private disposeNative(): void {
+  private disposeNative(cause: 'failed' | 'closed'): void {
     this.closed = true;
+    log('p2p', 'native P2P cleanup start', {
+      cause,
+      nativeStarted: this.nativeStarted,
+      pendingIce: this.pendingIce.length,
+      pendingFileBindings: this.pendingFiles.size,
+      queuedBytes: this.channel.bufferedAmount,
+    });
     this.pendingFiles.clear();
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     this.room.setDirectChannel(null);
     this.channel.markClosed();
     void invoke('native_p2p_close', { sessionId: this.sessionId }).catch(() => {});
+    log('p2p', 'native P2P cleanup requested', { cause });
     for (const unlisten of this.listeners) unlisten();
     this.listeners = [];
   }

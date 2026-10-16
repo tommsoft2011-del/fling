@@ -13,7 +13,8 @@ function reportGlobalError(where: string, err: unknown): void {
   const msg = err instanceof Error ? err.message : String(err);
   try {
     // log 是同步入队，flush 在后台；这里直接记
-    import('./log.js').then((m) => m.log('ui', 'global error: ' + where, { msg })).catch(() => {});
+    const errorType = err instanceof Error ? err.name : typeof err;
+    import('./log.js').then((m) => m.log('ui', 'global error', { where, errorType })).catch(() => {});
   } catch { /* ignore */ }
   const now = Date.now();
   if (now - lastErrToast > 5000) {
@@ -49,7 +50,7 @@ async function refreshRemoteConfig(): Promise<void> {
       const j = await resp.json();
       if (j.v !== 1 || typeof j.nonce !== 'string' || typeof j.data !== 'string') return;
       await invoke('apply_remote_config', { nonceB64: j.nonce, dataB64: j.data });
-      log('net', 'remote config applied', { url });
+      log('net', 'remote config applied', { configured: true });
     } finally {
       clearTimeout(timer);
     }
@@ -125,7 +126,9 @@ async function startMain(): Promise<void> {
   try {
     await hydrateHistory();
   } catch (e) {
-    log('app', 'disk history unavailable; showing local cache', { error: String(e) });
+    log('app', 'disk history unavailable; showing local cache', {
+      errorType: e instanceof Error ? e.name : typeof e,
+    });
     toast('完整传输历史暂时无法读取，将显示本地缓存', true);
   }
   showMain();
@@ -161,7 +164,8 @@ async function startMain(): Promise<void> {
   }
   try {
     const ver = (await invoke('app_version')) as string;
-    log('app', 'fling started', { version: ver, device: getDeviceName() });
+    log('app', 'diagnostic build identity', { version: ver, buildCommit: __FLING_BUILD_COMMIT__, diagnosticOnly: true });
+    log('p2p', 'diagnostic boundary: local publish resolution does not prove relay receipt or peer delivery');
   } catch {
     /* ignore */
   }

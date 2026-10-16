@@ -9,6 +9,7 @@ use std::{
     collections::HashMap,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use crate::ReceivedFileStore;
@@ -69,6 +70,10 @@ struct NativeP2pEvent {
     max_message_size: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subsystem: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -79,6 +84,8 @@ struct NativeFileFrame {
     chunk_count: u32,
     next_seq: u32,
     received_bytes: u64,
+    frame_bytes: usize,
+    append_elapsed_ms: f64,
 }
 
 #[derive(Clone)]
@@ -115,6 +122,23 @@ impl NativePeer {
             file_frame,
             max_message_size: (event == "open").then_some(ADVERTISED_MAX_MESSAGE_SIZE),
             error,
+            subsystem: None,
+            state: None,
+        };
+        let _ = self.app.emit(EVENT_NAME, payload);
+    }
+
+    fn emit_state(&self, subsystem: &str, state: impl Into<String>) {
+        let payload = NativeP2pEvent {
+            session_id: self.session_id.clone(),
+            event: "state".to_owned(),
+            signal: None,
+            text: None,
+            file_frame: None,
+            max_message_size: None,
+            error: None,
+            subsystem: Some(subsystem.to_owned()),
+            state: Some(state.into()),
         };
         let _ = self.app.emit(EVENT_NAME, payload);
     }
@@ -180,6 +204,7 @@ fn parse_ice_servers(input: Vec<IceServerInput>) -> Result<Vec<RTCIceServer>, St
 }
 
 fn wire_data_channel(peer: Arc<NativePeer>, channel: Arc<RTCDataChannel>) {
+    peer.emit_state("data-channel", format!("{:?}", channel.ready_state()));
     let open_peer = peer.clone();
     let open_channel = channel.clone();
     channel.on_open(Box::new(move || {
@@ -189,10 +214,12 @@ fn wire_data_channel(peer: Arc<NativePeer>, channel: Arc<RTCDataChannel>) {
             match channel.detach().await {
                 Ok(detached) => {
                     *peer.data_channel.lock().await = Some(detached.clone());
+                    peer.emit_state("data-channel", "Open");
                     peer.emit("open", None, None, None, None);
                     tokio::spawn(read_data_channel(peer.clone(), detached));
                 }
                 Err(error) => {
+                    peer.emit_state("data-channel", "Failed");
                     peer.emit(
                         "failed",
                         None,
@@ -209,6 +236,7 @@ fn wire_data_channel(peer: Arc<NativePeer>, channel: Arc<RTCDataChannel>) {
     channel.on_close(Box::new(move || {
         let peer = close_peer.clone();
         Box::pin(async move {
+            peer.emit_state("data-channel", "Closed");
             if !peer.closed.load(Ordering::SeqCst) {
                 peer.emit("closed", None, None, None, None);
             }
@@ -317,6 +345,7 @@ async fn read_data_channel(peer: Arc<NativePeer>, channel: Arc<DetachedDataChann
                         }
                         let mut payload_offset = frame.payload_start;
                         let payload_end = payload_offset + frame.payload_len;
+                        let append_started_at = Instant::now();
                         let mut last_append = None;
                         let mut valid = true;
                         for index in 0..frame.chunk_count {
@@ -377,12 +406,15 @@ async fn read_data_channel(peer: Arc<NativePeer>, channel: Arc<DetachedDataChann
                             );
                             break;
                         };
+                        let append_elapsed_ms = append_started_at.elapsed().as_secs_f64() * 1000.0;
                         Some(NativeFileFrame {
                             id: frame.id,
                             seq: frame.seq,
                             chunk_count: frame.chunk_count,
                             next_seq: append.next_seq,
                             received_bytes: append.cumulative_bytes,
+                            frame_bytes: frame.payload_len,
+                            append_elapsed_ms,
                         })
                     }
                     Ok(None) => {
@@ -530,10 +562,25 @@ pub async fn native_p2p_start(
             emit_local_candidate(&peer, candidate);
         })
     }));
+    let ice_state_peer = peer.clone();
+    pc.on_ice_connection_state_change(Box::new(move |ice_state| {
+        let peer = ice_state_peer.clone();
+        Box::pin(async move {
+            peer.emit_state("ice", format!("{ice_state:?}"));
+        })
+    }));
+    let dtls_peer = peer.clone();
+    pc.sctp().transport().on_state_change(Box::new(move |dtls_state| {
+        let peer = dtls_peer.clone();
+        Box::pin(async move {
+            peer.emit_state("dtls", format!("{dtls_state:?}"));
+        })
+    }));
     let state_peer = peer.clone();
     pc.on_peer_connection_state_change(Box::new(move |connection_state| {
         let peer = state_peer.clone();
         Box::pin(async move {
+            peer.emit_state("peer-connection", format!("{connection_state:?}"));
             if connection_state == RTCPeerConnectionState::Failed {
                 peer.emit(
                     "failed",

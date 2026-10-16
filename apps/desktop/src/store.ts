@@ -102,8 +102,8 @@ function mergeHistory(...groups: HistoryEntry[][]): HistoryEntry[] {
 function cacheHistory(entries: HistoryEntry[]): void {
   try {
     localStorage.setItem(HIST_KEY, JSON.stringify(entries.slice(0, LOCAL_CACHE_LIMIT)));
-  } catch (e) {
-    console.error('fling: history cache write failed:', e);
+  } catch {
+    console.error('fling: history cache write failed');
   }
 }
 
@@ -111,8 +111,8 @@ function persistLine(line: string): Promise<void> {
   const next = writeChain.then(async () => {
     await invoke('append_history', { line });
   });
-  writeChain = next.then(() => {}, (e) => {
-    console.error('fling: disk history write failed:', e);
+  writeChain = next.then(() => {}, () => {
+    console.error('fling: disk history write failed');
   });
   return next;
 }
@@ -153,8 +153,8 @@ export async function saveHistoryEntry(entry: HistoryEntry): Promise<void> {
   cacheHistory(all);
   try {
     await persistLine(JSON.stringify(entry));
-  } catch (e) {
-    console.error('fling: durable history append failed:', e);
+  } catch {
+    console.error('fling: durable history append failed');
   }
 }
 
