@@ -8,7 +8,7 @@ import type { DataHandler, FlingTransport } from '../src/transport.js';
 const RATE_BYTES_PER_SECOND = 7_594_000; // calibrate mock drain rate to the supplied run's weighted receive rate
 const ACK_DELAY_MS = 8;
 const FRAME_BYTES = 32 * 1024 + 26;
-const CANDIDATES = [256 * 1024, 512 * 1024] as const;
+const CANDIDATES = [256 * 1024, 512 * 1024, 1024 * 1024, 2 * 1024 * 1024] as const;
 const NORMAL_REPETITIONS = 3;
 
 type Scenario = 'normal' | 'lost-progress-ack' | 'blackhole-chunks';
@@ -279,7 +279,7 @@ async function main(): Promise<void> {
     const sorted = [...values].sort((a, b) => a - b);
     return sorted[Math.floor(sorted.length / 2)] ?? 0;
   };
-  for (const thresholdKiB of [256, 512]) {
+  for (const thresholdKiB of [256, 512, 1024, 2048]) {
     const normalRuns = samples.filter((sample) => sample.thresholdKiB === thresholdKiB && sample.scenario === 'normal');
     console.log(JSON.stringify({
       thresholdKiB,
@@ -293,13 +293,15 @@ async function main(): Promise<void> {
     }));
   }
   const baseline = samples.filter((sample) => sample.thresholdKiB === 256);
-  const candidate = samples.filter((sample) => sample.thresholdKiB === 512);
   const normalBase = median(baseline.filter((sample) => sample.scenario === 'normal').map((sample) => sample.throughputMBps));
-  const normalCandidate = median(candidate.filter((sample) => sample.scenario === 'normal').map((sample) => sample.throughputMBps));
-  const improvement = (normalCandidate / normalBase - 1) * 100;
-  console.log(`A/B normal throughput delta 512 vs 256 KiB: ${improvement.toFixed(2)}%`);
+  for (const thresholdKiB of [512, 1024, 2048]) {
+    const candidate = samples.filter((sample) => sample.thresholdKiB === thresholdKiB && sample.scenario === 'normal');
+    const normalCandidate = median(candidate.map((sample) => sample.throughputMBps));
+    const improvement = (normalCandidate / normalBase - 1) * 100;
+    console.log(`A/B normal throughput delta ${thresholdKiB} vs 256 KiB control: ${improvement.toFixed(2)}%`);
+  }
   console.log('Isolated shaped-channel result only; no physical LAN/WebRTC claim.');
-  console.log('A/B PASS: identical delivery/recovery outcomes, production default remains 256 KiB pending real-device evidence.');
+  console.log('A/B PASS: identical delivery/recovery outcomes; production drain default remains 256 KiB without real-device evidence.');
 }
 
 main().catch((error) => {

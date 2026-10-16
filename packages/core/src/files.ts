@@ -71,8 +71,10 @@ export async function buildManifest(file: FileLike, kind: FileKind = 'file'): Pr
   };
 }
 
-/** Hard upper bound for one desktop write IPC payload. */
+/** Conservative production default for one sequential desktop write IPC payload. */
 export const FILE_RECEIVE_BATCH_SIZE = 4 * 1024 * 1024;
+/** Hard upper bound used to benchmark larger batches without allowing unbounded IPC payloads. */
+export const FILE_RECEIVE_BATCH_MAX_SIZE = 16 * 1024 * 1024;
 
 /** Receiver-side chunk store with bounded streaming and a legacy array path. */
 export class FileReceiver {
@@ -159,7 +161,7 @@ export class FileReceiver {
   }
 
   /**
-   * Consume a complete file in bounded 4 MiB batches. The callback is awaited before
+   * Consume a complete file in bounded batches. The callback is awaited before
    * the next batch is allocated, providing backpressure to disk/IPC sinks.
    * The sink is responsible for validating the manifest hash before commit.
    */
@@ -169,8 +171,8 @@ export class FileReceiver {
   ): Promise<void> {
     if (!this.isComplete()) throw new Error('missing chunks');
     if (this.consuming || this.consumed) throw new Error('file finalization already started');
-    if (!Number.isInteger(batchSize) || batchSize <= 0 || batchSize > FILE_RECEIVE_BATCH_SIZE) {
-      throw new Error(`invalid stream batch size (max ${FILE_RECEIVE_BATCH_SIZE})`);
+    if (!Number.isInteger(batchSize) || batchSize <= 0 || batchSize > FILE_RECEIVE_BATCH_MAX_SIZE) {
+      throw new Error(`invalid stream batch size (max ${FILE_RECEIVE_BATCH_MAX_SIZE})`);
     }
 
     this.consuming = true;

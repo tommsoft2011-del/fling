@@ -644,7 +644,7 @@ struct StreamingReceivedFile {
     write_all_ms: f64,
 }
 
-const MAX_RECEIVED_FILE_BATCH_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RECEIVED_FILE_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
 fn raw_append_request_parts(
     body: &tauri::ipc::InvokeBody,
@@ -1702,6 +1702,80 @@ mod tests {
             rust_append_elapsed_ms,
             saved.sync_all_ms,
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn streaming_save_benchmarks_bounded_4_8_16_mib_batches() {
+        use std::io::Read;
+        let size = 63_116_252u64;
+        let dir = std::env::temp_dir().join(format!("fling-stream-batch-ab-{}", new_device_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_string_lossy().into_owned();
+        let store = ReceivedFileStore::default();
+        let fill_batch = |buffer: &mut [u8], offset: u64| {
+            for (index, byte) in buffer.iter_mut().enumerate() {
+                *byte = ((offset + index as u64) % 251) as u8;
+            }
+        };
+        let mut expected_hasher = Sha256::new();
+        let mut hash_buffer = vec![0u8; 64 * 1024];
+        let mut offset = 0u64;
+        while offset < size {
+            let length = std::cmp::min(hash_buffer.len() as u64, size - offset) as usize;
+            fill_batch(&mut hash_buffer[..length], offset);
+            expected_hasher.update(&hash_buffer[..length]);
+            offset += length as u64;
+        }
+        let expected_hash = format!("{:x}", expected_hasher.finalize());
+
+        for batch_size in [4usize, 8, 16].map(|mib| mib * 1024 * 1024) {
+            assert!(batch_size <= MAX_RECEIVED_FILE_BATCH_BYTES);
+            let mut batch = vec![0u8; batch_size];
+            let started = std::time::Instant::now();
+            let session = store.begin(
+                dir_str.clone(),
+                format!("batch-{batch_size}.bin"),
+                None,
+                size,
+                expected_hash.clone(),
+            ).unwrap();
+            offset = 0;
+            let mut batches = 0u64;
+            let mut write_all_ms = 0.0;
+            let mut largest_batch = 0usize;
+            while offset < size {
+                let length = std::cmp::min(batch.len() as u64, size - offset) as usize;
+                fill_batch(&mut batch[..length], offset);
+                let appended = store.append(&session, &batch[..length]).unwrap();
+                write_all_ms += appended.write_elapsed_ms;
+                largest_batch = largest_batch.max(appended.bytes);
+                offset += length as u64;
+                batches += 1;
+            }
+            let saved = store.finish(&session).unwrap();
+            assert_eq!(std::fs::metadata(&saved.path).unwrap().len(), size);
+            let mut file = std::fs::File::open(&saved.path).unwrap();
+            let mut actual_hasher = Sha256::new();
+            let mut read_buffer = vec![0u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut read_buffer).unwrap();
+                if read == 0 { break; }
+                actual_hasher.update(&read_buffer[..read]);
+            }
+            assert_eq!(format!("{:x}", actual_hasher.finalize()), expected_hash);
+            assert!(largest_batch <= MAX_RECEIVED_FILE_BATCH_BYTES);
+            println!(
+                "BENCH receive-save batch_bytes={} batches={} total_elapsed_ms={} rust_write_all_ms={:.3} sync_all_ms={:.3} largest_batch_bytes={} strict_sequential=true",
+                batch_size,
+                batches,
+                started.elapsed().as_millis(),
+                write_all_ms,
+                saved.sync_all_ms,
+                largest_batch,
+            );
+            std::fs::remove_file(saved.path).unwrap();
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 

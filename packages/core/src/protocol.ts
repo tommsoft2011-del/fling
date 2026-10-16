@@ -25,14 +25,22 @@ export const FILE_CHUNK_SIZE = 32 * 1024;
 
 /** P2P frame header: magic(4), version(1), type(1), transfer id(12), seq(4), payload length(4). */
 export const DIRECT_FILE_FRAME_HEADER_SIZE = 26;
+/** Additional metadata for direct-only frames containing multiple logical chunks. */
+export const DIRECT_FILE_BATCH_FRAME_HEADER_SIZE = 30;
+/** Hard payload ceiling for direct coalescing; sender also checks SCTP maxMessageSize. */
+export const DIRECT_FILE_BATCH_PAYLOAD_LIMIT_BYTES = 128 * 1024;
 const DIRECT_FILE_FRAME_MAGIC = [0x46, 0x4c, 0x4e, 0x47] as const; // FLNG
 const DIRECT_FILE_FRAME_VERSION = 1;
 const DIRECT_FILE_CHUNK_TYPE = 1;
+const DIRECT_FILE_CHUNK_BATCH_TYPE = 2;
 
 export interface DirectFileChunkFrame {
   id: string;
   seq: number;
   payload: Uint8Array<ArrayBuffer>;
+  /** Number and size of contiguous logical chunks in a coalesced frame. */
+  chunkCount?: number;
+  chunkSize?: number;
 }
 
 /** Encode a raw file chunk for RTCDataChannel; control messages remain JSON. */
@@ -40,18 +48,34 @@ export function encodeDirectFileChunkFrame(
   id: string,
   seq: number,
   payload: Uint8Array,
+  chunkSize = payload.byteLength,
+  chunkCount = 1,
 ): Uint8Array<ArrayBuffer> {
   if (!/^[0-9a-f]{24}$/i.test(id)) throw new Error('invalid transfer id');
   if (!Number.isInteger(seq) || seq < 0 || seq > 0xffffffff) throw new Error('invalid chunk sequence');
-  const frame = new Uint8Array(DIRECT_FILE_FRAME_HEADER_SIZE + payload.byteLength);
+  if (!Number.isInteger(chunkCount) || chunkCount < 1 || chunkCount > 0xffff) throw new Error('invalid direct chunk count');
+  if (chunkCount > 1 && (!Number.isInteger(chunkSize) || chunkSize <= 0 || chunkSize > 0xffff)) {
+    throw new Error('invalid direct chunk size');
+  }
+  if (seq > 0xffffffff - (chunkCount - 1)) throw new Error('direct chunk sequence range overflow');
+  if (chunkCount > 1 && (
+    payload.byteLength <= (chunkCount - 1) * chunkSize ||
+    payload.byteLength > chunkCount * chunkSize
+  )) throw new Error('invalid coalesced direct chunk payload length');
+  const headerSize = chunkCount > 1 ? DIRECT_FILE_BATCH_FRAME_HEADER_SIZE : DIRECT_FILE_FRAME_HEADER_SIZE;
+  const frame = new Uint8Array(headerSize + payload.byteLength);
   frame.set(DIRECT_FILE_FRAME_MAGIC, 0);
   frame[4] = DIRECT_FILE_FRAME_VERSION;
-  frame[5] = DIRECT_FILE_CHUNK_TYPE;
+  frame[5] = chunkCount > 1 ? DIRECT_FILE_CHUNK_BATCH_TYPE : DIRECT_FILE_CHUNK_TYPE;
   for (let i = 0; i < 12; i++) frame[6 + i] = Number.parseInt(id.slice(i * 2, i * 2 + 2), 16);
   const view = new DataView(frame.buffer);
   view.setUint32(18, seq, false);
   view.setUint32(22, payload.byteLength, false);
-  frame.set(payload, DIRECT_FILE_FRAME_HEADER_SIZE);
+  if (chunkCount > 1) {
+    view.setUint16(26, chunkSize, false);
+    view.setUint16(28, chunkCount, false);
+  }
+  frame.set(payload, headerSize);
   return frame;
 }
 
@@ -59,21 +83,32 @@ export function encodeDirectFileChunkFrame(
 export function decodeDirectFileChunkFrame(data: Uint8Array): DirectFileChunkFrame | undefined {
   if (data.byteLength < 4 || DIRECT_FILE_FRAME_MAGIC.some((b, i) => data[i] !== b)) return undefined;
   if (data.byteLength < DIRECT_FILE_FRAME_HEADER_SIZE) throw new Error('truncated direct file frame');
-  if (data[4] !== DIRECT_FILE_FRAME_VERSION || data[5] !== DIRECT_FILE_CHUNK_TYPE) {
+  if (data[4] !== DIRECT_FILE_FRAME_VERSION || (data[5] !== DIRECT_FILE_CHUNK_TYPE && data[5] !== DIRECT_FILE_CHUNK_BATCH_TYPE)) {
     throw new Error('unsupported direct file frame');
   }
+  const isBatch = data[5] === DIRECT_FILE_CHUNK_BATCH_TYPE;
+  const headerSize = isBatch ? DIRECT_FILE_BATCH_FRAME_HEADER_SIZE : DIRECT_FILE_FRAME_HEADER_SIZE;
+  if (data.byteLength < headerSize) throw new Error('truncated direct file batch frame');
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const seq = view.getUint32(18, false);
   const payloadLength = view.getUint32(22, false);
-  if (payloadLength !== data.byteLength - DIRECT_FILE_FRAME_HEADER_SIZE) {
+  if (payloadLength !== data.byteLength - headerSize) {
     throw new Error('invalid direct file frame length');
   }
+  const chunkSize = isBatch ? view.getUint16(26, false) : undefined;
+  const chunkCount = isBatch ? view.getUint16(28, false) : 1;
+  if (isBatch && (
+    !chunkSize || chunkCount < 2 || seq > 0xffffffff - (chunkCount - 1) ||
+    payloadLength <= (chunkCount - 1) * chunkSize || payloadLength > chunkCount * chunkSize
+  )) throw new Error('invalid coalesced direct chunk metadata');
   let id = '';
   for (let i = 6; i < 18; i++) id += data[i].toString(16).padStart(2, '0');
   return {
     id,
     seq,
-    payload: data.subarray(DIRECT_FILE_FRAME_HEADER_SIZE) as Uint8Array<ArrayBuffer>,
+    payload: data.subarray(headerSize) as Uint8Array<ArrayBuffer>,
+    chunkCount,
+    ...(chunkSize ? { chunkSize } : {}),
   };
 }
 
@@ -142,7 +177,7 @@ export type FlingMessage =
   // Sent over the LiveKit relay after the receiver has accepted a manifest.
   // chunkAck advertises support for receive-confirmed relay windows; it is
   // optional so older peers can still use the legacy relay stream.
-  | { kind: 'file-manifest-ack'; id: string; chunkAck?: boolean; binaryChunks?: boolean }
+  | { kind: 'file-manifest-ack'; id: string; chunkAck?: boolean; binaryChunks?: boolean; directFramePayloadBytes?: number }
   // Application-level receive acknowledgement for direct P2P windows.  This
   // deliberately stays on the encrypted LiveKit relay: an ACK behind the
   // same wedged RTCDataChannel would not be a useful health signal.
