@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -1168,13 +1168,66 @@ fn discovery_set_discoverable(app: tauri::AppHandle, on: bool) -> Result<(), Str
 /// (used for received clipboard-images; they must NOT become files).
 /// 读取拖放进来的文件内容（base64）。走 Rust 命令而不是 fs 插件，
 /// 避免 fs scope 挡住用户文件目录的任意路径。
+fn emit_native_diagnostic(app: &tauri::AppHandle, payload: serde_json::Value) {
+    let _ = app.emit("fling:diagnostic", payload);
+}
+
 #[tauri::command]
-fn read_file_bytes(path: String) -> Result<Vec<u8>, String> {
-    let meta = std::fs::metadata(&path).map_err(|e| format!("读取文件失败: {e}"))?;
+fn read_file_bytes(app: tauri::AppHandle, path: String) -> Result<Vec<u8>, String> {
+    let metadata_started = std::time::Instant::now();
+    let meta = match std::fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) => {
+            emit_native_diagnostic(&app, serde_json::json!({
+                "stage": "source_file_metadata", "status": "error",
+                "errorType": format!("{:?}", error.kind()),
+                "elapsedMs": metadata_started.elapsed().as_secs_f64() * 1000.0,
+            }));
+            return Err(format!("读取文件失败: {error}"));
+        }
+    };
+    let metadata_ms = metadata_started.elapsed().as_secs_f64() * 1000.0;
     if !meta.is_file() {
+        emit_native_diagnostic(&app, serde_json::json!({
+            "stage": "source_file_metadata", "status": "not_file",
+            "metadataMs": metadata_ms,
+        }));
         return Err("仅支持拖入文件，暂不支持文件夹".into());
     }
-    std::fs::read(&path).map_err(|e| format!("读取文件失败: {e}"))
+
+    let open_started = std::time::Instant::now();
+    let mut file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            emit_native_diagnostic(&app, serde_json::json!({
+                "stage": "source_file_open", "status": "error",
+                "expectedBytes": meta.len(), "metadataMs": metadata_ms,
+                "errorType": format!("{:?}", error.kind()),
+                "elapsedMs": open_started.elapsed().as_secs_f64() * 1000.0,
+            }));
+            return Err(format!("读取文件失败: {error}"));
+        }
+    };
+    let open_ms = open_started.elapsed().as_secs_f64() * 1000.0;
+    let read_started = std::time::Instant::now();
+    let mut bytes = Vec::with_capacity(meta.len().min(usize::MAX as u64) as usize);
+    if let Err(error) = file.read_to_end(&mut bytes) {
+        emit_native_diagnostic(&app, serde_json::json!({
+            "stage": "source_file_read", "status": "error",
+            "expectedBytes": meta.len(), "readBytes": bytes.len(),
+            "metadataMs": metadata_ms, "openMs": open_ms,
+            "errorType": format!("{:?}", error.kind()),
+            "elapsedMs": read_started.elapsed().as_secs_f64() * 1000.0,
+        }));
+        return Err(format!("读取文件失败: {error}"));
+    }
+    emit_native_diagnostic(&app, serde_json::json!({
+        "stage": "source_file_read", "status": "ok",
+        "expectedBytes": meta.len(), "readBytes": bytes.len(),
+        "metadataMs": metadata_ms, "openMs": open_ms,
+        "readMs": read_started.elapsed().as_secs_f64() * 1000.0,
+    }));
+    Ok(bytes)
 }
 
 /// 取文件大小（不读内容，供拖放时懒加载：只记路径+大小，发送时才读）。

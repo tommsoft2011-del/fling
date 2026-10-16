@@ -52,10 +52,16 @@ export function errText(e: unknown): string {
   return '未知错误';
 }
 
+function errorType(e: unknown): string {
+  return e instanceof Error ? e.name : typeof e;
+}
+
 interface SavedReceivedFileResult {
   path: string;
   writeAllMs: number;
   syncAllMs: number;
+  sha256VerifyMs: number;
+  commitMs: number;
 }
 
 interface AppendedReceivedFileBatchResult {
@@ -79,8 +85,15 @@ async function saveReceivedFile(
   const startedAt = Date.now();
   let sessionId: string | undefined;
   let lastProgressLog = 0;
+  let batchCount = 0;
+  let batchesSinceLog = 0;
+  let invokeMsSinceLog = 0;
+  let invokeMsMaxSinceLog = 0;
+  let rustWriteMsSinceLog = 0;
+  let lastProgressAt = performance.now();
   let failurePhase = 'begin';
-  log('xfer', 'Tauri streaming save IPC start', { taskId, xfer, size });
+  const beginStartedAt = performance.now();
+  log('xfer', 'receiver temp file begin requested', { taskId, xfer, size });
   try {
     const currentSessionId = await invoke<string>('begin_received_file', {
       dir,
@@ -90,6 +103,9 @@ async function saveReceivedFile(
       expectedSha256: receiver.manifest.sha256,
     });
     sessionId = currentSessionId;
+    log('xfer', 'receiver temp file begin complete', {
+      taskId, xfer, size, status: 'ok', elapsedMs: Math.round(performance.now() - beginStartedAt),
+    });
     failurePhase = 'append';
     await receiver.streamTo(async (bytes, writtenBytes) => {
       const invokeStartedAt = performance.now();
@@ -103,25 +119,51 @@ async function saveReceivedFile(
         throw new Error('received file append accounting mismatch');
       }
       // streamTo awaits every append, so there are no queued batches behind this one.
-      log('xfer', 'stream save batch', {
-        taskId, xfer, bytes: result.bytes, invokeElapsedMs,
-        rustWriteElapsedMs: result.writeElapsedMs,
-        cumulativeBytes: result.cumulativeBytes, queueDepth: 0,
-      });
+      batchCount++;
+      batchesSinceLog++;
+      invokeMsSinceLog += invokeElapsedMs;
+      invokeMsMaxSinceLog = Math.max(invokeMsMaxSinceLog, invokeElapsedMs);
+      rustWriteMsSinceLog += result.writeElapsedMs;
+      const now = performance.now();
+      if (batchCount === 1) {
+        log('xfer', 'first receiver append completed', {
+          taskId, xfer, batchBytes: result.bytes, cumulativeBytes: result.cumulativeBytes,
+          invokeMs: Math.round(invokeElapsedMs), rustWriteMs: Math.round(result.writeElapsedMs),
+        });
+      }
       onBatch?.(bytes);
       onProgress?.(writtenBytes);
-      if (writtenBytes - lastProgressLog >= 8 * 1024 * 1024 || writtenBytes === size) {
-        log('xfer', 'stream save progress', { taskId, xfer, size, writtenBytes });
+      if (
+        writtenBytes - lastProgressLog >= 32 * 1024 * 1024 ||
+        now - lastProgressAt >= 10_000 ||
+        writtenBytes === size
+      ) {
+        log('xfer', 'receiver append aggregate', {
+          taskId, xfer, size, cumulativeBytes: writtenBytes, batches: batchesSinceLog,
+          invokeTotalMs: Math.round(invokeMsSinceLog), invokeMaxMs: Math.round(invokeMsMaxSinceLog),
+          rustWriteTotalMs: Math.round(rustWriteMsSinceLog),
+        });
         lastProgressLog = writtenBytes;
+        lastProgressAt = now;
+        batchesSinceLog = 0;
+        invokeMsSinceLog = 0;
+        invokeMsMaxSinceLog = 0;
+        rustWriteMsSinceLog = 0;
       }
     });
     failurePhase = 'verify-sync-commit';
     const result = await invoke<SavedReceivedFileResult>('finish_received_file', { sessionId });
+    log('xfer', 'Rust SHA-256 verify stage', {
+      taskId, xfer, size, status: 'ok', elapsedMs: Math.round(result.sha256VerifyMs),
+    });
     log('xfer', 'Rust write_all stage', {
       taskId, xfer, size, status: 'ok', elapsedMs: result.writeAllMs,
     });
     log('xfer', 'Rust sync_all stage', {
       taskId, xfer, size, status: 'ok', elapsedMs: result.syncAllMs,
+    });
+    log('xfer', 'Rust atomic commit stage', {
+      taskId, xfer, size, status: 'ok', elapsedMs: Math.round(result.commitMs),
     });
     log('xfer', 'Tauri save IPC end', {
       taskId, xfer, size, status: 'ok', elapsedMs: Date.now() - startedAt,
@@ -130,14 +172,22 @@ async function saveReceivedFile(
   } catch (e) {
     if (sessionId) {
       try {
+        const cleanupStartedAt = performance.now();
         await invoke('abort_received_file', { sessionId });
-      } catch {
+        log('xfer', 'receiver temp cleanup completed', {
+          taskId, xfer, reason: 'save_error',
+          elapsedMs: Math.round(performance.now() - cleanupStartedAt),
+        });
+      } catch (cleanupError) {
+        log('xfer', 'receiver temp cleanup failed', {
+          taskId, xfer, reason: 'save_error', errorType: errorType(cleanupError),
+        });
         // The backend also drops unfinished temp files when a session fails.
       }
     }
     log('xfer', 'Tauri save IPC end', {
       taskId, xfer, size, status: 'error', elapsedMs: Date.now() - startedAt,
-      failurePhase,
+      failurePhase, errorType: errorType(e),
     });
     throw e;
   }
@@ -265,6 +315,14 @@ export class SendTask {
   private doneNotified = false;
   private directHealthTimer: ReturnType<typeof setInterval> | null = null;
   private lastPeerProgressAt = 0;
+  private watchdogStartedAt = 0;
+  private lastWatchdogArmedAt = 0;
+  private watchdogPauseReason: string | null = null;
+  private currentFileStartedAt = 0;
+  private currentFileFirstFrameAccepted = false;
+  private lastPeerProgressLogAt = 0;
+  private peerDoneBytesAtLastLog = 0;
+  private peerSavedBytesAtLastLog = 0;
 
   constructor(
     readonly source: ComposeItem[],
@@ -296,8 +354,8 @@ export class SendTask {
     if (!next.blob) {
       log('xfer', 'next manifest prehash skipped for lazy path-backed file', {
         taskId: this.taskId,
-        name: next.name,
         size: next.size,
+        source: 'native_path',
       });
       return;
     }
@@ -307,25 +365,24 @@ export class SendTask {
     const startedAt = performance.now();
     log('xfer', 'next manifest prehash started', {
       taskId: this.taskId,
-      name: next.name,
       size: next.size,
-      overlaps: this.currentSendingItem.name,
+      source: 'in_memory_blob',
+      overlapsCurrentItemSize: this.currentSendingItem.size,
     });
     const promise = buildManifest(file, next.kind).then((manifest) => {
       log('xfer', 'next manifest prehash complete', {
         taskId: this.taskId,
-        name: next.name,
         size: next.size,
+        status: 'ok',
         elapsedMs: Math.round(performance.now() - startedAt),
       });
       return manifest;
     }).catch((error: unknown) => {
       log('xfer', 'next manifest prehash failed', {
         taskId: this.taskId,
-        name: next.name,
         size: next.size,
         elapsedMs: Math.round(performance.now() - startedAt),
-        error: errText(error),
+        errorType: errorType(error),
       });
       return null;
     });
@@ -395,8 +452,9 @@ export class SendTask {
       const taskKey = newTaskKey();
       log('task', 'send start', {
         taskId: this.taskId,
-        peer: this.peerLabel,
-        items: this.items.map((i) => ({ kind: i.kind, name: i.name, size: i.size })),
+        itemCount: this.items.length,
+        totalBytes: this.items.reduce((sum, item) => sum + item.size, 0),
+        items: this.items.map((i) => ({ kind: i.kind, size: i.size })),
       });
       const offer: OfferMessage = {
         kind: 'offer',
@@ -484,11 +542,15 @@ export class SendTask {
         onTaskProgress: (taskId, receivedBytes, totalBytes, _from, savedBytes = 0) => {
           if (taskId === this.taskId) {
             const previousPeerDone = this.peerDoneBytes;
+            const progressAt = Date.now();
+            const watchdogSilenceBeforeMs = this.lastPeerProgressAt > 0
+              ? Math.max(0, progressAt - this.lastPeerProgressAt)
+              : undefined;
             const received = Math.max(0, Math.floor(receivedBytes));
             const saved = Math.max(0, Math.floor(savedBytes));
             const progressAdvanced = received > previousPeerDone;
             if (this.phase === 'sending' && this.p2p === 'open' && this.room?.directActive && progressAdvanced) {
-              this.lastPeerProgressAt = Date.now();
+              this.lastPeerProgressAt = progressAt;
             }
             // 诊断：对方上报的已收到不应超过我已发送的；倒退/超发都说明计数错乱
             const mySent = this.doneBytes;
@@ -508,20 +570,51 @@ export class SendTask {
             this.peerDoneBytes = Math.max(this.peerDoneBytes, received);
             this.peerSavedBytes = Math.max(this.peerSavedBytes, Math.min(saved, received));
             this.peerTotalBytes = Math.max(this.peerTotalBytes, totalBytes);
-            log('xfer', 'peer progress', {
-              taskId,
-              receivedBytes: this.peerDoneBytes,
-              receivedDelta: this.peerDoneBytes - previousPeerDone,
-              savedBytes: this.peerSavedBytes,
-              totalBytes: this.peerTotalBytes,
-              direct: this.room?.directActive ?? false,
-            });
+            const progressLogDue = this.lastPeerProgressLogAt === 0 ||
+              progressAt - this.lastPeerProgressLogAt >= 5_000 ||
+              this.peerDoneBytes - this.peerDoneBytesAtLastLog >= 32 * 1024 * 1024 ||
+              this.peerSavedBytes - this.peerSavedBytesAtLastLog >= 32 * 1024 * 1024;
+            if (progressLogDue) {
+              log('xfer', 'peer progress aggregate', {
+                taskId,
+                receivedBytes: this.peerDoneBytes,
+                receivedDeltaSinceLog: this.peerDoneBytes - this.peerDoneBytesAtLastLog,
+                immediateReceivedDelta: this.peerDoneBytes - previousPeerDone,
+                savedBytes: this.peerSavedBytes,
+                savedDeltaSinceLog: this.peerSavedBytes - this.peerSavedBytesAtLastLog,
+                totalBytes: this.peerTotalBytes,
+                aggregateIntervalMs: this.lastPeerProgressLogAt ? progressAt - this.lastPeerProgressLogAt : undefined,
+                direct: this.room?.directActive ?? false,
+                watchdogSilenceBeforeMs: this.p2p === 'open' && this.room?.directActive
+                  ? watchdogSilenceBeforeMs
+                  : undefined,
+                watchdogReset: progressAdvanced && this.p2p === 'open' && this.room?.directActive,
+                firstDirectFrameAccepted: this.currentFileFirstFrameAccepted,
+              });
+              this.lastPeerProgressLogAt = progressAt;
+              this.peerDoneBytesAtLastLog = this.peerDoneBytes;
+              this.peerSavedBytesAtLastLog = this.peerSavedBytes;
+            }
             this.notify();
           }
         },
-        onFileRoute: (route) => {
+        onFileRoute: (route, id) => {
           if (this.currentSendingItem) {
             this.currentSendingItem.transport = mergeTransport(this.currentSendingItem.transport, route);
+            if (route === 'p2p' && !this.currentFileFirstFrameAccepted) {
+              const acceptedAt = Date.now();
+              this.currentFileFirstFrameAccepted = true;
+              log('p2p', 'first direct frame locally accepted by DataChannel send()', {
+                taskId: this.taskId,
+                xfer: id.slice(0, 8),
+                acceptedAt,
+                elapsedFromFileStartMs: this.currentFileStartedAt ? Math.max(0, acceptedAt - this.currentFileStartedAt) : undefined,
+                elapsedFromWatchdogArmMs: this.lastWatchdogArmedAt ? Math.max(0, acceptedAt - this.lastWatchdogArmedAt) : undefined,
+                watchdogStartedBeforeFirstAcceptedFrame: this.lastWatchdogArmedAt > 0 && this.lastWatchdogArmedAt < acceptedAt,
+                watchdogTimeoutMs: DIRECT_PEER_PROGRESS_TIMEOUT_MS,
+                peerProgressAlreadySeen: this.peerDoneBytes > 0,
+              });
+            }
           }
         },
         onLog: (tag, msg) => log(tag as LogTag, `[room] ${msg}`),
@@ -582,10 +675,14 @@ export class SendTask {
             taskId: this.taskId,
           });
         }
-        if (src.kind !== 'text') this.markDirectTransferStart();
+        if (src.kind !== 'text') {
+          this.currentFileStartedAt = Date.now();
+          this.currentFileFirstFrameAccepted = false;
+          this.markDirectTransferStart();
+        }
         st.status = 'active';
         this.notify();
-        log('xfer', 'send item start', { taskId: this.taskId, kind: src.kind, name: st.name, size: st.size });
+        log('xfer', 'send item start', { taskId: this.taskId, kind: src.kind, size: st.size });
         try {
           if (src.kind === 'text') {
             await this.sendTextItem(src.text ?? '', st);
@@ -594,8 +691,27 @@ export class SendTask {
             let blob = src.blob;
             if (!blob && src.filePath) {
               // read_file_bytes 直接返回 Uint8Array（Tauri 原生二进制，无 base64 开销）
-              const bytes = (await invoke('read_file_bytes', { path: src.filePath })) as unknown as Uint8Array;
-              blob = new Blob([bytes as BlobPart]);
+              const readStartedAt = performance.now();
+              log('xfer', 'native source read requested', {
+                taskId: this.taskId, source: 'native_path', expectedSize: src.size,
+              });
+              try {
+                const bytes = (await invoke('read_file_bytes', {
+                  path: src.filePath,
+                })) as unknown as Uint8Array;
+                log('xfer', 'native source read returned', {
+                  taskId: this.taskId, source: 'native_path', bytes: bytes.byteLength,
+                  status: 'ok', elapsedMs: Math.round(performance.now() - readStartedAt),
+                });
+                blob = new Blob([bytes as BlobPart]);
+              } catch (error) {
+                log('xfer', 'native source read failed', {
+                  taskId: this.taskId, source: 'native_path', expectedSize: src.size,
+                  status: 'error', errorType: errorType(error),
+                  elapsedMs: Math.round(performance.now() - readStartedAt),
+                });
+                throw error;
+              }
             }
             if (!blob) throw new Error('文件内容不可用');
             const file = wrapWebFile(blob, src.name, src.relPath);
@@ -709,7 +825,7 @@ export class SendTask {
         // into an even larger LiveKit queue and made the UI show e.g. 3/5
         // while item 2 was already failed.
         if (st.status === 'error') {
-          log('xfer', 'stopping after item failure', { taskId: this.taskId, name: st.name });
+          log('xfer', 'stopping after item failure', { taskId: this.taskId, size: st.size });
           break;
         }
       }
@@ -726,9 +842,9 @@ export class SendTask {
       // relay failure and keep the broken room alive; close promptly after a
       // failed item, while preserving the full end-to-end wait for success.
       const acked = okCount === this.items.length
-        ? await this.waitForAck(30_000)
-        : false;
-      this.stopDirectHealth();
+      ? await this.waitForAck(30_000)
+      : false;
+      this.stopDirectHealth(acked ? 'task_ack_received' : 'task_finished_without_task_ack');
       log('task', acked ? 'ack ok, closing' : 'ack timeout, closing anyway', {
         taskId: this.taskId,
         peerCancelled: this.peerCancelled,
@@ -828,7 +944,7 @@ export class SendTask {
   }
 
   private closeP2P(): void {
-    this.stopDirectHealth();
+    this.stopDirectHealth('p2p_link_owner_closed');
     this.p2pLink?.close();
     this.p2pLink = null;
   }
@@ -836,36 +952,114 @@ export class SendTask {
   /** Begin/refresh the sender-side watchdog for a direct file transfer. */
   private markDirectTransferStart(): void {
     if (this.p2p !== 'open' || !this.room?.directActive) return;
-    this.lastPeerProgressAt = Date.now();
-    if (this.directHealthTimer) return;
-    this.directHealthTimer = setInterval(() => {
-      if (this.phase !== 'sending' || this.p2p !== 'open' || !this.room?.directActive) {
-        this.stopDirectHealth();
-        return;
-      }
-      const silentMs = Date.now() - this.lastPeerProgressAt;
-      if (
-        this.currentFileFinalizing ||
-        (this.currentPeerProgressTarget !== null && this.peerDoneBytes >= this.currentPeerProgressTarget)
-      ) return;
-      if (silentMs < DIRECT_PEER_PROGRESS_TIMEOUT_MS) return;
-      const reason = `peer progress timeout (${silentMs}ms)`;
-      log('p2p', 'peer progress stalled, falling back to relay', {
+    const now = Date.now();
+    this.lastWatchdogArmedAt = now;
+    this.lastPeerProgressAt = now;
+    if (this.directHealthTimer) {
+      log('p2p', 'peer progress watchdog refreshed for file', {
         taskId: this.taskId,
-        silentMs,
+        timeoutMs: DIRECT_PEER_PROGRESS_TIMEOUT_MS,
+        armedAt: now,
+        originalStartedAt: this.watchdogStartedAt,
+        currentFileStartedAt: this.currentFileStartedAt,
+        currentFileSize: this.currentSendingItem?.size,
+        currentFilePhase: 'before_file_source_or_manifest_preparation',
+        firstDirectFrameAccepted: this.currentFileFirstFrameAccepted,
         sentBytes: this.doneBytes,
         peerDoneBytes: this.peerDoneBytes,
       });
-      this.stopDirectHealth();
+      return;
+    }
+    this.watchdogStartedAt = now;
+    this.watchdogPauseReason = null;
+    log('p2p', 'peer progress watchdog started', {
+      taskId: this.taskId,
+      timeoutMs: DIRECT_PEER_PROGRESS_TIMEOUT_MS,
+      startedAt: now,
+      armedAt: now,
+      currentFileStartedAt: this.currentFileStartedAt,
+      currentFileSize: this.currentSendingItem?.size,
+      currentFilePhase: 'before_file_source_or_manifest_preparation',
+      firstDirectFrameAccepted: this.currentFileFirstFrameAccepted,
+      sentBytes: this.doneBytes,
+      peerDoneBytes: this.peerDoneBytes,
+      directChannelOpen: this.room.directActive,
+    });
+    this.directHealthTimer = setInterval(() => {
+      if (this.phase !== 'sending' || this.p2p !== 'open' || !this.room?.directActive) {
+        this.stopDirectHealth('phase_changed_or_direct_path_lost');
+        return;
+      }
+      const silentMs = Date.now() - this.lastPeerProgressAt;
+      const pauseReason = this.currentFileFinalizing
+        ? 'receiver_finalizing'
+        : this.currentPeerProgressTarget !== null && this.peerDoneBytes >= this.currentPeerProgressTarget
+          ? 'peer_reached_current_target'
+          : null;
+      if (pauseReason) {
+        if (this.watchdogPauseReason !== pauseReason) {
+          log('p2p', 'peer progress watchdog paused', {
+            taskId: this.taskId, reason: pauseReason, silentMs,
+            peerDoneBytes: this.peerDoneBytes, target: this.currentPeerProgressTarget,
+          });
+          this.watchdogPauseReason = pauseReason;
+        }
+        return;
+      }
+      if (this.watchdogPauseReason) {
+        log('p2p', 'peer progress watchdog resumed', {
+          taskId: this.taskId, previousReason: this.watchdogPauseReason, silentMs,
+          peerDoneBytes: this.peerDoneBytes, target: this.currentPeerProgressTarget,
+        });
+        this.watchdogPauseReason = null;
+      }
+      if (silentMs < DIRECT_PEER_PROGRESS_TIMEOUT_MS) return;
+      const reason = 'peer_progress_silence_timeout';
+      log('p2p', 'peer progress watchdog timed out; relay fallback requested', {
+        taskId: this.taskId,
+        reason,
+        timeoutMs: DIRECT_PEER_PROGRESS_TIMEOUT_MS,
+        silentMs,
+        watchdogElapsedMs: Math.max(0, Date.now() - this.watchdogStartedAt),
+        lastFileArmAt: this.lastWatchdogArmedAt,
+        fileElapsedMs: this.currentFileStartedAt ? Math.max(0, Date.now() - this.currentFileStartedAt) : undefined,
+        firstDirectFrameAccepted: this.currentFileFirstFrameAccepted,
+        firstFrameNotYetAcceptedAtTimeout: !this.currentFileFirstFrameAccepted,
+        lastProgressAt: this.lastPeerProgressAt,
+        sentBytes: this.doneBytes,
+        peerDoneBytes: this.peerDoneBytes,
+        peerSavedBytes: this.peerSavedBytes,
+        peerProgressTarget: this.currentPeerProgressTarget,
+        currentFileFinalizing: this.currentFileFinalizing,
+        directChannelOpen: this.room?.directActive ?? false,
+        p2pState: this.p2p,
+      });
+      this.stopDirectHealth('watchdog_timeout');
       this.room?.fallbackToRelay(reason);
     }, DIRECT_HEALTH_CHECK_MS);
   }
 
-  private stopDirectHealth(): void {
+  private stopDirectHealth(reason = 'not_active'): void {
     if (this.directHealthTimer) {
+      const now = Date.now();
       clearInterval(this.directHealthTimer);
       this.directHealthTimer = null;
+      log('p2p', 'peer progress watchdog stopped', {
+        taskId: this.taskId,
+        reason,
+        elapsedMs: this.watchdogStartedAt ? Math.max(0, now - this.watchdogStartedAt) : 0,
+        timeoutMs: DIRECT_PEER_PROGRESS_TIMEOUT_MS,
+        originalStartedAt: this.watchdogStartedAt,
+        lastFileArmAt: this.lastWatchdogArmedAt,
+        silentMs: this.lastPeerProgressAt ? Math.max(0, now - this.lastPeerProgressAt) : undefined,
+        currentFileStartedAt: this.currentFileStartedAt,
+        firstDirectFrameAccepted: this.currentFileFirstFrameAccepted,
+        sentBytes: this.doneBytes,
+        peerDoneBytes: this.peerDoneBytes,
+        directChannelOpen: this.room?.directActive ?? false,
+      });
     }
+    this.watchdogPauseReason = null;
   }
 
   /** Wait for receiver bytes; relay mode uses a no-progress timeout, not a total-size timeout. */
@@ -902,7 +1096,19 @@ export class SendTask {
 
   /** FlingRoom found a direct send/manifest/drain failure. Close the link owner. */
   private onDirectFallback(reason: string): void {
-    this.stopDirectHealth();
+    log('p2p', 'sender observed relay fallback', {
+      taskId: this.taskId,
+      reason,
+      sentBytes: this.doneBytes,
+      peerDoneBytes: this.peerDoneBytes,
+      peerSavedBytes: this.peerSavedBytes,
+      currentFileStartedAt: this.currentFileStartedAt,
+      firstDirectFrameAccepted: this.currentFileFirstFrameAccepted,
+      watchdogTimeoutMs: DIRECT_PEER_PROGRESS_TIMEOUT_MS,
+      directChannelOpen: this.room?.directActive ?? false,
+      p2pState: this.p2p,
+    });
+    this.stopDirectHealth('room_relay_fallback');
     this.p2pLink?.fallbackToRelay(reason);
   }
 
@@ -928,6 +1134,7 @@ export class SendTask {
   /** 接收方拒绝（经 inbox / lobby 回来） */
   onRejected(): void {
     if (!this.active) return;
+    log('task', 'sender observed peer rejection', { taskId: this.taskId, phase: this.phase, sentBytes: this.doneBytes, peerDoneBytes: this.peerDoneBytes, firstDirectFrameAccepted: this.currentFileFirstFrameAccepted });
     this.cancelled = true;
     this.phase = 'rejected';
     this.error = '对方拒绝了传输';
@@ -989,6 +1196,7 @@ export class SendTask {
 
   cancel(): void {
     if (!this.active) return;
+    log('task', 'sender cancellation requested', { taskId: this.taskId, phase: this.phase, sentBytes: this.doneBytes, peerDoneBytes: this.peerDoneBytes, currentFileSize: this.currentSendingItem?.size, firstDirectFrameAccepted: this.currentFileFirstFrameAccepted });
     this.cancelled = true;
     clearTimeout(this.waitTimer);
     this.stopAnnounce();
@@ -1714,6 +1922,7 @@ export class RecvTask {
 
   async cancel(): Promise<void> {
     if (!this.active) return;
+    log('task', 'receiver cancellation requested', { taskId: this.taskId, phase: this.phase, receivedBytes: this.items.reduce((sum, item) => sum + item.doneBytes, 0), savedBytes: this.items.reduce((sum, item) => sum + (item.saveBytes ?? 0), 0) });
     this.cancelled = true;
     // 先告诉发送方"我取消了"再拆连接；flush 保证取消信令发出去，
     // 否则发送方等 ack 超时（以前还会误标"成功"）。
@@ -1729,6 +1938,12 @@ export class RecvTask {
     }
     log('task', 'recv cancelled, task-cancel sent', { taskId: this.taskId });
     void this.finish(false).then(() => {
+      log('task', 'receiver cancellation cleanup complete', {
+        taskId: this.taskId,
+        receivedBytes: this.items.reduce((sum, item) => sum + item.doneBytes, 0),
+        savedBytes: this.items.reduce((sum, item) => sum + (item.saveBytes ?? 0), 0),
+        pendingSaveCount: this.pendingSaves.size,
+      });
       this.phase = 'cancelled';
       this.notify();
     });

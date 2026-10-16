@@ -359,6 +359,7 @@ async function main(): Promise<void> {
 
   const relayBefore = relayPublishesA;
   const drainChecksBefore = directA.drainWaitThresholds.length;
+  const directFileLogStart = directWindowLogs.length;
   const file = fileLike('hello.bin', 100_000); // 100KB -> 4 chunks of 32KB
   const p1 = roomA.sendFile(file, undefined, 'file');
   // pump: deliver direct messages as they are produced
@@ -384,6 +385,17 @@ async function main(): Promise<void> {
   check(
     drainTargets.length > 0 && drainTargets.every((threshold) => threshold === P2P_DRAIN_THRESHOLD),
     'drain wait target matches bufferedamountlow threshold in the 223–256 KiB window',
+  );
+  const directFileLogs = directWindowLogs.slice(directFileLogStart);
+  check(
+    directFileLogs.some((message) => message.startsWith('manifest send/ack phase complete')),
+    'manifest send/ACK phase is logged independently of byte-progress aggregation',
+  );
+  check(
+    directFileLogs.some((message) => message.startsWith('first direct frame payload_prepared')) &&
+      directFileLogs.some((message) => message.startsWith('first direct frame send_attempt')) &&
+      directFileLogs.some((message) => message.startsWith('first direct frame send_accepted')),
+    'first direct frame preparation, native send attempt, and local acceptance stay visible',
   );
 
   // --- 1a. direct-only coalescing is negotiated against each peer's actual SCTP max ---
@@ -563,6 +575,7 @@ async function main(): Promise<void> {
   // only silently lost part of this scenario.
   directA.dropAfter = 1;
   const relayBeforeBlackhole = relayPublishesA;
+  const blackholeLogStart = directWindowLogs.length;
   const blackholeStart = Date.now();
   const coalescedBlackholeSend = roomA.sendFile(fileLike('blackhole.bin', 70_000), undefined, 'file');
   for (let i = 0; i < 2_000 && !done.cur; i++) {
@@ -575,6 +588,10 @@ async function main(): Promise<void> {
   check(blackholeElapsed < 10_000, `black-hole fallback completes promptly (${blackholeElapsed}ms)`);
   check(relayPublishesA > relayBeforeBlackhole, 'black-hole retry publishes manifest/chunks through relay');
   check(directA.coalescedFrameCount > 0, 'black-hole scenario exercised a coalesced direct frame before relay repair');
+  check(
+    directWindowLogs.slice(blackholeLogStart).some((message) => message.startsWith('direct fallback to relay:')),
+    'direct-to-relay fallback state transition is retained separately from progress summaries',
+  );
   check(!roomA.directActive, 'black-hole fallback detaches direct channel');
 
   // --- 1d. partial silent loss -> replay the same manifest through relay ---

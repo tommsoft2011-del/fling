@@ -1,12 +1,14 @@
-// 结构化诊断日志：批量写入 Rust 日志文件（按天分文件，保留 7 天）。
-// 用户复现问题后，从设置页打开日志目录，把当天文件发回来分析。
-// 注意：只记元数据（文件名/大小/状态/错误信息），不记文本内容与剪贴板内容。
+// Structured diagnostics are buffered into the daily Rust log file (7-day retention).
+// Diagnostic payloads are metadata-only; sanitize again at the single log boundary.
 import { invoke } from '@tauri-apps/api/core';
 
 export type LogTag = 'app' | 'task' | 'p2p' | 'xfer' | 'net' | 'ui' | 'err';
 
 const queue: string[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Never serialize identifying, path-like, address, credential, content, or hash fields.
+const PRIVATE_FIELD = /^(?:name|filename|file_name|displayname|peer|peerlabel|peername|device|devicename|deviceid|path|filepath|relpath|savedpath|directory|dir|folder|url|urls|host|hostname|address|ip|port|candidate|sdp|token|secret|password|apikey|apisecret|key|taskkey|content|text|payload|data|datab64|sha256|hash|checksum|error|msg|message)$/i;
 
 function dayStamp(d = new Date()): string {
   const p = (n: number) => String(n).padStart(2, '0');
@@ -25,20 +27,49 @@ function timeStamp(d = new Date()): string {
   );
 }
 
+function sanitizeText(text: string): string {
+  return text
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>)]*/gi, '[redacted-endpoint]')
+    .replace(/\b(?:stun|stuns|turn|turns):[^\s"'<>)]*/gi, '[redacted-endpoint]')
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b/g, '[redacted-address]')
+    .replace(/\[[\da-f:]+\](?::\d{1,5})?/gi, '[redacted-address]')
+    .replace(/\bport\s*[=:]\s*\d{1,5}\b/gi, 'port=[redacted]')
+    .replace(/(^|[\s"'(=])(?:[A-Za-z]:\\|\\\\)[^\s"'<>)]*/g, '$1[redacted-path]')
+    .replace(/(^|[\s"'(=])\/(?:[^\s\t\r\n"'<>)]*)/g, '$1[redacted-path]')
+    .slice(0, 500);
+}
+
+function sanitizeValue(value: unknown, depth = 0): unknown {
+  if (depth > 6) return '[truncated]';
+  if (typeof value === 'string') return sanitizeText(value);
+  if (typeof value === 'number' || typeof value === 'boolean' || value === null) return value;
+  if (Array.isArray(value)) return value.slice(0, 40).map((item) => sanitizeValue(item, depth + 1));
+  if (typeof value === 'object') {
+    const safe: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      if (PRIVATE_FIELD.test(key.replace(/[-_]/g, ''))) continue;
+      safe[key] = sanitizeValue(item, depth + 1);
+    }
+    return safe;
+  }
+  return String(value);
+}
+
 export function log(tag: LogTag, msg: string, data?: Record<string, unknown>): void {
   try {
-    const line = `${timeStamp()} [${tag}] ${msg}${data ? ' ' + JSON.stringify(data) : ''}`;
+    const safeData = data ? sanitizeValue(data) : undefined;
+    const line = `${timeStamp()} [${tag}] ${sanitizeText(msg)}${safeData ? ' ' + JSON.stringify(safeData) : ''}`;
     queue.push(line);
-    // 顺手也打到控制台，方便 devtools 联调
+    // Also write to the console for devtools, using exactly the same sanitized line.
     if (tag === 'err') console.error(line);
     if (queue.length >= 50) void flushLogs();
     else if (!flushTimer) flushTimer = setTimeout(() => void flushLogs(), 2000);
   } catch {
-    /* 日志永不干扰主流程 */
+    // Logging must never interfere with transfer behavior.
   }
 }
 
-/** 把缓冲的行刷进日志文件。 */
+/** Flush buffered lines to the daily log file. */
 export async function flushLogs(): Promise<void> {
   if (flushTimer) {
     clearTimeout(flushTimer);
@@ -49,7 +80,7 @@ export async function flushLogs(): Promise<void> {
   try {
     await invoke('append_log', { file: `fling-${dayStamp()}.log`, lines });
   } catch {
-    /* 忽略，后续批次会重试（行已丢弃，避免无限堆积） */
+    // Ignore; later batches retry (this batch is dropped to cap memory use).
   }
 }
 

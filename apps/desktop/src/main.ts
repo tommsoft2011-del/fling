@@ -11,9 +11,10 @@ document.addEventListener('contextmenu', (e) => {
 let lastErrToast = 0;
 function reportGlobalError(where: string, err: unknown): void {
   const msg = err instanceof Error ? err.message : String(err);
+  const errorType = err instanceof Error ? err.name : typeof err;
   try {
     // log 是同步入队，flush 在后台；这里直接记
-    import('./log.js').then((m) => m.log('ui', 'global error: ' + where, { msg })).catch(() => {});
+    import('./log.js').then((m) => m.log('ui', 'global error', { where, errorType })).catch(() => {});
   } catch { /* ignore */ }
   const now = Date.now();
   if (now - lastErrToast > 5000) {
@@ -26,6 +27,7 @@ function reportGlobalError(where: string, err: unknown): void {
 window.addEventListener('unhandledrejection', (e) => reportGlobalError('unhandledrejection', e.reason));
 window.addEventListener('error', (e) => reportGlobalError('window.onerror', e.error ?? e.message));
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { $, toast } from './ui.js';
 import { initNet, getDeviceName } from './net.js';
 import { manager } from './tasks.js';
@@ -49,7 +51,7 @@ async function refreshRemoteConfig(): Promise<void> {
       const j = await resp.json();
       if (j.v !== 1 || typeof j.nonce !== 'string' || typeof j.data !== 'string') return;
       await invoke('apply_remote_config', { nonceB64: j.nonce, dataB64: j.data });
-      log('net', 'remote config applied', { url });
+      log('net', 'remote config applied');
     } finally {
       clearTimeout(timer);
     }
@@ -61,6 +63,19 @@ async function refreshRemoteConfig(): Promise<void> {
 type Page = 'send' | 'recv' | 'hist' | 'settings';
 let current: Page = 'send';
 let started = false;
+let nativeDiagnosticListenerReady = false;
+
+async function installNativeDiagnosticListener(): Promise<void> {
+  if (nativeDiagnosticListenerReady) return;
+  try {
+    await listen<Record<string, unknown>>('fling:diagnostic', (event) => {
+      log('xfer', 'native diagnostic', event.payload);
+    });
+    nativeDiagnosticListenerReady = true;
+  } catch {
+    log('app', 'native diagnostic listener unavailable');
+  }
+}
 
 function switchPage(p: Page): void {
   if (current === 'recv' && p !== 'recv') blurRecvPage();
@@ -113,6 +128,7 @@ async function startMain(): Promise<void> {
   }
   started = true;
   try {
+    await installNativeDiagnosticListener();
     await initNet();
   } catch (e) {
     started = false;
@@ -161,7 +177,11 @@ async function startMain(): Promise<void> {
   }
   try {
     const ver = (await invoke('app_version')) as string;
-    log('app', 'fling started', { version: ver, device: getDeviceName() });
+    log('app', 'fling started', { version: ver });
+    log('app', 'diagnostic build identifier', {
+      buildId: `v0.6.3-diag+${__FLING_BUILD_COMMIT__}`,
+      commit: __FLING_BUILD_COMMIT__,
+    });
   } catch {
     /* ignore */
   }

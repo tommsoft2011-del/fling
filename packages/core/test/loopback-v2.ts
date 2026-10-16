@@ -312,10 +312,20 @@ async function main(): Promise<void> {
   const senderEvents = makeEvents(senderCollected);
   senderEvents.onFileFinalizing = () => { finalizingNotices++; };
   const handoffTrace: string[] = [];
+  let firstDataAckSummaryHasTrace = false;
+  let firstDataPhaseSeen = false;
+  let firstFinalAckSeen = false;
   senderEvents.onLog = (_tag, message) => {
-    if (message.startsWith('direct window ACK large.bin')) handoffTrace.push('window-ack');
-    else if (message.startsWith('file finalize ACK confirmed')) handoffTrace.push('file-final-ack');
-    else if (message.startsWith('direct window start next.bin')) handoffTrace.push('next-first-window');
+    if (!firstDataPhaseSeen && message.startsWith('file data ACK phase complete')) {
+      firstDataPhaseSeen = true;
+      firstDataAckSummaryHasTrace = /lastAckId=[a-f0-9]{16}/.test(message);
+      handoffTrace.push('data-phase-complete');
+    } else if (firstDataPhaseSeen && !firstFinalAckSeen && message.startsWith('file finalize ACK confirmed')) {
+      firstFinalAckSeen = true;
+      handoffTrace.push('file-final-ack');
+    } else if (firstFinalAckSeen && message.startsWith('direct window start')) {
+      handoffTrace.push('next-first-window');
+    }
   };
   const receiverEvents = makeEvents(receiverCollected);
   receiverEvents.onFileError = () => {};
@@ -377,11 +387,11 @@ async function main(): Promise<void> {
   check(!sequenceError, 'multi-file sequence completes after delayed persistence');
   check(firstFilePersisted && senderObservedSaved, 'final ACK follows persistence and reaches sender callback');
   check(completionOrder.indexOf('persisted') < completionOrder.indexOf('sender-final-ack'), 'sender final ACK is observed after persistence');
-  const lastWindowAck = handoffTrace.lastIndexOf('window-ack');
+  const dataPhaseComplete = handoffTrace.indexOf('data-phase-complete');
   const finalFileAck = handoffTrace.indexOf('file-final-ack');
   const nextFirstWindow = handoffTrace.indexOf('next-first-window');
-  check(lastWindowAck >= 0 && finalFileAck > lastWindowAck && nextFirstWindow > finalFileAck,
-    `next file first window starts only after the last data-window ACK and durable-save ACK (${handoffTrace.join(' -> ')})`);
+  check(dataPhaseComplete >= 0 && firstDataAckSummaryHasTrace && finalFileAck > dataPhaseComplete && nextFirstWindow > finalFileAck,
+    `next file first window starts only after the last data-window ACK phase and durable-save ACK (${handoffTrace.join(' -> ')})`);
   check(receiverCollected.manifests.length === 2, 'second manifest arrives only after first final ACK');
   const failureStartedAt = Date.now();
   let saveFailureReported = false;
