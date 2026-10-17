@@ -75,7 +75,24 @@ jobs:
       - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: |
+          set -euo pipefail
           sudo apt-get update
+          sudo apt-get install -y ca-certificates curl gnupg
+          if ! apt-cache policy clang-21 | grep -Eq 'Candidate: [0-9]'; then
+            . /etc/os-release
+            key_file="$(mktemp)"
+            trap 'rm -f "$key_file"' EXIT
+            curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o "$key_file"
+            fingerprint="$(gpg --show-keys --with-colons "$key_file" | awk -F: '$1 == "fpr" && !seen++ { print $10 }')"
+            test "$fingerprint" = '6084F3CF814B57C1CF12EFD515CF4D18AF4F7421'
+            sudo install -d -m 0755 /etc/apt/keyrings
+            sudo gpg --dearmor --yes -o /etc/apt/keyrings/apt-llvm.gpg "$key_file"
+            sudo chmod 0644 /etc/apt/keyrings/apt-llvm.gpg
+            printf 'deb [arch=%s signed-by=/etc/apt/keyrings/apt-llvm.gpg] https://apt.llvm.org/%s/ llvm-toolchain-%s-21 main\n' \
+              "$(dpkg --print-architecture)" "$VERSION_CODENAME" "$VERSION_CODENAME" \
+              | sudo tee /etc/apt/sources.list.d/llvm-21.list >/dev/null
+            sudo apt-get update
+          fi
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf clang-21
           clang-21 --version
           clang++-21 --version

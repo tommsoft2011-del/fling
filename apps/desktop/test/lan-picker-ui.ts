@@ -34,6 +34,15 @@ class Element {
   click(): void { this.lastActivation = this.onclick?.(); }
 }
 const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+const stylesheet = readFileSync(new URL('../src/style.css', import.meta.url), 'utf8');
+const feedback = html.match(/<aside class="lan-feedback"[^>]*>([\s\S]*?)<\/aside>/)![0];
+assert.match(feedback, /id="lanStatus"[^>]*role="status"/);
+assert.equal((html.match(/id="lanStatus"/g) ?? []).length, 1);
+assert.ok(html.indexOf(feedback) < html.indexOf('<main class="lan-content">'));
+assert.doesNotMatch(html.match(/<main class="lan-content">([\s\S]*?)<\/main>/)![1], /id="lanStatus"/);
+assert.match(stylesheet, /\.lan-feedback\s*\{[^}]*flex:\s*0 0 auto/);
+assert.match(stylesheet, /\.lan-content\s*\{[^}]*min-height:\s*0/);
+console.log('ok - one live status outside scrollable content; native bounds tested separately (static)');
 const elements = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map((match) => [match[1], new Element()]));
 const get = (id: string) => elements.get(id)!;
 const dom = {

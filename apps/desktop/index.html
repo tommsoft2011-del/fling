@@ -40,6 +40,9 @@
           </div>
           <button class="ghostbtn" id="lanExit">退出测试模式</button>
         </header>
+        <aside class="lan-feedback" aria-label="当前任务状态">
+          <div id="lanStatus" class="lan-status" role="status" aria-live="polite" aria-atomic="true">尚未开始传输</div>
+        </aside>
         <main class="lan-content">
           <section class="card">
             <div class="card-t">附近设备</div>
@@ -60,7 +63,6 @@
           </section>
           <section class="card">
             <div class="card-t">当前传输</div>
-            <div id="lanStatus" class="lan-status" role="status" aria-live="polite" aria-atomic="true">尚未开始传输</div>
             <div id="lanTasks"><div class="empty">暂无局域网任务</div></div>
           </section>
           <section class="card" id="lanHistorySection" hidden>
