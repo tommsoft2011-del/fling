@@ -23,6 +23,8 @@ static HISTORY_IO_LOCK: Mutex<()> = Mutex::new(());
 
 mod embedded_config;
 
+#[allow(dead_code)]
+mod native_lan;
 // ================================================================ config ==
 
 /// 16 random bytes as lowercase hex. Generated once on first run, never rotated.
