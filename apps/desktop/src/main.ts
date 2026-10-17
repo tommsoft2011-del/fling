@@ -36,6 +36,7 @@ import { initSendPage } from './send.js';
 import { initRecvPage, blurRecvPage } from './receive.js';
 import { initHistPage, refreshHistPage } from './history.js';
 import { initSettingsPage } from './settings.js';
+import { initLanPage } from './lan.js';
 import { log } from './log.js';
 
 /** 从服务器拉取加密的远程配置并应用（静默失败：用内置/本地配置继续） */
@@ -90,6 +91,8 @@ function switchPage(p: Page): void {
 }
 
 function showSetup(prefill: boolean): void {
+  $('#modeScreen').classList.remove('active');
+  $('#lanScreen').classList.remove('active');
   $('#mainScreen').classList.remove('active');
   $('#setupScreen').classList.add('active');
   if (prefill) {
@@ -106,8 +109,34 @@ function showSetup(prefill: boolean): void {
 }
 
 function showMain(): void {
+  $('#modeScreen').classList.remove('active');
+  $('#lanScreen').classList.remove('active');
   $('#setupScreen').classList.remove('active');
   $('#mainScreen').classList.add('active');
+}
+
+function showMode(): void {
+  $('#setupScreen').classList.remove('active');
+  $('#mainScreen').classList.remove('active');
+  $('#lanScreen').classList.remove('active');
+  $('#modeScreen').classList.add('active');
+}
+
+function showLan(): void {
+  $('#modeScreen').classList.remove('active');
+  $('#setupScreen').classList.remove('active');
+  $('#mainScreen').classList.remove('active');
+  $('#lanScreen').classList.add('active');
+}
+
+async function startLanMain(): Promise<void> {
+  try {
+    await initLanPage();
+    showLan();
+  } catch (e) {
+    showMode();
+    toast('局域网模式启动失败：' + (e as Error).message, true);
+  }
 }
 
 function updateBadges(): void {
@@ -191,6 +220,12 @@ async function startMain(): Promise<void> {
 
 async function boot(): Promise<void> {
   applyTheme();
+  let hasOnlineConfig = false;
+  $('#chooseOnline').onclick = async () => {
+    if (hasOnlineConfig) await startMain();
+    else showSetup(false);
+  };
+  $('#chooseLan').onclick = () => { void startLanMain(); };
   $('#saveCfg').onclick = async () => {
     const cfg = {
       server_url: (($('#cfgUrl') as HTMLInputElement).value || '').trim(),
@@ -221,11 +256,8 @@ async function boot(): Promise<void> {
   } catch {
     cfg = null;
   }
-  if (cfg) {
-    await startMain();
-  } else {
-    showSetup(false);
-  }
+  hasOnlineConfig = Boolean(cfg);
+  showMode();
 }
 
 boot();

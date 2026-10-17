@@ -1401,6 +1401,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2 0.6.5",
  "tauri",
  "tauri-build",
  "tauri-plugin-clipboard-manager",
@@ -1409,6 +1410,7 @@ dependencies = [
  "tauri-plugin-notification",
  "tokio",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

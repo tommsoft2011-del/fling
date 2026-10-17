@@ -162,6 +162,7 @@ pub enum NativeControlMessage {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NativeFileManifest {
     pub id: String,
+    pub transfer_nonce: String,
     pub name: String,
     pub size: u64,
     pub sha256: String,
@@ -199,8 +200,8 @@ pub struct SecureLocalSession {
 impl fmt::Debug for SecureLocalSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SecureLocalSession")
-            .field("session_id", &self.session_id)
-            .field("task_id", &self.task_id)
+            .field("session_id", &"[REDACTED]")
+            .field("task_id", &"[REDACTED]")
             .field("peer_device_id", &self.peer_device_id)
             .field("peer_device_label", &self.peer_device_label)
             .field("verification_code", &"[REDACTED]")
@@ -248,8 +249,8 @@ pub struct LocalSessionCipher {
 impl fmt::Debug for LocalSessionCipher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LocalSessionCipher")
-            .field("session_id", &self.session_id)
-            .field("task_id", &self.task_id)
+            .field("session_id", &"[REDACTED]")
+            .field("task_id", &"[REDACTED]")
             .field("local_device_id", &self.local_device_id)
             .field("peer_device_id", &self.peer_device_id)
             .field("send_sequence", &self.send_sequence)
@@ -1485,6 +1486,73 @@ mod tests {
     }
 
     #[test]
+    fn pairing_hello_and_control_messages_have_only_public_or_transcript_fields() {
+        let (_key, hello) = create_pairing_hello_from_material(
+            "00112233445566778899aabbccddeeff",
+            "task-vector-01",
+            "device-a",
+            "Desk A",
+            "device-b",
+            PairingRole::Initiator,
+            [0x11; 32],
+            [0x33; 16],
+        )
+        .unwrap();
+        let hello_value = serde_json::to_value(hello).unwrap();
+        let hello_fields = hello_value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            hello_fields,
+            [
+                "v",
+                "role",
+                "sessionId",
+                "taskId",
+                "fromDeviceId",
+                "toDeviceId",
+                "fromDeviceLabel",
+                "ephemeralPublicKey",
+                "nonce"
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(!hello_value.to_string().contains("verificationCode"));
+        assert!(!hello_value.to_string().contains("peerCode"));
+
+        for (message, expected_kind) in [
+            (
+                NativeControlMessage::PairConfirm {
+                    transcript_hash: "fixed-transcript".into(),
+                },
+                "pair-confirm",
+            ),
+            (
+                NativeControlMessage::PairReject {
+                    transcript_hash: "fixed-transcript".into(),
+                },
+                "pair-reject",
+            ),
+        ] {
+            let value = serde_json::to_value(message).unwrap();
+            let object = value.as_object().unwrap();
+            assert_eq!(object.len(), 2);
+            assert_eq!(
+                object.get("kind").and_then(serde_json::Value::as_str),
+                Some(expected_kind)
+            );
+            assert!(object.contains_key("transcriptHash"));
+            for forbidden in ["shortCode", "peerCode", "verificationCode"] {
+                assert!(!object.contains_key(forbidden));
+            }
+        }
+    }
+
+    #[test]
     fn online_room_key_matches_existing_pbkdf2_sha256_parameters() {
         let key = derive_room_key(" k7q2-m9x4 ", "fling-v2-room");
         assert_eq!(
@@ -1526,6 +1594,29 @@ mod tests {
     }
 
     #[test]
+    fn incorrect_local_code_rejects_without_reflecting_input_in_frame_or_error() {
+        let (local_session, remote_session) = fixed_pairing_sessions();
+        let mut local = PendingLocalPair::new(local_session);
+        let mut remote = PendingLocalPair::new(remote_session);
+        let input = "87654321";
+        let frame = local.decide_locally(true, input).unwrap();
+        let decoded = remote
+            .session
+            .as_mut()
+            .unwrap()
+            .cipher
+            .decrypt_control(&frame)
+            .unwrap();
+        assert!(matches!(decoded, NativeControlMessage::PairReject { .. }));
+        let control = serde_json::to_string(&decoded).unwrap();
+        assert!(!control.contains(input));
+        assert!(!control.contains("peerCode"));
+        assert!(!control.contains("verificationCode"));
+        assert_eq!(local.decision(), PairingDecision::Rejected);
+        assert!(local.into_authenticated().is_err());
+    }
+
+    #[test]
     fn session_confirm_requires_both_local_and_remote_approval() {
         let (alice_session, bob_session) = two_secure_sessions();
         let mut alice = PendingLocalPair::new(alice_session);
@@ -1540,11 +1631,21 @@ mod tests {
             .is_err());
 
         let alice_frame = alice.decide_locally(true, &bob_code).unwrap();
+        let decoded_confirm = bob
+            .session
+            .as_mut()
+            .unwrap()
+            .cipher
+            .decrypt_control(&alice_frame)
+            .unwrap();
+        let confirm_json = serde_json::to_value(&decoded_confirm).unwrap();
+        assert_eq!(confirm_json.as_object().unwrap().len(), 2);
+        for forbidden in ["shortCode", "peerCode", "verificationCode"] {
+            assert!(!confirm_json.as_object().unwrap().contains_key(forbidden));
+        }
         assert_eq!(alice.decision(), PairingDecision::AwaitingPeerApproval);
-        assert_eq!(
-            bob.accept_peer_frame(&alice_frame).unwrap(),
-            PairingDecision::AwaitingLocalApproval
-        );
+        bob.approval.accept_peer_message(&decoded_confirm).unwrap();
+        assert_eq!(bob.decision(), PairingDecision::AwaitingLocalApproval);
         let bob_frame = bob.decide_locally(true, &alice_code).unwrap();
         assert_eq!(
             alice.accept_peer_frame(&bob_frame).unwrap(),
@@ -1589,7 +1690,9 @@ mod tests {
             task_id: "task-001".to_string(),
         };
         let first = alice.cipher.encrypt_control(&message).unwrap();
-        let mut second = alice.cipher.encrypt_control(&message).unwrap();
+        let second = alice.cipher.encrypt_control(&message).unwrap();
+        assert_eq!(first.sequence, 0);
+        assert_eq!(second.sequence, 1);
         assert!(bob.cipher.decrypt_control(&second).is_err());
 
         let (mut alice, mut bob) = two_secure_sessions();
@@ -1792,6 +1895,172 @@ mod tests {
                 ),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn native_datachannel_round_trips_one_mib_in_both_directions() {
+        use livekit::webrtc::{
+            data_channel::{DataChannel, DataChannelInit, DataChannelState},
+            peer_connection::{AnswerOptions, IceConnectionState, IceGatheringState, OfferOptions},
+            peer_connection_factory::{
+                ContinualGatheringPolicy, IceTransportsType, PeerConnectionFactory,
+                RtcConfiguration,
+            },
+        };
+        use tokio::sync::mpsc;
+        use tokio::time::{timeout, Duration};
+
+        async fn transfer_one_mib(
+            sender: &DataChannel,
+            receiver: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+            transfer_id: &str,
+            seed: u8,
+        ) {
+            const TOTAL: usize = 1024 * 1024;
+            const CHUNK: usize = 32_768;
+            let expected: Vec<u8> = (0..TOTAL)
+                .map(|i| ((i.wrapping_mul(131) + usize::from(seed)) % 251) as u8)
+                .collect();
+            let expected_hash = Sha256::digest(&expected);
+            let mut actual_hasher = Sha256::new();
+
+            for (seq, payload) in expected.chunks(CHUNK).enumerate() {
+                let frame =
+                    encode_direct_file_frame(transfer_id, seq as u32, payload, CHUNK as u16, 1)
+                        .unwrap();
+                sender.send(&frame, true).unwrap();
+                let received = timeout(Duration::from_secs(10), receiver.recv())
+                    .await
+                    .expect("DataChannel message timeout")
+                    .expect("DataChannel closed before message");
+                let decoded = decode_direct_file_frame(&received).unwrap().unwrap();
+                assert_eq!(decoded.id, transfer_id);
+                assert_eq!(decoded.seq, seq as u32);
+                assert_eq!(decoded.payload.as_slice(), payload);
+                actual_hasher.update(&decoded.payload);
+            }
+            assert_eq!(
+                actual_hasher.finalize().as_slice(),
+                expected_hash.as_slice()
+            );
+        }
+
+        let factory = PeerConnectionFactory::default();
+        let mut config = RtcConfiguration::default();
+        config.ice_servers.clear();
+        config.continual_gathering_policy = ContinualGatheringPolicy::GatherOnce;
+        config.ice_transport_type = IceTransportsType::All;
+        let a = factory.create_peer_connection(config.clone()).unwrap();
+        let b = factory.create_peer_connection(config).unwrap();
+
+        let (a_ice_tx, mut a_ice_rx) = mpsc::unbounded_channel();
+        let (b_ice_tx, mut b_ice_rx) = mpsc::unbounded_channel();
+        let (b_dc_tx, mut b_dc_rx) = mpsc::unbounded_channel();
+        a.on_ice_candidate(Some(Box::new(move |candidate| {
+            let _ = a_ice_tx.send(candidate);
+        })));
+        b.on_ice_candidate(Some(Box::new(move |candidate| {
+            let _ = b_ice_tx.send(candidate);
+        })));
+        b.on_data_channel(Some(Box::new(move |channel| {
+            let _ = b_dc_tx.send(channel);
+        })));
+
+        let a_dc = a
+            .create_data_channel("fling-file", DataChannelInit::default())
+            .unwrap();
+        let offer = a.create_offer(OfferOptions::default()).await.unwrap();
+        a.set_local_description(offer.clone()).await.unwrap();
+        b.set_remote_description(offer).await.unwrap();
+        let answer = b.create_answer(AnswerOptions::default()).await.unwrap();
+        b.set_local_description(answer.clone()).await.unwrap();
+        a.set_remote_description(answer).await.unwrap();
+
+        timeout(Duration::from_secs(15), async {
+            loop {
+                if a.ice_gathering_state() == IceGatheringState::Complete
+                    && b.ice_gathering_state() == IceGatheringState::Complete
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("host ICE gathering did not complete");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut a_candidates = Vec::new();
+        let mut b_candidates = Vec::new();
+        while let Ok(candidate) = a_ice_rx.try_recv() {
+            a_candidates.push(candidate);
+        }
+        while let Ok(candidate) = b_ice_rx.try_recv() {
+            b_candidates.push(candidate);
+        }
+        assert!(!a_candidates.is_empty(), "A gathered no host candidates");
+        assert!(!b_candidates.is_empty(), "B gathered no host candidates");
+        for candidate in b_candidates {
+            a.add_ice_candidate(candidate).await.unwrap();
+        }
+        for candidate in a_candidates {
+            b.add_ice_candidate(candidate).await.unwrap();
+        }
+
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let a_connected = matches!(
+                    a.ice_connection_state(),
+                    IceConnectionState::Connected | IceConnectionState::Completed
+                );
+                let b_connected = matches!(
+                    b.ice_connection_state(),
+                    IceConnectionState::Connected | IceConnectionState::Completed
+                );
+                if a_connected && b_connected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("host ICE candidates did not connect");
+        let b_dc = timeout(Duration::from_secs(15), b_dc_rx.recv())
+            .await
+            .expect("remote DataChannel creation timeout")
+            .expect("DataChannel callback closed");
+        assert_eq!(a_dc.label(), "fling-file");
+        assert_eq!(b_dc.label(), "fling-file");
+
+        let (to_a_tx, mut to_a_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (to_b_tx, mut to_b_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        a_dc.on_message(Some(Box::new(move |message| {
+            if message.binary {
+                let _ = to_a_tx.send(message.data.to_vec());
+            }
+        })));
+        b_dc.on_message(Some(Box::new(move |message| {
+            if message.binary {
+                let _ = to_b_tx.send(message.data.to_vec());
+            }
+        })));
+
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if a_dc.state() == DataChannelState::Open && b_dc.state() == DataChannelState::Open
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("DataChannel did not open");
+
+        transfer_one_mib(&a_dc, &mut to_b_rx, "00112233445566778899aabb", 7).await;
+        transfer_one_mib(&b_dc, &mut to_a_rx, "ffeeddccbbaa998877665544", 19).await;
+        a.close();
+        b.close();
     }
 
     #[tokio::test]

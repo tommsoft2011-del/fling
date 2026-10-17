@@ -25,6 +25,7 @@ mod embedded_config;
 
 #[allow(dead_code)]
 mod native_lan;
+mod native_lan_runtime;
 // ================================================================ config ==
 
 /// 16 random bytes as lowercase hex. Generated once on first run, never rotated.
@@ -68,11 +69,23 @@ struct FlingConfig {
     download_dir: String,
     #[serde(default, alias = "turnUrl", skip_serializing_if = "Option::is_none")]
     turn_url: Option<String>,
-    #[serde(default, alias = "turnUsername", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "turnUsername",
+        skip_serializing_if = "Option::is_none"
+    )]
     turn_username: Option<String>,
-    #[serde(default, alias = "turnPassword", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "turnPassword",
+        skip_serializing_if = "Option::is_none"
+    )]
     turn_password: Option<String>,
-    #[serde(default, alias = "remoteConfigUrl", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "remoteConfigUrl",
+        skip_serializing_if = "Option::is_none"
+    )]
     remote_config_url: Option<String>,
 }
 
@@ -125,12 +138,12 @@ fn needs_migration(raw: &str) -> bool {
 /// Serializes config-file writers so concurrent settings changes can't tear the file.
 struct ConfigLock(Mutex<()>);
 
-fn with_config_lock<T>(app: &tauri::AppHandle, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+fn with_config_lock<T>(
+    app: &tauri::AppHandle,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
     let state = app.state::<ConfigLock>();
-    let _guard = state
-        .0
-        .lock()
-        .map_err(|e| format!("lock: {e}"))?;
+    let _guard = state.0.lock().map_err(|e| format!("lock: {e}"))?;
     f()
 }
 
@@ -187,21 +200,45 @@ fn effective_config(app: &tauri::AppHandle) -> Result<FlingConfig, String> {
     // 远程配置（服务器下发）优先于嵌入配置，低于本地手动配置
     if let Ok(remote) = app.state::<RemoteConfig>().0.lock() {
         if let Some(r) = remote.as_ref() {
-            if cfg.server_url.trim().is_empty() { cfg.server_url = r.server_url.clone(); }
-            if cfg.api_key.trim().is_empty() { cfg.api_key = r.api_key.clone(); }
-            if cfg.api_secret.trim().is_empty() { cfg.api_secret = r.api_secret.clone(); }
-            if cfg.turn_url.is_none() { cfg.turn_url = r.turn_url.clone(); }
-            if cfg.turn_username.is_none() { cfg.turn_username = r.turn_username.clone(); }
-            if cfg.turn_password.is_none() { cfg.turn_password = r.turn_password.clone(); }
+            if cfg.server_url.trim().is_empty() {
+                cfg.server_url = r.server_url.clone();
+            }
+            if cfg.api_key.trim().is_empty() {
+                cfg.api_key = r.api_key.clone();
+            }
+            if cfg.api_secret.trim().is_empty() {
+                cfg.api_secret = r.api_secret.clone();
+            }
+            if cfg.turn_url.is_none() {
+                cfg.turn_url = r.turn_url.clone();
+            }
+            if cfg.turn_username.is_none() {
+                cfg.turn_username = r.turn_username.clone();
+            }
+            if cfg.turn_password.is_none() {
+                cfg.turn_password = r.turn_password.clone();
+            }
         }
     }
     if let Ok(e) = decrypt_embedded_config() {
-        if cfg.server_url.trim().is_empty() { cfg.server_url = e.server_url; }
-        if cfg.api_key.trim().is_empty() { cfg.api_key = e.api_key; }
-        if cfg.api_secret.trim().is_empty() { cfg.api_secret = e.api_secret; }
-        if cfg.turn_url.is_none() { cfg.turn_url = e.turn_url; }
-        if cfg.turn_username.is_none() { cfg.turn_username = e.turn_username; }
-        if cfg.turn_password.is_none() { cfg.turn_password = e.turn_password; }
+        if cfg.server_url.trim().is_empty() {
+            cfg.server_url = e.server_url;
+        }
+        if cfg.api_key.trim().is_empty() {
+            cfg.api_key = e.api_key;
+        }
+        if cfg.api_secret.trim().is_empty() {
+            cfg.api_secret = e.api_secret;
+        }
+        if cfg.turn_url.is_none() {
+            cfg.turn_url = e.turn_url;
+        }
+        if cfg.turn_username.is_none() {
+            cfg.turn_username = e.turn_username;
+        }
+        if cfg.turn_password.is_none() {
+            cfg.turn_password = e.turn_password;
+        }
     }
     Ok(cfg)
 }
@@ -220,37 +257,49 @@ fn get_remote_config_url(app: tauri::AppHandle) -> Result<Option<String>, String
 
 /// 应用从服务器拉取的加密配置（前端 fetch 后传 nonce/data，Rust 解密并缓存）
 #[tauri::command]
-fn apply_remote_config(app: tauri::AppHandle, nonce_b64: String, data_b64: String) -> Result<(), String> {
-    use aes_gcm::{Aes256Gcm, Key, Nonce};
+fn apply_remote_config(
+    app: tauri::AppHandle,
+    nonce_b64: String,
+    data_b64: String,
+) -> Result<(), String> {
     use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     if !embedded_config::HAS_EMBEDDED {
         return Err("no embedded key".into());
     }
-    let nonce = B64.decode(nonce_b64.trim()).map_err(|e| format!("nonce: {e}"))?;
-    let data = B64.decode(data_b64.trim()).map_err(|e| format!("data: {e}"))?;
+    let nonce = B64
+        .decode(nonce_b64.trim())
+        .map_err(|e| format!("nonce: {e}"))?;
+    let data = B64
+        .decode(data_b64.trim())
+        .map_err(|e| format!("data: {e}"))?;
     let key = Key::<Aes256Gcm>::from_slice(&embedded_config::CONFIG_KEY);
     let cipher = Aes256Gcm::new(key);
     let pt = cipher
         .decrypt(Nonce::from_slice(&nonce), data.as_slice())
         .map_err(|e| format!("decrypt remote config: {e}"))?;
     let cfg: FlingConfig = serde_json::from_slice(&pt).map_err(|e| format!("parse: {e}"))?;
-    *app.state::<RemoteConfig>().0.lock().map_err(|e| format!("lock: {e}"))? = Some(cfg);
+    *app.state::<RemoteConfig>()
+        .0
+        .lock()
+        .map_err(|e| format!("lock: {e}"))? = Some(cfg);
     Ok(())
 }
 
 /// 解密编译时嵌入的服务器凭据（AES-256-GCM）。
 /// 返回 FlingConfig（只取其中的服务器字段，设备字段忽略）。
 fn decrypt_embedded_config() -> Result<FlingConfig, String> {
-    use aes_gcm::{Aes256Gcm, Key, Nonce};
     use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
     if !embedded_config::HAS_EMBEDDED || embedded_config::CONFIG_CIPHERTEXT.is_empty() {
         return Err("no embedded config".into());
     }
     let key = Key::<Aes256Gcm>::from_slice(&embedded_config::CONFIG_KEY);
     let cipher = Aes256Gcm::new(key);
     let nonce = Nonce::from_slice(&embedded_config::CONFIG_NONCE);
-    let pt = cipher.decrypt(nonce, embedded_config::CONFIG_CIPHERTEXT)
+    let pt = cipher
+        .decrypt(nonce, embedded_config::CONFIG_CIPHERTEXT)
         .map_err(|e| format!("decrypt embedded config: {e}"))?;
     serde_json::from_slice::<FlingConfig>(&pt).map_err(|e| format!("parse embedded config: {e}"))
 }
@@ -285,10 +334,22 @@ fn save_config(app: tauri::AppHandle, cfg: FlingConfig) -> Result<(), String> {
                         cfg.download_dir
                     },
                     // TURN 字段：新值非空则采用，否则保留旧值（缺省为 None）
-                    turn_url: cfg.turn_url.filter(|s| !s.trim().is_empty()).or(old.turn_url),
-                    turn_username: cfg.turn_username.filter(|s| !s.trim().is_empty()).or(old.turn_username),
-                    turn_password: cfg.turn_password.filter(|s| !s.trim().is_empty()).or(old.turn_password),
-                    remote_config_url: cfg.remote_config_url.filter(|s| !s.trim().is_empty()).or(old.remote_config_url),
+                    turn_url: cfg
+                        .turn_url
+                        .filter(|s| !s.trim().is_empty())
+                        .or(old.turn_url),
+                    turn_username: cfg
+                        .turn_username
+                        .filter(|s| !s.trim().is_empty())
+                        .or(old.turn_username),
+                    turn_password: cfg
+                        .turn_password
+                        .filter(|s| !s.trim().is_empty())
+                        .or(old.turn_password),
+                    remote_config_url: cfg
+                        .remote_config_url
+                        .filter(|s| !s.trim().is_empty())
+                        .or(old.remote_config_url),
                 },
                 Err(_) => cfg,
             },
@@ -398,7 +459,11 @@ fn save_received_file(
         .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
         .collect();
     let clean = clean.trim();
-    let clean = if clean.is_empty() { "file".to_string() } else { clean.to_string() };
+    let clean = if clean.is_empty() {
+        "file".to_string()
+    } else {
+        clean.to_string()
+    };
 
     let dir_path = std::path::PathBuf::from(&dir);
     // 相对路径：逐段清洗，拒绝 ".." 与绝对路径，防止目录穿越
@@ -435,7 +500,11 @@ fn save_received_file(
     // atomic and fails rather than overwriting a file created concurrently.
     let (temp_path, mut temp_file) = loop {
         let temp = target_dir.join(format!(".fling-{}.tmp", new_device_id()));
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&temp) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
             Ok(file) => break (temp, file),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("创建临时文件失败: {e}")),
@@ -461,7 +530,11 @@ fn save_received_file(
         _ => (clean.clone(), String::new()),
     };
     for i in 0..10_000u32 {
-        let filename = if i == 0 { clean.clone() } else { format!("{stem} ({i}){ext}") };
+        let filename = if i == 0 {
+            clean.clone()
+        } else {
+            format!("{stem} ({i}){ext}")
+        };
         let candidate = target_dir.join(filename);
         match std::fs::hard_link(&temp_path, &candidate) {
             Ok(()) => {
@@ -473,13 +546,23 @@ fn save_received_file(
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput) => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
                 // Some removable/network filesystems do not implement hard
                 // links. Reserve the final path with create_new before copy;
                 // this fallback still never overwrites a concurrent file.
-                match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&candidate)
+                {
                     Ok(mut destination) => {
-                        let mut source = std::fs::File::open(&temp_path).map_err(|err| format!("重开临时文件失败: {err}"))?;
+                        let mut source = std::fs::File::open(&temp_path)
+                            .map_err(|err| format!("重开临时文件失败: {err}"))?;
                         if let Err(err) = std::io::copy(&mut source, &mut destination)
                             .and_then(|_| destination.sync_all())
                         {
@@ -525,7 +608,11 @@ fn received_file_target(
         .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
         .collect();
     let clean = clean.trim();
-    let clean = if clean.is_empty() { "file".to_string() } else { clean.to_string() };
+    let clean = if clean.is_empty() {
+        "file".to_string()
+    } else {
+        clean.to_string()
+    };
     let dir_path = std::path::PathBuf::from(dir);
     let target_dir = match rel_path {
         Some(rel) if !rel.trim().is_empty() => {
@@ -562,7 +649,11 @@ fn create_received_temp_file(
 ) -> Result<(std::path::PathBuf, std::fs::File), String> {
     loop {
         let temp = target_dir.join(format!(".fling-{}.tmp", new_device_id()));
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&temp) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
             Ok(file) => return Ok((temp, file)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("创建临时文件失败: {e}")),
@@ -582,7 +673,11 @@ fn commit_received_temp_file(
         _ => (clean.to_string(), String::new()),
     };
     for i in 0..10_000u32 {
-        let filename = if i == 0 { clean.to_string() } else { format!("{stem} ({i}){ext}") };
+        let filename = if i == 0 {
+            clean.to_string()
+        } else {
+            format!("{stem} ({i}){ext}")
+        };
         let candidate = target_dir.join(filename);
         match std::fs::hard_link(temp_path, &candidate) {
             Ok(()) => {
@@ -594,15 +689,26 @@ fn commit_received_temp_file(
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput) => {
-                match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&candidate)
+                {
                     Ok(mut destination) => {
                         let copied = (|| -> Result<(), String> {
                             let mut source = std::fs::File::open(temp_path)
                                 .map_err(|err| format!("重开临时文件失败: {err}"))?;
                             std::io::copy(&mut source, &mut destination)
                                 .map_err(|err| format!("写入失败: {err}"))?;
-                            destination.sync_all().map_err(|err| format!("写入失败: {err}"))?;
+                            destination
+                                .sync_all()
+                                .map_err(|err| format!("写入失败: {err}"))?;
                             Ok(())
                         })();
                         if let Err(err) = copied {
@@ -665,7 +771,8 @@ fn raw_append_request_parts(
     if data.is_empty() || data.len() > MAX_RECEIVED_FILE_BATCH_BYTES {
         return Err(format!(
             "invalid receive batch size (got {}, max {})",
-            data.len(), MAX_RECEIVED_FILE_BATCH_BYTES
+            data.len(),
+            MAX_RECEIVED_FILE_BATCH_BYTES
         ));
     }
     Ok((session_id.to_string(), data.clone()))
@@ -704,7 +811,10 @@ impl ReceivedFileStore {
             return Err("invalid expected sha256".to_string());
         }
         let (target_dir, clean_name) = received_file_target(&dir, &name, rel_path.as_deref())?;
-        let mut sessions = self.sessions.lock().map_err(|e| format!("receive file lock: {e}"))?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|e| format!("receive file lock: {e}"))?;
         let (temp_path, file) = create_received_temp_file(&target_dir)?;
         let session_id = loop {
             let id = new_device_id();
@@ -712,32 +822,46 @@ impl ReceivedFileStore {
                 break id;
             }
         };
-        sessions.insert(session_id.clone(), StreamingReceivedFile {
-            temp_path,
-            file: Some(file),
-            target_dir,
-            clean_name,
-            expected_size,
-            expected_sha256,
-            written: 0,
-            hasher: Sha256::new(),
-            write_all_ms: 0.0,
-        });
+        sessions.insert(
+            session_id.clone(),
+            StreamingReceivedFile {
+                temp_path,
+                file: Some(file),
+                target_dir,
+                clean_name,
+                expected_size,
+                expected_sha256,
+                written: 0,
+                hasher: Sha256::new(),
+                write_all_ms: 0.0,
+            },
+        );
         Ok(session_id)
     }
 
     fn append(&self, session_id: &str, data: &[u8]) -> Result<AppendReceivedFileResult, String> {
         let result = (|| -> Result<AppendReceivedFileResult, String> {
-            let mut sessions = self.sessions.lock().map_err(|e| format!("receive file lock: {e}"))?;
-            let session = sessions.get_mut(session_id).ok_or_else(|| "unknown receive file session".to_string())?;
-            let next_size = session.written.checked_add(data.len() as u64)
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|e| format!("receive file lock: {e}"))?;
+            let session = sessions
+                .get_mut(session_id)
+                .ok_or_else(|| "unknown receive file session".to_string())?;
+            let next_size = session
+                .written
+                .checked_add(data.len() as u64)
                 .ok_or_else(|| "received file size overflow".to_string())?;
             if next_size > session.expected_size {
                 return Err("received more bytes than declared".to_string());
             }
             let started = std::time::Instant::now();
-            session.file.as_mut().ok_or_else(|| "receive file is already closed".to_string())?
-                .write_all(data).map_err(|e| format!("写入失败: {e}"))?;
+            session
+                .file
+                .as_mut()
+                .ok_or_else(|| "receive file is already closed".to_string())?
+                .write_all(data)
+                .map_err(|e| format!("写入失败: {e}"))?;
             let write_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
             session.write_all_ms += write_elapsed_ms;
             session.hasher.update(data);
@@ -755,18 +879,26 @@ impl ReceivedFileStore {
     }
 
     fn finish(&self, session_id: &str) -> Result<SaveReceivedFileResult, String> {
-        let mut session = self.sessions.lock()
+        let mut session = self
+            .sessions
+            .lock()
             .map_err(|e| format!("receive file lock: {e}"))?
             .remove(session_id)
             .ok_or_else(|| "unknown receive file session".to_string())?;
         if session.written != session.expected_size {
-            return Err(format!("received file size mismatch (got {}, want {})", session.written, session.expected_size));
+            return Err(format!(
+                "received file size mismatch (got {}, want {})",
+                session.written, session.expected_size
+            ));
         }
         let digest = format!("{:x}", session.hasher.clone().finalize());
         if !digest.eq_ignore_ascii_case(&session.expected_sha256) {
             return Err("sha256 mismatch while saving received file".to_string());
         }
-        let file = session.file.take().ok_or_else(|| "receive file is already closed".to_string())?;
+        let file = session
+            .file
+            .take()
+            .ok_or_else(|| "receive file is already closed".to_string())?;
         let sync_started = std::time::Instant::now();
         file.sync_all().map_err(|e| format!("写入失败: {e}"))?;
         let sync_all_ms = sync_started.elapsed().as_secs_f64() * 1000.0;
@@ -781,7 +913,9 @@ impl ReceivedFileStore {
     }
 
     fn abort(&self, session_id: &str) -> Result<(), String> {
-        let session = self.sessions.lock()
+        let session = self
+            .sessions
+            .lock()
             .map_err(|e| format!("receive file lock: {e}"))?
             .remove(session_id);
         drop(session);
@@ -799,8 +933,11 @@ async fn begin_received_file(
     expected_sha256: String,
 ) -> Result<String, String> {
     let store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || store.begin(dir, name, rel_path, expected_size, expected_sha256))
-        .await.map_err(|e| format!("开始接收文件失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        store.begin(dir, name, rel_path, expected_size, expected_sha256)
+    })
+    .await
+    .map_err(|e| format!("开始接收文件失败: {e}"))?
 }
 
 #[tauri::command]
@@ -815,7 +952,8 @@ async fn append_received_file_chunk(
     let (session_id, data) = raw_append_request_parts(request.body(), session_header)?;
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || store.append(&session_id, &data))
-        .await.map_err(|e| format!("写入接收文件失败: {e}"))?
+        .await
+        .map_err(|e| format!("写入接收文件失败: {e}"))?
 }
 
 #[tauri::command]
@@ -825,7 +963,8 @@ async fn finish_received_file(
 ) -> Result<SaveReceivedFileResult, String> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || store.finish(&session_id))
-        .await.map_err(|e| format!("完成接收文件失败: {e}"))?
+        .await
+        .map_err(|e| format!("完成接收文件失败: {e}"))?
 }
 
 #[tauri::command]
@@ -835,7 +974,8 @@ async fn abort_received_file(
 ) -> Result<(), String> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || store.abort(&session_id))
-        .await.map_err(|e| format!("清理接收文件失败: {e}"))?
+        .await
+        .map_err(|e| format!("清理接收文件失败: {e}"))?
 }
 
 fn history_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -851,7 +991,9 @@ fn history_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
 #[tauri::command]
 fn read_history(app: tauri::AppHandle) -> Result<Vec<String>, String> {
     use std::io::BufRead;
-    let _guard = HISTORY_IO_LOCK.lock().map_err(|e| format!("history lock: {e}"))?;
+    let _guard = HISTORY_IO_LOCK
+        .lock()
+        .map_err(|e| format!("history lock: {e}"))?;
     let path = history_path(&app)?;
     if !path.exists() {
         return Ok(Vec::new());
@@ -871,8 +1013,11 @@ fn read_history(app: tauri::AppHandle) -> Result<Vec<String>, String> {
 #[tauri::command]
 fn append_history(app: tauri::AppHandle, line: String) -> Result<(), String> {
     use std::io::Write;
-    let _guard = HISTORY_IO_LOCK.lock().map_err(|e| format!("history lock: {e}"))?;
-    let value: serde_json::Value = serde_json::from_str(&line).map_err(|e| format!("invalid history JSON: {e}"))?;
+    let _guard = HISTORY_IO_LOCK
+        .lock()
+        .map_err(|e| format!("history lock: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&line).map_err(|e| format!("invalid history JSON: {e}"))?;
     if !value.is_object() {
         return Err("history record must be a JSON object".to_string());
     }
@@ -918,10 +1063,11 @@ fn set_device_name(app: tauri::AppHandle, name: String) -> Result<(), String> {
     cfg.device_name = name.clone();
     with_config_lock(&app, || write_config_file(&p, &cfg))?;
     // Re-announce on mDNS so peers see the new name immediately.
-    app.state::<DiscoveryState>().send(DiscoveryCmd::UpdateIdentity {
-        device_id: cfg.device_id,
-        device_name: name,
-    });
+    app.state::<DiscoveryState>()
+        .send(DiscoveryCmd::UpdateIdentity {
+            device_id: cfg.device_id,
+            device_name: name,
+        });
     Ok(())
 }
 
@@ -973,7 +1119,10 @@ struct PeerDownPayload {
 enum DiscoveryCmd {
     SetBrowsing(bool),
     SetDiscoverable(bool),
-    UpdateIdentity { device_id: String, device_name: String },
+    UpdateIdentity {
+        device_id: String,
+        device_name: String,
+    },
 }
 
 struct DiscoveryState {
@@ -988,7 +1137,11 @@ impl DiscoveryState {
 
 /// Parse a resolved service's TXT records into (device_id, device_name).
 /// Returns None for non-Fling services (wrong or absent protocol version).
-fn peer_from_txt(v: Option<&str>, id: Option<&str>, name: Option<&str>) -> Option<(String, String)> {
+fn peer_from_txt(
+    v: Option<&str>,
+    id: Option<&str>,
+    name: Option<&str>,
+) -> Option<(String, String)> {
     if v? != FLING_PROTO_VERSION {
         return None;
     }
@@ -1011,15 +1164,17 @@ struct PeerSet {
 impl PeerSet {
     /// Returns true when this is a newly seen peer (caller emits peer-up).
     fn insert(&mut self, fullname: &str, id: &str) -> bool {
-        self.by_fullname.insert(fullname.to_string(), id.to_string());
+        self.by_fullname
+            .insert(fullname.to_string(), id.to_string());
         self.known_ids.insert(id.to_string())
     }
     /// Returns the device_id when the peer was known (caller emits peer-down).
     fn remove(&mut self, fullname: &str) -> Option<String> {
         let id = self.by_fullname.remove(fullname)?;
-        if !self.by_fullname.values().any(|v| v == &id) {
-            self.known_ids.remove(&id);
+        if self.by_fullname.values().any(|v| v == &id) {
+            return None;
         }
+        self.known_ids.remove(&id);
         Some(id)
     }
     fn clear(&mut self) -> Vec<String> {
@@ -1033,23 +1188,30 @@ fn register_fling(
     daemon: &mdns_sd::ServiceDaemon,
     device_id: &str,
     device_name: &str,
+    native_port: u16,
 ) -> Option<String> {
     let short = device_id.get(..12).unwrap_or(device_id);
+    let instance = format!("fling-{short}");
     let host = format!("fling-{short}.local.");
-    // Port 0: we offer no TCP service; mDNS is discovery-only here.
+    // The TCP listener is Rust-owned and only carries pairing/signaling/control.
     let props = [
         ("id", device_id),
         ("v", FLING_PROTO_VERSION),
         ("name", device_name),
     ];
-    let info = mdns_sd::ServiceInfo::new(MDNS_SERVICE_TYPE, device_name, &host, "", 0, &props[..])
-        .ok()?
-        .enable_addr_auto();
+    let info = mdns_sd::ServiceInfo::new(
+        MDNS_SERVICE_TYPE,
+        &instance,
+        &host,
+        "",
+        native_port,
+        &props[..],
+    )
+    .ok()?
+    .enable_addr_auto();
     // register() re-announces in place; no need to unregister first.
     let _ = daemon.register(info);
-    // Expected fullname; on instance-name conflict the daemon appends " (2)",
-    // in which case unregister() with this name is a best-effort no-op.
-    Some(format!("{device_name}.{MDNS_SERVICE_TYPE}"))
+    Some(format!("{instance}.{MDNS_SERVICE_TYPE}"))
 }
 
 fn discovery_thread(
@@ -1057,6 +1219,7 @@ fn discovery_thread(
     rx: mpsc::Receiver<DiscoveryCmd>,
     initial_id: String,
     initial_name: String,
+    native_port: u16,
 ) {
     use mdns_sd::ServiceEvent;
 
@@ -1074,7 +1237,7 @@ fn discovery_thread(
     let mut discoverable = true; // default on
     let mut browse_rx: Option<mdns_sd::Receiver<ServiceEvent>> = None;
     // Initial announce (discoverable defaults to on).
-    let mut registered_name = register_fling(&daemon, &device_id, &device_name);
+    let mut registered_name = register_fling(&daemon, &device_id, &device_name, native_port);
     let mut peers = PeerSet::default();
 
     loop {
@@ -1092,15 +1255,32 @@ fn discovery_thread(
                     let _ = daemon.stop_browse(MDNS_SERVICE_TYPE);
                     browse_rx = None;
                     browsing = false;
+                    let lan_enabled = app
+                        .state::<native_lan_runtime::NativeLanRuntime>()
+                        .is_enabled();
+                    app.state::<native_lan_runtime::NativeLanRuntime>()
+                        .clear_peers();
                     for id in peers.clear() {
-                        let _ = app.emit("fling://peer-down", PeerDownPayload { id });
+                        let payload = PeerDownPayload { id };
+                        let _ = app.emit("fling://peer-down", payload.clone());
+                        if lan_enabled {
+                            let runtime = app.state::<native_lan_runtime::NativeLanRuntime>();
+                            runtime.count_ipc(
+                                "event:fling://lan/peer-down",
+                                serde_json::to_vec(&payload)
+                                    .map(|value| value.len())
+                                    .unwrap_or_default(),
+                            );
+                            let _ = app.emit("fling://lan/peer-down", payload);
+                        }
                     }
                 }
             }
             Ok(DiscoveryCmd::SetDiscoverable(on)) => {
                 discoverable = on;
                 if on {
-                    registered_name = register_fling(&daemon, &device_id, &device_name);
+                    registered_name =
+                        register_fling(&daemon, &device_id, &device_name, native_port);
                 } else if let Some(name) = registered_name.take() {
                     let _ = daemon.unregister(&name);
                 }
@@ -1112,7 +1292,8 @@ fn discovery_thread(
                 device_id = id;
                 device_name = name;
                 if discoverable {
-                    registered_name = register_fling(&daemon, &device_id, &device_name);
+                    registered_name =
+                        register_fling(&daemon, &device_id, &device_name, native_port);
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1129,17 +1310,61 @@ fn discovery_thread(
                             info.get_property_val_str("name"),
                         ) {
                             Some((id, name)) if id != device_id => {
+                                let endpoints = native_lan_runtime::eligible_lan_endpoints(
+                                    info.get_addresses(),
+                                    info.get_port(),
+                                    app.state::<native_lan_runtime::NativeLanRuntime>()
+                                        .ipv6_listener_ready(),
+                                );
+                                app.state::<native_lan_runtime::NativeLanRuntime>()
+                                    .upsert_peer(
+                                        info.get_fullname(),
+                                        &id,
+                                        &name,
+                                        endpoints.clone(),
+                                    );
                                 if peers.insert(info.get_fullname(), &id) {
-                                    let _ =
-                                        app.emit("fling://peer-up", PeerUpPayload { id, name });
+                                    let payload = PeerUpPayload { id, name };
+                                    let _ = app.emit("fling://peer-up", payload.clone());
+                                    if app
+                                        .state::<native_lan_runtime::NativeLanRuntime>()
+                                        .is_enabled()
+                                        && !endpoints.is_empty()
+                                    {
+                                        let runtime =
+                                            app.state::<native_lan_runtime::NativeLanRuntime>();
+                                        runtime.count_ipc(
+                                            "event:fling://lan/peer-up",
+                                            serde_json::to_vec(&payload)
+                                                .map(|value| value.len())
+                                                .unwrap_or_default(),
+                                        );
+                                        let _ = app.emit("fling://lan/peer-up", payload);
+                                    }
                                 }
                             }
                             _ => {}
                         }
                     }
                     ServiceEvent::ServiceRemoved(_ty, fullname) => {
+                        app.state::<native_lan_runtime::NativeLanRuntime>()
+                            .remove_peer(&fullname);
                         if let Some(id) = peers.remove(&fullname) {
-                            let _ = app.emit("fling://peer-down", PeerDownPayload { id });
+                            let payload = PeerDownPayload { id };
+                            let _ = app.emit("fling://peer-down", payload.clone());
+                            if app
+                                .state::<native_lan_runtime::NativeLanRuntime>()
+                                .is_enabled()
+                            {
+                                let runtime = app.state::<native_lan_runtime::NativeLanRuntime>();
+                                runtime.count_ipc(
+                                    "event:fling://lan/peer-down",
+                                    serde_json::to_vec(&payload)
+                                        .map(|value| value.len())
+                                        .unwrap_or_default(),
+                                );
+                                let _ = app.emit("fling://lan/peer-down", payload);
+                            }
                         }
                     }
                     _ => {}
@@ -1180,20 +1405,26 @@ fn read_file_bytes(app: tauri::AppHandle, path: String) -> Result<Vec<u8>, Strin
     let meta = match std::fs::metadata(&path) {
         Ok(meta) => meta,
         Err(error) => {
-            emit_native_diagnostic(&app, serde_json::json!({
-                "stage": "source_file_metadata", "status": "error",
-                "errorType": format!("{:?}", error.kind()),
-                "elapsedMs": metadata_started.elapsed().as_secs_f64() * 1000.0,
-            }));
+            emit_native_diagnostic(
+                &app,
+                serde_json::json!({
+                    "stage": "source_file_metadata", "status": "error",
+                    "errorType": format!("{:?}", error.kind()),
+                    "elapsedMs": metadata_started.elapsed().as_secs_f64() * 1000.0,
+                }),
+            );
             return Err(format!("读取文件失败: {error}"));
         }
     };
     let metadata_ms = metadata_started.elapsed().as_secs_f64() * 1000.0;
     if !meta.is_file() {
-        emit_native_diagnostic(&app, serde_json::json!({
-            "stage": "source_file_metadata", "status": "not_file",
-            "metadataMs": metadata_ms,
-        }));
+        emit_native_diagnostic(
+            &app,
+            serde_json::json!({
+                "stage": "source_file_metadata", "status": "not_file",
+                "metadataMs": metadata_ms,
+            }),
+        );
         return Err("仅支持拖入文件，暂不支持文件夹".into());
     }
 
@@ -1201,12 +1432,15 @@ fn read_file_bytes(app: tauri::AppHandle, path: String) -> Result<Vec<u8>, Strin
     let mut file = match std::fs::File::open(&path) {
         Ok(file) => file,
         Err(error) => {
-            emit_native_diagnostic(&app, serde_json::json!({
-                "stage": "source_file_open", "status": "error",
-                "expectedBytes": meta.len(), "metadataMs": metadata_ms,
-                "errorType": format!("{:?}", error.kind()),
-                "elapsedMs": open_started.elapsed().as_secs_f64() * 1000.0,
-            }));
+            emit_native_diagnostic(
+                &app,
+                serde_json::json!({
+                    "stage": "source_file_open", "status": "error",
+                    "expectedBytes": meta.len(), "metadataMs": metadata_ms,
+                    "errorType": format!("{:?}", error.kind()),
+                    "elapsedMs": open_started.elapsed().as_secs_f64() * 1000.0,
+                }),
+            );
             return Err(format!("读取文件失败: {error}"));
         }
     };
@@ -1214,21 +1448,27 @@ fn read_file_bytes(app: tauri::AppHandle, path: String) -> Result<Vec<u8>, Strin
     let read_started = std::time::Instant::now();
     let mut bytes = Vec::with_capacity(meta.len().min(usize::MAX as u64) as usize);
     if let Err(error) = file.read_to_end(&mut bytes) {
-        emit_native_diagnostic(&app, serde_json::json!({
-            "stage": "source_file_read", "status": "error",
-            "expectedBytes": meta.len(), "readBytes": bytes.len(),
-            "metadataMs": metadata_ms, "openMs": open_ms,
-            "errorType": format!("{:?}", error.kind()),
-            "elapsedMs": read_started.elapsed().as_secs_f64() * 1000.0,
-        }));
+        emit_native_diagnostic(
+            &app,
+            serde_json::json!({
+                "stage": "source_file_read", "status": "error",
+                "expectedBytes": meta.len(), "readBytes": bytes.len(),
+                "metadataMs": metadata_ms, "openMs": open_ms,
+                "errorType": format!("{:?}", error.kind()),
+                "elapsedMs": read_started.elapsed().as_secs_f64() * 1000.0,
+            }),
+        );
         return Err(format!("读取文件失败: {error}"));
     }
-    emit_native_diagnostic(&app, serde_json::json!({
-        "stage": "source_file_read", "status": "ok",
-        "expectedBytes": meta.len(), "readBytes": bytes.len(),
-        "metadataMs": metadata_ms, "openMs": open_ms,
-        "readMs": read_started.elapsed().as_secs_f64() * 1000.0,
-    }));
+    emit_native_diagnostic(
+        &app,
+        serde_json::json!({
+            "stage": "source_file_read", "status": "ok",
+            "expectedBytes": meta.len(), "readBytes": bytes.len(),
+            "metadataMs": metadata_ms, "openMs": open_ms,
+            "readMs": read_started.elapsed().as_secs_f64() * 1000.0,
+        }),
+    );
     Ok(bytes)
 }
 
@@ -1408,16 +1648,33 @@ fn main() {
         .setup(|app| {
             // Device identity (created on first run) + mDNS discovery thread.
             let (_, cfg) = ensure_config(app.handle())?;
+            let (listeners, mut native_port, ipv6_ready) =
+                match native_lan_runtime::bind_lan_listeners() {
+                    Ok(bound) => bound,
+                    Err(error) => {
+                        eprintln!("[fling] offline LAN mode unavailable: {error}");
+                        (Vec::new(), 0, false)
+                    }
+                };
             let (tx, rx) = mpsc::channel::<DiscoveryCmd>();
             app.manage(ConfigLock(Mutex::new(())));
             app.manage(ReceivedFileStore::default());
             app.manage(RemoteConfig(Mutex::new(None)));
+            app.manage(native_lan_runtime::NativeLanRuntime::new());
             app.manage(DiscoveryState { tx });
+            if native_port != 0 {
+                if let Err(error) =
+                    native_lan_runtime::start_listener(app.handle().clone(), listeners, ipv6_ready)
+                {
+                    eprintln!("[fling] offline LAN mode unavailable: {error}");
+                    native_port = 0;
+                }
+            }
             let handle = app.handle().clone();
             let (device_id, device_name) = (cfg.device_id, cfg.device_name);
             std::thread::Builder::new()
                 .name("fling-mdns".into())
-                .spawn(move || discovery_thread(handle, rx, device_id, device_name))
+                .spawn(move || discovery_thread(handle, rx, device_id, device_name, native_port))
                 .map_err(|e| format!("mdns thread: {e}"))?;
             Ok(())
         })
@@ -1440,6 +1697,14 @@ fn main() {
             pick_download_dir,
             discovery_set_browsing,
             discovery_set_discoverable,
+            native_lan_runtime::native_lan_start_mode,
+            native_lan_runtime::native_lan_stop_mode,
+            native_lan_runtime::native_lan_pick_source,
+            native_lan_runtime::native_lan_start_send,
+            native_lan_runtime::native_lan_pair_decision,
+            native_lan_runtime::native_lan_manifest_decision,
+            native_lan_runtime::native_lan_cancel,
+            native_lan_runtime::native_lan_ipc_counters,
             write_image_clipboard,
             read_file_bytes,
             file_size,
@@ -1473,14 +1738,24 @@ mod tests {
         assert_eq!(bytes, vec![0, 1, 127, 255]);
 
         let json = tauri::ipc::InvokeBody::Json(serde_json::json!({ "data": [0, 1, 127, 255] }));
-        assert!(raw_append_request_parts(&json, Some(id)).unwrap_err().contains("raw binary"));
-        assert!(raw_append_request_parts(&raw, None).unwrap_err().contains("missing x-session-id"));
-        assert!(raw_append_request_parts(&raw, Some("bad-session")).unwrap_err().contains("invalid receive file session id"));
-        assert!(raw_append_request_parts(&tauri::ipc::InvokeBody::Raw(Vec::new()), Some(id)).is_err());
+        assert!(raw_append_request_parts(&json, Some(id))
+            .unwrap_err()
+            .contains("raw binary"));
+        assert!(raw_append_request_parts(&raw, None)
+            .unwrap_err()
+            .contains("missing x-session-id"));
+        assert!(raw_append_request_parts(&raw, Some("bad-session"))
+            .unwrap_err()
+            .contains("invalid receive file session id"));
+        assert!(
+            raw_append_request_parts(&tauri::ipc::InvokeBody::Raw(Vec::new()), Some(id)).is_err()
+        );
         assert!(raw_append_request_parts(
             &tauri::ipc::InvokeBody::Raw(vec![0; MAX_RECEIVED_FILE_BATCH_BYTES + 1]),
             Some(id),
-        ).unwrap_err().contains("invalid receive batch size"));
+        )
+        .unwrap_err()
+        .contains("invalid receive batch size"));
     }
 
     #[test]
@@ -1552,10 +1827,7 @@ mod tests {
         assert!(ps.insert("PC._fling._tcp.local.", "id1")); // new -> emit up
         assert!(!ps.insert("PC._fling._tcp.local.", "id1")); // dup -> suppressed
         assert!(!ps.insert("PC (2)._fling._tcp.local.", "id1")); // same id -> suppressed
-        assert_eq!(
-            ps.remove("PC._fling._tcp.local."),
-            Some("id1".to_string())
-        );
+        assert_eq!(ps.remove("PC._fling._tcp.local."), None);
         // id still referenced by the "(2)" name
         assert_eq!(
             ps.remove("PC (2)._fling._tcp.local."),
@@ -1595,14 +1867,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_string_lossy().into_owned();
 
-        let first_result = save_received_file(dir_str.clone(), "../sample.txt".into(), vec![1, 2, 3], None).unwrap();
+        let first_result =
+            save_received_file(dir_str.clone(), "../sample.txt".into(), vec![1, 2, 3], None)
+                .unwrap();
         assert!(first_result.write_all_ms.is_finite() && first_result.write_all_ms >= 0.0);
         assert!(first_result.sync_all_ms.is_finite() && first_result.sync_all_ms >= 0.0);
         let ipc_result = serde_json::to_value(&first_result).unwrap();
         assert!(ipc_result.get("writeAllMs").is_some());
         assert!(ipc_result.get("syncAllMs").is_some());
         let first = first_result.path;
-        let second = save_received_file(dir_str.clone(), "sample.txt".into(), vec![9, 8], None).unwrap().path;
+        let second = save_received_file(dir_str.clone(), "sample.txt".into(), vec![9, 8], None)
+            .unwrap()
+            .path;
         assert_ne!(first, second);
         assert_eq!(std::fs::read(&first).unwrap(), vec![1, 2, 3]);
         assert_eq!(std::fs::read(&second).unwrap(), vec![9, 8]);
@@ -1642,7 +1918,15 @@ mod tests {
             offset += length as u64;
         }
         let expected_hash = format!("{:x}", expected_hasher.finalize());
-        let session = store.begin(dir_str.clone(), "../large.bin".into(), None, size, expected_hash.clone()).unwrap();
+        let session = store
+            .begin(
+                dir_str.clone(),
+                "../large.bin".into(),
+                None,
+                size,
+                expected_hash.clone(),
+            )
+            .unwrap();
         offset = 0;
         let mut last_append = None;
         let mut rust_append_elapsed_ms = 0.0;
@@ -1661,8 +1945,14 @@ mod tests {
         assert_eq!(final_append.bytes as u64, size % (4 * 1024 * 1024));
         assert!(final_append.write_elapsed_ms.is_finite() && final_append.write_elapsed_ms >= 0.0);
         let append_ipc = serde_json::to_value(&final_append).unwrap();
-        assert_eq!(append_ipc.get("bytes").and_then(|v| v.as_u64()), Some(final_append.bytes as u64));
-        assert_eq!(append_ipc.get("cumulativeBytes").and_then(|v| v.as_u64()), Some(size));
+        assert_eq!(
+            append_ipc.get("bytes").and_then(|v| v.as_u64()),
+            Some(final_append.bytes as u64)
+        );
+        assert_eq!(
+            append_ipc.get("cumulativeBytes").and_then(|v| v.as_u64()),
+            Some(size)
+        );
         assert!(append_ipc.get("writeElapsedMs").is_some());
         let first = store.finish(&session).unwrap();
         println!(
@@ -1681,14 +1971,24 @@ mod tests {
         let mut read_buffer = vec![0u8; 64 * 1024];
         loop {
             let read = file.read(&mut read_buffer).unwrap();
-            if read == 0 { break; }
+            if read == 0 {
+                break;
+            }
             actual_hasher.update(&read_buffer[..read]);
         }
         assert_eq!(format!("{:x}", actual_hasher.finalize()), expected_hash);
 
         let second_bytes = b"second file";
         let second_hash = format!("{:x}", Sha256::digest(second_bytes));
-        let second_session = store.begin(dir_str, "large.bin".into(), None, second_bytes.len() as u64, second_hash).unwrap();
+        let second_session = store
+            .begin(
+                dir_str,
+                "large.bin".into(),
+                None,
+                second_bytes.len() as u64,
+                second_hash,
+            )
+            .unwrap();
         store.append(&second_session, second_bytes).unwrap();
         let second = store.finish(&second_session).unwrap();
         assert_ne!(first.path, second.path);
@@ -1720,13 +2020,15 @@ mod tests {
             offset += length as u64;
         }
         let expected_hash = format!("{:x}", expected_hasher.finalize());
-        let session = store.begin(
-            dir.to_string_lossy().into_owned(),
-            "60mib.bin".into(),
-            None,
-            size,
-            expected_hash.clone(),
-        ).unwrap();
+        let session = store
+            .begin(
+                dir.to_string_lossy().into_owned(),
+                "60mib.bin".into(),
+                None,
+                size,
+                expected_hash.clone(),
+            )
+            .unwrap();
         offset = 0;
         let mut rust_append_elapsed_ms = 0.0;
         let mut batches = 0u64;
@@ -1745,7 +2047,9 @@ mod tests {
         let mut read_buffer = vec![0u8; 64 * 1024];
         loop {
             let read = file.read(&mut read_buffer).unwrap();
-            if read == 0 { break; }
+            if read == 0 {
+                break;
+            }
             actual_hasher.update(&read_buffer[..read]);
         }
         assert_eq!(format!("{:x}", actual_hasher.finalize()), expected_hash);
@@ -1788,13 +2092,15 @@ mod tests {
             assert!(batch_size <= MAX_RECEIVED_FILE_BATCH_BYTES);
             let mut batch = vec![0u8; batch_size];
             let started = std::time::Instant::now();
-            let session = store.begin(
-                dir_str.clone(),
-                format!("batch-{batch_size}.bin"),
-                None,
-                size,
-                expected_hash.clone(),
-            ).unwrap();
+            let session = store
+                .begin(
+                    dir_str.clone(),
+                    format!("batch-{batch_size}.bin"),
+                    None,
+                    size,
+                    expected_hash.clone(),
+                )
+                .unwrap();
             offset = 0;
             let mut batches = 0u64;
             let mut write_all_ms = 0.0;
@@ -1815,7 +2121,9 @@ mod tests {
             let mut read_buffer = vec![0u8; 64 * 1024];
             loop {
                 let read = file.read(&mut read_buffer).unwrap();
-                if read == 0 { break; }
+                if read == 0 {
+                    break;
+                }
                 actual_hasher.update(&read_buffer[..read]);
             }
             assert_eq!(format!("{:x}", actual_hasher.finalize()), expected_hash);
@@ -1842,8 +2150,24 @@ mod tests {
         let store = ReceivedFileStore::default();
         let a = b"alpha";
         let b = b"bravo-two";
-        let a_session = store.begin(dir_str.clone(), "a.bin".into(), Some("batch/a.bin".into()), a.len() as u64, format!("{:x}", Sha256::digest(a))).unwrap();
-        let b_session = store.begin(dir_str.clone(), "b.bin".into(), Some("batch/b.bin".into()), b.len() as u64, format!("{:x}", Sha256::digest(b))).unwrap();
+        let a_session = store
+            .begin(
+                dir_str.clone(),
+                "a.bin".into(),
+                Some("batch/a.bin".into()),
+                a.len() as u64,
+                format!("{:x}", Sha256::digest(a)),
+            )
+            .unwrap();
+        let b_session = store
+            .begin(
+                dir_str.clone(),
+                "b.bin".into(),
+                Some("batch/b.bin".into()),
+                b.len() as u64,
+                format!("{:x}", Sha256::digest(b)),
+            )
+            .unwrap();
         store.append(&a_session, &a[..2]).unwrap();
         store.append(&b_session, &b[..4]).unwrap();
         store.append(&a_session, &a[2..]).unwrap();
@@ -1853,10 +2177,26 @@ mod tests {
         assert_eq!(std::fs::read(saved_a.path).unwrap(), a);
         assert_eq!(std::fs::read(saved_b.path).unwrap(), b);
 
-        let aborted = store.begin(dir_str.clone(), "interrupted.bin".into(), None, 100, format!("{:x}", Sha256::digest(b"x"))).unwrap();
+        let aborted = store
+            .begin(
+                dir_str.clone(),
+                "interrupted.bin".into(),
+                None,
+                100,
+                format!("{:x}", Sha256::digest(b"x")),
+            )
+            .unwrap();
         store.append(&aborted, b"partial").unwrap();
         store.abort(&aborted).unwrap();
-        let invalid = store.begin(dir_str.clone(), "bad-hash.bin".into(), None, 3, "0".repeat(64)).unwrap();
+        let invalid = store
+            .begin(
+                dir_str.clone(),
+                "bad-hash.bin".into(),
+                None,
+                3,
+                "0".repeat(64),
+            )
+            .unwrap();
         store.append(&invalid, b"bad").unwrap();
         assert!(store
             .finish(&invalid)
@@ -1875,7 +2215,11 @@ mod tests {
         assert!(store.append(&overflow, b"four").is_err());
         assert!(store.finish(&overflow).is_err());
         assert!(std::fs::read_dir(&dir).unwrap().all(|entry| {
-            !entry.unwrap().file_name().to_string_lossy().starts_with(".fling-")
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".fling-")
         }));
         assert!(!dir.join("interrupted.bin").exists());
         assert!(!dir.join("bad-hash.bin").exists());

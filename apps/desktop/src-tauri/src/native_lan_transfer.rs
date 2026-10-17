@@ -1,0 +1,1898 @@
+use super::{
+    emit_lan_event, enqueue_ordered_control, is_local_network_address, task_event_with_metadata,
+    try_enqueue_ordered_control, NativeLanRuntime, NativeLanSession, NativeSource,
+    NATIVE_CHUNK_SIZE,
+};
+use crate::native_lan::{self, NativeControlMessage, NativeFileManifest};
+use crate::{ensure_config, ReceivedFileStore};
+use livekit::webrtc::{
+    data_channel::{DataChannel, DataChannelInit, DataChannelState},
+    ice_candidate::IceCandidate,
+    peer_connection::{AnswerOptions, IceConnectionState, OfferOptions, PeerConnection},
+    peer_connection_factory::{
+        ContinualGatheringPolicy, IceTransportsType, PeerConnectionFactory, RtcConfiguration,
+    },
+    session_description::{SdpType, SessionDescription},
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::io::{Read, Seek, SeekFrom};
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Manager};
+use tokio::sync::{mpsc as async_mpsc, watch};
+use tokio::time::timeout;
+
+const DIRECT_CHANNEL_LABEL: &str = "fling-file";
+const ACK_INTERVAL_CHUNKS: u32 = 8;
+const SENDER_WINDOW_CHUNKS: u32 = 16;
+const MAX_BUFFERED_BYTES: u64 = 256 * 1024;
+const MAX_ACK_RECOVERY_RETRIES: u8 = 3;
+const RECEIVE_QUEUE_FRAMES: usize = 8;
+const ACK_TIMEOUT: Duration = Duration::from_secs(30);
+const CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+const PROGRESS_MIN_BYTES: u64 = 1024 * 1024;
+const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_PENDING_ICE: usize = 128;
+
+pub(super) struct TransferState {
+    pc: Option<PeerConnection>,
+    data_channel: Option<DataChannel>,
+    pending_remote_ice: Vec<String>,
+    remote_description_set: bool,
+    pending_manifest: Option<NativeFileManifest>,
+    outgoing_manifest: Option<NativeFileManifest>,
+    seen_transfer_nonces: HashSet<String>,
+    incoming: Option<IncomingTransfer>,
+    last_sender_progress_bytes: u64,
+    last_sender_progress_at: Instant,
+}
+
+impl Default for TransferState {
+    fn default() -> Self {
+        Self {
+            pc: None,
+            data_channel: None,
+            pending_remote_ice: Vec::new(),
+            remote_description_set: false,
+            pending_manifest: None,
+            outgoing_manifest: None,
+            seen_transfer_nonces: HashSet::new(),
+            incoming: None,
+            last_sender_progress_bytes: 0,
+            last_sender_progress_at: Instant::now(),
+        }
+    }
+}
+
+fn claim_transfer_nonce(used: &mut HashSet<String>, nonce: &str) -> Result<(), String> {
+    if used.contains(nonce) {
+        return Err("file manifest transfer nonce replay rejected".to_string());
+    }
+    if used.len() >= 128 {
+        return Err("LAN transfer nonce budget exhausted; re-pair required".to_string());
+    }
+    used.insert(nonce.to_string());
+    Ok(())
+}
+
+fn fresh_transfer_nonce(used: &mut HashSet<String>) -> Result<String, String> {
+    for _ in 0..8 {
+        let nonce = super::random_hex_id();
+        if !used.contains(&nonce) {
+            claim_transfer_nonce(used, &nonce)?;
+            return Ok(nonce);
+        }
+    }
+    Err("cannot allocate a fresh transfer nonce".to_string())
+}
+
+fn outgoing_transfer_id(session: &NativeLanSession) -> Result<String, String> {
+    session
+        .transfer
+        .lock()
+        .map_err(|_| "LAN transfer state lock".to_string())?
+        .outgoing_manifest
+        .as_ref()
+        .map(|manifest| manifest.id.clone())
+        .ok_or_else(|| "sender manifest state missing".to_string())
+}
+
+fn progress_event(
+    session: &NativeLanSession,
+    phase: &str,
+    received_bytes: u64,
+    saved_bytes: u64,
+    total_bytes: u64,
+    speed_bps: u64,
+    name: Option<String>,
+) -> super::LanTaskEvent {
+    let mut event = task_event_with_metadata(
+        session,
+        phase,
+        received_bytes,
+        saved_bytes,
+        total_bytes,
+        None,
+        name,
+    );
+    event.speed_bps = speed_bps;
+    event
+}
+
+struct IncomingTransfer {
+    manifest: NativeFileManifest,
+    store: ReceivedFileStore,
+    store_session_id: String,
+    next_seq: u32,
+    received_bytes: u64,
+    last_ack_seq: u32,
+    last_progress_bytes: u64,
+    last_progress_at: Instant,
+    complete: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IncomingManifestEvent {
+    session_id: String,
+    task_id: String,
+    peer_device_label: String,
+    name: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IceCandidateInit {
+    candidate: String,
+    sdp_mid: Option<String>,
+    #[serde(rename = "sdpMLineIndex")]
+    sdp_mline_index: Option<i32>,
+    #[serde(default)]
+    username_fragment: Option<String>,
+}
+
+pub(super) fn start_data_channel_router(
+    app: AppHandle,
+    runtime: NativeLanRuntime,
+    session: Arc<NativeLanSession>,
+    mut channels: async_mpsc::UnboundedReceiver<DataChannel>,
+) {
+    tauri::async_runtime::spawn(async move {
+        while let Some(channel) = channels.recv().await {
+            if channel.label() != DIRECT_CHANNEL_LABEL {
+                channel.close();
+                continue;
+            }
+            if let Err(error) =
+                install_data_channel(app.clone(), runtime.clone(), session.clone(), channel).await
+            {
+                let kind = if error.contains("closed") {
+                    super::LanFailureKind::Close
+                } else {
+                    super::LanFailureKind::Error
+                };
+                super::interrupt_session(&app, &runtime, &session, error, kind);
+                return;
+            }
+        }
+    });
+}
+
+pub(super) async fn on_pair_confirmed(
+    app: &AppHandle,
+    runtime: &NativeLanRuntime,
+    session: &Arc<NativeLanSession>,
+) -> Result<(), String> {
+    if session
+        .webrtc_started
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return Ok(());
+    }
+    let mut config = RtcConfiguration::default();
+    config.ice_servers.clear(); // Offline LAN mode never uses STUN/TURN or LiveKit relay.
+    config.continual_gathering_policy = ContinualGatheringPolicy::GatherOnce;
+    config.ice_transport_type = IceTransportsType::All; // host candidates only: no ICE servers are configured.
+    let factory = PeerConnectionFactory::default();
+    let peer = factory
+        .create_peer_connection(config)
+        .map_err(|error| format!("create native LAN PeerConnection: {error}"))?;
+    install_peer_callbacks(app.clone(), runtime.clone(), session.clone(), &peer);
+    {
+        let mut transfer = session
+            .transfer
+            .lock()
+            .map_err(|error| format!("LAN transfer state lock: {error}"))?;
+        if let Some(previous) = transfer.pc.replace(peer.clone()) {
+            previous.close();
+        }
+        transfer.remote_description_set = false;
+        transfer.pending_remote_ice.clear();
+    }
+    emit_lan_event(
+        app,
+        runtime,
+        "fling://lan/progress",
+        task_event_with_metadata(session, "connecting", 0, 0, 0, None, None),
+    );
+    if session.role == super::PairingRole::Initiator {
+        let data_channel = peer
+            .create_data_channel(DIRECT_CHANNEL_LABEL, DataChannelInit::default())
+            .map_err(|error| format!("create native LAN DataChannel: {error}"))?;
+        session
+            .data_channel_tx
+            .send(data_channel)
+            .map_err(|_| "LAN DataChannel router is closed".to_string())?;
+        let offer = peer
+            .create_offer(OfferOptions::default())
+            .await
+            .map_err(|error| format!("create native LAN offer: {error}"))?;
+        peer.set_local_description(offer.clone())
+            .await
+            .map_err(|error| format!("set native LAN local offer: {error}"))?;
+        let sdp = signaling_sdp(&offer.to_string());
+        send_authenticated_control(session, NativeControlMessage::P2pOffer { sdp }).await?;
+    }
+    Ok(())
+}
+
+fn install_peer_callbacks(
+    app: AppHandle,
+    runtime: NativeLanRuntime,
+    session: Arc<NativeLanSession>,
+    peer: &PeerConnection,
+) {
+    let dc_tx = session.data_channel_tx.clone();
+    peer.on_data_channel(Some(Box::new(move |channel| {
+        let _ = dc_tx.send(channel);
+    })));
+
+    let candidate_session = session.clone();
+    let candidate_app = app.clone();
+    let candidate_runtime = runtime.clone();
+    peer.on_ice_candidate(Some(Box::new(move |candidate| {
+        let candidate_line = candidate.candidate();
+        if !is_local_host_candidate(&candidate_line) {
+            return;
+        }
+        let payload = IceCandidateInit {
+            candidate: candidate_line,
+            sdp_mid: Some(candidate.sdp_mid()),
+            sdp_mline_index: Some(candidate.sdp_mline_index()),
+            username_fragment: None,
+        };
+        let Ok(candidate_json) = serde_json::to_string(&payload) else {
+            let _ = candidate_session.cancel_tx.send(true);
+            return;
+        };
+        let session_for_send = candidate_session.clone();
+        let app_for_send = candidate_app.clone();
+        let runtime_for_send = candidate_runtime.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = send_authenticated_control(
+                &session_for_send,
+                NativeControlMessage::P2pIce {
+                    candidate: Some(candidate_json),
+                },
+            )
+            .await
+            {
+                eprintln!(
+                    "{}",
+                    super::safe_failure_log("local-candidate-queue", &error)
+                );
+                super::interrupt_session(
+                    &app_for_send,
+                    &runtime_for_send,
+                    &session_for_send,
+                    error,
+                    super::LanFailureKind::Error,
+                );
+            }
+        });
+    })));
+
+    let state_app = app.clone();
+    let state_runtime = runtime.clone();
+    let state_session = session.clone();
+    peer.on_ice_connection_state_change(Some(Box::new(move |state| {
+        if state_session
+            .completed
+            .load(std::sync::atomic::Ordering::Acquire)
+            || *state_session.cancel_tx.borrow()
+        {
+            return;
+        }
+        eprintln!("[fling] LAN ICE state: {state:?}");
+        let (error, kind) = match state {
+            IceConnectionState::Failed => (
+                "LAN host-candidate ICE failed",
+                super::LanFailureKind::Error,
+            ),
+            IceConnectionState::Disconnected | IceConnectionState::Closed => (
+                "LAN ICE connection interrupted",
+                super::LanFailureKind::Close,
+            ),
+            _ => return,
+        };
+        let app = state_app.clone();
+        let runtime = state_runtime.clone();
+        let session = state_session.clone();
+        tauri::async_runtime::spawn(async move {
+            super::interrupt_session(&app, &runtime, &session, error.to_string(), kind);
+        });
+    })));
+}
+
+pub(super) async fn handle_authenticated_control(
+    app: &AppHandle,
+    runtime: &NativeLanRuntime,
+    session: &Arc<NativeLanSession>,
+    message: NativeControlMessage,
+) -> Result<(), String> {
+    match message {
+        NativeControlMessage::P2pOffer { sdp } => handle_offer(session, sdp).await,
+        NativeControlMessage::P2pAnswer { sdp } => handle_answer(session, sdp).await,
+        NativeControlMessage::P2pIce { candidate } => {
+            if let Some(candidate) = candidate {
+                receive_ice_candidate(runtime, session, candidate).await?;
+            }
+            Ok(())
+        }
+        NativeControlMessage::FileManifest { manifest } => {
+            receive_manifest(app, runtime, session, manifest)
+        }
+        NativeControlMessage::FileManifestAck {
+            id,
+            chunk_ack,
+            binary_chunks,
+            direct_frame_payload_bytes,
+        } => {
+            if session.role != super::PairingRole::Initiator
+                || id != outgoing_transfer_id(session)?
+                || chunk_ack != Some(true)
+                || binary_chunks != Some(true)
+                || direct_frame_payload_bytes.unwrap_or_default() < NATIVE_CHUNK_SIZE as u32
+            {
+                return Err("recipient did not accept the native FLNG frame contract".to_string());
+            }
+            start_sender(app.clone(), runtime.clone(), session.clone()).await
+        }
+        NativeControlMessage::FileChunkAck {
+            id,
+            next_seq,
+            received_bytes,
+            saved_bytes,
+            complete,
+            failed,
+        } => {
+            handle_chunk_ack(
+                app,
+                runtime,
+                session,
+                id,
+                next_seq,
+                received_bytes,
+                saved_bytes,
+                complete,
+                failed,
+            )
+            .await
+        }
+        NativeControlMessage::TaskAck { task_id } => {
+            if session.role != super::PairingRole::Responder || task_id != session.task_id {
+                return Err("invalid final task acknowledgement".to_string());
+            }
+            session
+                .completed
+                .store(true, std::sync::atomic::Ordering::Release);
+            schedule_session_cleanup(runtime.clone(), session.clone());
+            Ok(())
+        }
+        NativeControlMessage::TaskCancel { task_id } => {
+            if task_id != session.task_id {
+                return Err("task cancellation binding mismatch".to_string());
+            }
+            Err("peer cancelled the transfer".to_string())
+        }
+        NativeControlMessage::TaskProgress { .. } => Ok(()),
+        NativeControlMessage::PairConfirm { .. } | NativeControlMessage::PairReject { .. } => {
+            Err("pairing control message received after authentication".to_string())
+        }
+    }
+}
+
+async fn handle_offer(session: &NativeLanSession, sdp: String) -> Result<(), String> {
+    if session.role != super::PairingRole::Responder {
+        return Err("unexpected native LAN offer role".to_string());
+    }
+    ensure_signaling_sdp_is_candidate_free(&sdp)?;
+    let peer = current_peer(session)?;
+    let offer = SessionDescription::parse(&sdp, SdpType::Offer)
+        .map_err(|error| format!("parse native LAN offer: {error}"))?;
+    peer.set_remote_description(offer)
+        .await
+        .map_err(|error| format!("set native LAN remote offer: {error}"))?;
+    mark_remote_description_set(session).await?;
+    let answer = peer
+        .create_answer(AnswerOptions::default())
+        .await
+        .map_err(|error| format!("create native LAN answer: {error}"))?;
+    peer.set_local_description(answer.clone())
+        .await
+        .map_err(|error| format!("set native LAN local answer: {error}"))?;
+    send_authenticated_control(
+        session,
+        NativeControlMessage::P2pAnswer {
+            sdp: signaling_sdp(&answer.to_string()),
+        },
+    )
+    .await
+}
+
+async fn handle_answer(session: &NativeLanSession, sdp: String) -> Result<(), String> {
+    if session.role != super::PairingRole::Initiator {
+        return Err("unexpected native LAN answer role".to_string());
+    }
+    ensure_signaling_sdp_is_candidate_free(&sdp)?;
+    let peer = current_peer(session)?;
+    let answer = SessionDescription::parse(&sdp, SdpType::Answer)
+        .map_err(|error| format!("parse native LAN answer: {error}"))?;
+    peer.set_remote_description(answer)
+        .await
+        .map_err(|error| format!("set native LAN remote answer: {error}"))?;
+    mark_remote_description_set(session).await
+}
+
+fn current_peer(session: &NativeLanSession) -> Result<PeerConnection, String> {
+    session
+        .transfer
+        .lock()
+        .map_err(|error| format!("LAN transfer state lock: {error}"))?
+        .pc
+        .clone()
+        .ok_or_else(|| "native LAN PeerConnection is not ready".to_string())
+}
+
+async fn mark_remote_description_set(session: &NativeLanSession) -> Result<(), String> {
+    let candidates = {
+        let mut transfer = session
+            .transfer
+            .lock()
+            .map_err(|error| format!("LAN transfer state lock: {error}"))?;
+        transfer.remote_description_set = true;
+        std::mem::take(&mut transfer.pending_remote_ice)
+    };
+    for candidate in candidates {
+        add_remote_ice(session, &candidate).await?;
+    }
+    Ok(())
+}
+
+async fn receive_ice_candidate(
+    runtime: &NativeLanRuntime,
+    session: &NativeLanSession,
+    candidate_json: String,
+) -> Result<(), String> {
+    if candidate_json.len() > 4096 {
+        return Err("ICE candidate exceeds the LAN control bound".to_string());
+    }
+    let init: IceCandidateInit = serde_json::from_str(&candidate_json)
+        .map_err(|_| "invalid ICE candidate payload".to_string())?;
+    validate_peer_candidate(runtime, session, &init.candidate)?;
+    let ready = {
+        let mut transfer = session
+            .transfer
+            .lock()
+            .map_err(|error| format!("LAN transfer state lock: {error}"))?;
+        if !transfer.remote_description_set || transfer.pc.is_none() {
+            if transfer.pending_remote_ice.len() >= MAX_PENDING_ICE {
+                return Err("too many pending LAN ICE candidates".to_string());
+            }
+            transfer.pending_remote_ice.push(candidate_json.clone());
+            false
+        } else {
+            true
+        }
+    };
+    if ready {
+        add_remote_ice(session, &candidate_json).await?;
+    }
+    Ok(())
+}
+
+async fn add_remote_ice(session: &NativeLanSession, candidate_json: &str) -> Result<(), String> {
+    let init: IceCandidateInit = serde_json::from_str(candidate_json)
+        .map_err(|_| "invalid ICE candidate payload".to_string())?;
+    let mid = init
+        .sdp_mid
+        .as_deref()
+        .ok_or_else(|| "ICE candidate missing sdpMid".to_string())?;
+    let mline = init
+        .sdp_mline_index
+        .ok_or_else(|| "ICE candidate missing sdpMLineIndex".to_string())?;
+    let candidate = IceCandidate::parse(mid, mline, &init.candidate)
+        .map_err(|error| format!("parse LAN ICE candidate: {error}"))?;
+    current_peer(session)?
+        .add_ice_candidate(candidate)
+        .await
+        .map_err(|error| format!("add LAN ICE candidate: {error}"))
+}
+
+fn validate_peer_candidate(
+    runtime: &NativeLanRuntime,
+    session: &NativeLanSession,
+    candidate: &str,
+) -> Result<(), String> {
+    let ip = candidate_host_ip(candidate)
+        .ok_or_else(|| "LAN ICE candidate is not a numeric host candidate".to_string())?;
+    if !is_local_network_address(ip, runtime.ipv6_listener_ready()) && !is_loopback_for_tests(ip) {
+        return Err("non-local ICE candidate rejected in LAN-only mode".to_string());
+    }
+    if !runtime.peer_matches_endpoint(&session.peer_device_id, ip) && !is_loopback_for_tests(ip) {
+        return Err("ICE candidate does not match the discovered peer endpoint".to_string());
+    }
+    Ok(())
+}
+
+fn candidate_host_ip(candidate: &str) -> Option<IpAddr> {
+    let fields = candidate.split_whitespace().collect::<Vec<_>>();
+    if fields.len() < 8
+        || !fields[0].starts_with("candidate:")
+        || fields[6] != "typ"
+        || fields[7] != "host"
+    {
+        return None;
+    }
+    fields[4].parse().ok()
+}
+
+fn is_local_host_candidate(candidate: &str) -> bool {
+    let Some(ip) = candidate_host_ip(candidate) else {
+        return false;
+    };
+    is_local_network_address(ip, true) || is_loopback_for_tests(ip)
+}
+
+#[cfg(test)]
+fn is_loopback_for_tests(ip: IpAddr) -> bool {
+    ip.is_loopback()
+}
+
+#[cfg(not(test))]
+fn is_loopback_for_tests(_ip: IpAddr) -> bool {
+    false
+}
+
+fn signaling_sdp(sdp: &str) -> String {
+    sdp.lines()
+        .filter(|line| !line.starts_with("a=candidate:") && *line != "a=end-of-candidates")
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        + "\r\n"
+}
+
+fn ensure_signaling_sdp_is_candidate_free(sdp: &str) -> Result<(), String> {
+    if sdp.len() > 128 * 1024 || sdp.lines().any(|line| line.starts_with("a=candidate:")) {
+        return Err(
+            "LAN SDP must be bounded and use the authenticated ICE control lane".to_string(),
+        );
+    }
+    if !sdp.lines().any(|line| line.starts_with("m=application ")) {
+        return Err("LAN SDP does not contain the expected DataChannel m-line".to_string());
+    }
+    Ok(())
+}
+
+fn receive_manifest(
+    app: &AppHandle,
+    runtime: &NativeLanRuntime,
+    session: &NativeLanSession,
+    manifest: NativeFileManifest,
+) -> Result<(), String> {
+    if session.role != super::PairingRole::Responder {
+        return Err("unexpected file manifest role".to_string());
+    }
+    validate_manifest(session, &manifest)?;
+    let event = IncomingManifestEvent {
+        session_id: session.session_id.clone(),
+        task_id: session.task_id.clone(),
+        peer_device_label: session.peer_device_label.clone(),
+        name: manifest.name.clone(),
+        size_bytes: manifest.size,
+    };
+    {
+        let mut transfer = session
+            .transfer
+            .lock()
+            .map_err(|error| format!("LAN transfer state lock: {error}"))?;
+        if transfer.pending_manifest.is_some() || transfer.incoming.is_some() {
+            return Err("duplicate file manifest".to_string());
+        }
+        claim_transfer_nonce(&mut transfer.seen_transfer_nonces, &manifest.transfer_nonce)?;
+        transfer.pending_manifest = Some(manifest);
+    }
+    emit_lan_event(app, runtime, "fling://lan/manifest", event);
+    Ok(())
+}
+
+fn validate_manifest(
+    session: &NativeLanSession,
+    manifest: &NativeFileManifest,
+) -> Result<(), String> {
+    validate_manifest_for_session(&session.session_id, &session.task_id, manifest)
+}
+
+fn validate_manifest_for_session(
+    session_id: &str,
+    task_id: &str,
+    manifest: &NativeFileManifest,
+) -> Result<(), String> {
+    if manifest.transfer_nonce.len() != 32
+        || !manifest
+            .transfer_nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || manifest.id
+            != super::transfer_id_for_session(session_id, task_id, &manifest.transfer_nonce)
+        || manifest.id.len() != 24
+        || !manifest.id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("file manifest transfer id mismatch".to_string());
+    }
+    if manifest.name.is_empty()
+        || manifest.name.len() > 255
+        || manifest.name == "."
+        || manifest.name == ".."
+        || manifest
+            .name
+            .chars()
+            .any(|character| character.is_control())
+        || manifest.name.contains('/')
+        || manifest.name.contains('\\')
+    {
+        return Err("invalid LAN file name".to_string());
+    }
+    if manifest.kind != "file"
+        || manifest.chunk_size != NATIVE_CHUNK_SIZE as u32
+        || manifest.sha256.len() != 64
+        || !manifest.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("unsupported LAN manifest parameters".to_string());
+    }
+    let expected_chunks = if manifest.size == 0 {
+        0
+    } else {
+        manifest
+            .size
+            .checked_add(NATIVE_CHUNK_SIZE - 1)
+            .ok_or_else(|| "file size overflow".to_string())?
+            / NATIVE_CHUNK_SIZE
+    };
+    if expected_chunks > u32::MAX as u64 || manifest.total_chunks as u64 != expected_chunks {
+        return Err("LAN manifest chunk count mismatch".to_string());
+    }
+    Ok(())
+}
+
+pub(super) async fn decide_manifest(
+    app: &AppHandle,
+    runtime: &NativeLanRuntime,
+    session: &Arc<NativeLanSession>,
+    accepted: bool,
+) -> Result<(), String> {
+    let manifest = {
+        let mut transfer = session
+            .transfer
+            .lock()
+            .map_err(|error| format!("LAN transfer state lock: {error}"))?;
+        transfer
+            .pending_manifest
+            .take()
+            .ok_or_else(|| "incoming file consent is no longer available".to_string())?
+    };
+    if !accepted {
+        send_authenticated_control(
+            session,
+            NativeControlMessage::TaskCancel {
+                task_id: session.task_id.clone(),
+            },
+        )
+        .await?;
+        runtime.remove_session(&session.session_id);
+        emit_lan_event(
+            app,
+            runtime,
+            "fling://lan/progress",
+            task_event_with_metadata(
+                session,
+                "cancelled",
+                0,
+                0,
+                manifest.size,
+                None,
+                Some(manifest.name),
+            ),
+        );
+        return Ok(());
+    }
+    let cfg = ensure_config(app)?.1;
+    let store = app.state::<ReceivedFileStore>().inner().clone();
+    let store_session_id = store.begin(
+        cfg.download_dir,
+        manifest.name.clone(),
+        None,
+        manifest.size,
+        manifest.sha256.clone(),
+    )?;
+    {
+        let mut transfer = session
+            .transfer
+            .lock()
+            .map_err(|error| format!("LAN transfer state lock: {error}"))?;
+        transfer.incoming = Some(IncomingTransfer {
+            manifest: manifest.clone(),
+            store: store.clone(),
+            store_session_id,
+            next_seq: 0,
+            received_bytes: 0,
+            last_ack_seq: 0,
+            last_progress_bytes: 0,
+            last_progress_at: Instant::now(),
+            complete: false,
+        });
+    }
+    send_authenticated_control(
+        session,
+        NativeControlMessage::FileManifestAck {
+            id: manifest.id.clone(),
+            chunk_ack: Some(true),
+            binary_chunks: Some(true),
+            direct_frame_payload_bytes: Some(NATIVE_CHUNK_SIZE as u32),
+        },
+    )
+    .await?;
+    emit_lan_event(
+        app,
+        runtime,
+        "fling://lan/progress",
+        task_event_with_metadata(
+            session,
+            "ready-to-transfer",
+            0,
+            0,
+            manifest.size,
+            None,
+            Some(manifest.name.clone()),
+        ),
+    );
+    if manifest.size == 0 {
+        finalize_zero_byte_receive(app, runtime, session).await?;
+    }
+    Ok(())
+}
+
+async fn finalize_zero_byte_receive(
+    app: &AppHandle,
+    runtime: &NativeLanRuntime,
+    session: &NativeLanSession,
+) -> Result<(), String> {
+    let (manifest, store, store_session_id) = {
+        let transfer = session
+            .transfer
+            .lock()
+            .map_err(|error| format!("LAN transfer state lock: {error}"))?;
+        let incoming = transfer
+            .incoming
+            .as_ref()
+            .ok_or_else(|| "zero-byte receive state missing".to_string())?;
+        let result = (
+            incoming.manifest.clone(),
+            incoming.store.clone(),
+            incoming.store_session_id.clone(),
+        );
+        result
+    };
+    store.finish(&store_session_id)?;
+    if let Ok(mut transfer) = session.transfer.lock() {
+        if let Some(incoming) = transfer.incoming.as_mut() {
+            incoming.complete = true;
+        }
+    }
+    send_file_chunk_ack(session, &manifest.id, 0, 0, Some(0), Some(true), None).await?;
+    session
+        .durable_complete
+        .store(true, std::sync::atomic::Ordering::Release);
+    if !session.claim_terminal() {
+        return Ok(());
+    }
+    emit_lan_event(
+        app,
+        runtime,
+        "fling://lan/progress",
+        task_event_with_metadata(session, "complete", 0, 0, 0, None, Some(manifest.name)),
+    );
+    Ok(())
+}
+
+async fn install_data_channel(
+    app: AppHandle,
+    runtime: NativeLanRuntime,
+    session: Arc<NativeLanSession>,
+    channel: DataChannel,
+) -> Result<(), String> {
+    let (frame_tx, frame_rx) = async_mpsc::channel(RECEIVE_QUEUE_FRAMES);
+    let message_tx = frame_tx.clone();
+    let overflow_channel = channel.clone();
+    let overflow_cancel = session.cancel_tx.clone();
+    channel.on_message(Some(Box::new(move |message| {
+        let frame = if message.binary && message.data.len() <= 128 * 1024 + 30 {
+            message.data.to_vec()
+        } else {
+            vec![0]
+        };
+        if message_tx.try_send(frame).is_err() {
+            let _ = overflow_cancel.send(true);
+            overflow_channel.close();
+        }
+    })));
+    let (state_tx, mut state_rx) = watch::channel(channel.state());
+    let worker_state_rx = state_rx.clone();
+    eprintln!("[fling] LAN DataChannel installed: {:?}", channel.state());
+    channel.on_state_change(Some(Box::new(move |state| {
+        eprintln!("[fling] LAN DataChannel state: {state:?}");
+        let _ = state_tx.send(state);
+    })));
+    {
+        let mut transfer = session
+            .transfer
+            .lock()
+            .map_err(|error| format!("LAN transfer state lock: {error}"))?;
+        transfer.data_channel = Some(channel.clone());
+    }
+    let worker_app = app.clone();
+    let worker_runtime = runtime.clone();
+    let worker_session = session.clone();
+    tauri::async_runtime::spawn(async move {
+        receive_worker(
+            worker_app,
+            worker_runtime,
+            worker_session,
+            frame_rx,
+            worker_state_rx,
+        )
+        .await;
+    });
+
+    let open_result = timeout(CHANNEL_OPEN_TIMEOUT, async {
+        loop {
+            match *state_rx.borrow() {
+                DataChannelState::Open => return Ok(()),
+                DataChannelState::Closing | DataChannelState::Closed => {
+                    return Err("LAN DataChannel closed before opening".to_string())
+                }
+                DataChannelState::Connecting => {}
+            }
+            state_rx
+                .changed()
+                .await
+                .map_err(|_| "LAN DataChannel state observer closed".to_string())?;
+        }
+    })
+    .await
+    .map_err(|_| "LAN DataChannel open timed out".to_string())?;
+    open_result?;
+    if *session.cancel_tx.borrow() {
+        return Err("LAN session cancelled".to_string());
+    }
+    emit_lan_event(
+        &app,
+        &runtime,
+        "fling://lan/progress",
+        task_event_with_metadata(&session, "channel-ready", 0, 0, 0, None, None),
+    );
+
+    if session.role == super::PairingRole::Initiator
+        && !session
+            .manifest_sent
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        let transfer_nonce = {
+            let mut transfer = session
+                .transfer
+                .lock()
+                .map_err(|_| "LAN transfer state lock".to_string())?;
+            fresh_transfer_nonce(&mut transfer.seen_transfer_nonces)?
+        };
+        let manifest = {
+            let source = session
+                .source
+                .lock()
+                .map_err(|error| format!("LAN source state lock: {error}"))?;
+            let source = source
+                .as_ref()
+                .ok_or_else(|| "native LAN source file is unavailable".to_string())?;
+            NativeFileManifest {
+                id: super::transfer_id_for_session(
+                    &session.session_id,
+                    &session.task_id,
+                    &transfer_nonce,
+                ),
+                transfer_nonce,
+                name: source.name.clone(),
+                size: source.size_bytes,
+                sha256: source.sha256.clone(),
+                chunk_size: NATIVE_CHUNK_SIZE as u32,
+                total_chunks: source.total_chunks,
+                kind: "file".to_string(),
+            }
+        };
+        {
+            let mut transfer = session
+                .transfer
+                .lock()
+                .map_err(|error| format!("LAN transfer state lock: {error}"))?;
+            transfer.outgoing_manifest = Some(manifest.clone());
+        }
+        send_authenticated_control(
+            &session,
+            NativeControlMessage::FileManifest {
+                manifest: manifest.clone(),
+            },
+        )
+        .await?;
+        emit_lan_event(
+            &app,
+            &runtime,
+            "fling://lan/progress",
+            task_event_with_metadata(
+                &session,
+                "waiting-recipient",
+                0,
+                0,
+                manifest.size,
+                None,
+                Some(manifest.name),
+            ),
+        );
+    }
+    Ok(())
+}
+
+async fn receive_worker(
+    app: AppHandle,
+    runtime: NativeLanRuntime,
+    session: Arc<NativeLanSession>,
+    mut receiver: async_mpsc::Receiver<Vec<u8>>,
+    mut state_rx: watch::Receiver<DataChannelState>,
+) {
+    loop {
+        if receiver.is_empty()
+            && matches!(
+                *state_rx.borrow(),
+                DataChannelState::Closing | DataChannelState::Closed
+            )
+        {
+            break;
+        }
+        let frame = tokio::select! {
+            biased;
+            frame = receiver.recv() => frame,
+            changed = state_rx.changed() => {
+                if changed.is_err()
+                    || matches!(*state_rx.borrow(), DataChannelState::Closing | DataChannelState::Closed)
+                {
+                    None
+                } else {
+                    continue;
+                }
+            }
+        };
+        let Some(frame) = frame else {
+            break;
+        };
+        if let Err(error) = receive_one_frame(&app, &runtime, &session, &frame).await {
+            fail_session(&app, &runtime, &session, error);
+            return;
+        }
+    }
+    if !session
+        .durable_complete
+        .load(std::sync::atomic::Ordering::Acquire)
+        && !*session.cancel_tx.borrow()
+    {
+        super::interrupt_session(
+            &app,
+            &runtime,
+            &session,
+            "LAN DataChannel closed before durable completion".to_string(),
+            super::LanFailureKind::Close,
+        );
+    }
+}
+
+async fn receive_one_frame(
+    app: &AppHandle,
+    runtime: &NativeLanRuntime,
+    session: &NativeLanSession,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let frame = native_lan::decode_direct_file_frame(bytes)?
+        .ok_or_else(|| "non-FLNG payload received on the file DataChannel".to_string())?;
+    let (ack, progress, complete, manifest_name, manifest_size) = {
+        let mut transfer = session
+            .transfer
+            .lock()
+            .map_err(|error| format!("LAN transfer state lock: {error}"))?;
+        let incoming = transfer
+            .incoming
+            .as_mut()
+            .ok_or_else(|| "file bytes arrived before recipient consent".to_string())?;
+        if frame.id != incoming.manifest.id {
+            return Err("FLNG frame transfer id mismatch".to_string());
+        }
+        if incoming.complete {
+            return Err("file frame received after durable completion".to_string());
+        }
+        if frame.seq < incoming.next_seq || frame.seq > incoming.next_seq {
+            let ack = cumulative_ack(incoming, false, None);
+            (
+                Some(ack),
+                None,
+                false,
+                incoming.manifest.name.clone(),
+                incoming.manifest.size,
+            )
+        } else {
+            let count = u32::from(frame.chunk_count);
+            let chunk_size = frame
+                .chunk_size
+                .map(u32::from)
+                .unwrap_or(incoming.manifest.chunk_size);
+            if chunk_size != incoming.manifest.chunk_size || count == 0 {
+                return Err("FLNG frame chunk geometry does not match manifest".to_string());
+            }
+            let mut offset = 0usize;
+            for index in 0..count {
+                if incoming.next_seq >= incoming.manifest.total_chunks {
+                    return Err("FLNG frame exceeds declared chunk count".to_string());
+                }
+                let remaining = incoming
+                    .manifest
+                    .size
+                    .checked_sub(incoming.received_bytes)
+                    .ok_or_else(|| "received byte counter overflow".to_string())?;
+                let expected = remaining.min(u64::from(chunk_size)) as usize;
+                if expected == 0
+                    || offset.checked_add(expected).unwrap_or(usize::MAX) > frame.payload.len()
+                {
+                    return Err("FLNG payload length does not match manifest".to_string());
+                }
+                incoming.store.append(
+                    &incoming.store_session_id,
+                    &frame.payload[offset..offset + expected],
+                )?;
+                offset += expected;
+                incoming.received_bytes += expected as u64;
+                incoming.next_seq += 1;
+                if index + 1 < count && incoming.received_bytes >= incoming.manifest.size {
+                    return Err("FLNG batch exceeds declared file size".to_string());
+                }
+            }
+            if offset != frame.payload.len() {
+                return Err("FLNG frame contains trailing payload bytes".to_string());
+            }
+            let is_complete = incoming.next_seq == incoming.manifest.total_chunks
+                && incoming.received_bytes == incoming.manifest.size;
+            if incoming.next_seq == incoming.manifest.total_chunks
+                && incoming.received_bytes != incoming.manifest.size
+            {
+                return Err("received chunk count does not match declared file size".to_string());
+            }
+            let should_ack = is_complete
+                || incoming.next_seq.saturating_sub(incoming.last_ack_seq) >= ACK_INTERVAL_CHUNKS;
+            let ack = if should_ack {
+                incoming.last_ack_seq = incoming.next_seq;
+                Some(cumulative_ack(incoming, false, None))
+            } else {
+                None
+            };
+            let progress_due = incoming
+                .received_bytes
+                .saturating_sub(incoming.last_progress_bytes)
+                >= PROGRESS_MIN_BYTES
+                || incoming.last_progress_at.elapsed() >= PROGRESS_MIN_INTERVAL
+                || is_complete;
+            let progress = if progress_due {
+                let elapsed_ms = incoming.last_progress_at.elapsed().as_millis().max(1) as u64;
+                let delta = incoming
+                    .received_bytes
+                    .saturating_sub(incoming.last_progress_bytes);
+                let speed_bps = delta.saturating_mul(1000) / elapsed_ms;
+                incoming.last_progress_bytes = incoming.received_bytes;
+                incoming.last_progress_at = Instant::now();
+                Some((
+                    incoming.received_bytes,
+                    incoming.manifest.name.clone(),
+                    incoming.manifest.size,
+                    speed_bps,
+                ))
+            } else {
+                None
+            };
+            (
+                ack,
+                progress,
+                is_complete,
+                incoming.manifest.name.clone(),
+                incoming.manifest.size,
+            )
+        }
+    };
+    if let Some(ack) = ack {
+        send_file_chunk_ack(
+            session,
+            &ack.id,
+            ack.next_seq,
+            ack.received_bytes,
+            ack.saved_bytes,
+            ack.complete,
+            ack.failed,
+        )
+        .await?;
+    }
+    if let Some((received, name, total, speed_bps)) = progress {
+        emit_lan_event(
+            app,
+            runtime,
+            "fling://lan/progress",
+            progress_event(
+                session,
+                if complete { "finalizing" } else { "receiving" },
+                received,
+                received,
+                total,
+                speed_bps,
+                Some(name),
+            ),
+        );
+    }
+    if complete {
+        finalize_received_file(app, runtime, session, &manifest_name, manifest_size).await?;
+    }
+    Ok(())
+}
+
+struct AckFields {
+    id: String,
+    next_seq: u32,
+    received_bytes: u64,
+    saved_bytes: Option<u64>,
+    complete: Option<bool>,
+    failed: Option<bool>,
+}
+
+fn cumulative_ack(incoming: &IncomingTransfer, complete: bool, failed: Option<bool>) -> AckFields {
+    AckFields {
+        id: incoming.manifest.id.clone(),
+        next_seq: incoming.next_seq,
+        received_bytes: incoming.received_bytes,
+        saved_bytes: Some(incoming.received_bytes),
+        complete: Some(complete),
+        failed,
+    }
+}
+
+async fn finalize_received_file(
+    app: &AppHandle,
+    runtime: &NativeLanRuntime,
+    session: &NativeLanSession,
+    _name: &str,
+    _size: u64,
+) -> Result<(), String> {
+    let (manifest, store, store_session_id) = {
+        let transfer = session
+            .transfer
+            .lock()
+            .map_err(|error| format!("LAN transfer state lock: {error}"))?;
+        let incoming = transfer
+            .incoming
+            .as_ref()
+            .ok_or_else(|| "receive finalization state missing".to_string())?;
+        if incoming.complete {
+            return Ok(());
+        }
+        let manifest = incoming.manifest.clone();
+        let store = incoming.store.clone();
+        let store_session_id = incoming.store_session_id.clone();
+        (manifest, store, store_session_id)
+    };
+    // finish() verifies SHA-256, syncs the temporary file and atomically commits
+    // without overwriting an existing destination. Only after it succeeds is the
+    // durable-completion ACK sent.
+    store.finish(&store_session_id)?;
+    if let Ok(mut transfer) = session.transfer.lock() {
+        if let Some(incoming) = transfer.incoming.as_mut() {
+            incoming.complete = true;
+        }
+    }
+    send_file_chunk_ack(
+        session,
+        &manifest.id,
+        manifest.total_chunks,
+        manifest.size,
+        Some(manifest.size),
+        Some(true),
+        None,
+    )
+    .await?;
+    session
+        .durable_complete
+        .store(true, std::sync::atomic::Ordering::Release);
+    if !session.claim_terminal() {
+        return Ok(());
+    }
+    emit_lan_event(
+        app,
+        runtime,
+        "fling://lan/progress",
+        task_event_with_metadata(
+            session,
+            "complete",
+            manifest.size,
+            manifest.size,
+            manifest.size,
+            None,
+            Some(manifest.name),
+        ),
+    );
+    Ok(())
+}
+
+async fn start_sender(
+    app: AppHandle,
+    runtime: NativeLanRuntime,
+    session: Arc<NativeLanSession>,
+) -> Result<(), String> {
+    let channel = {
+        let transfer = session
+            .transfer
+            .lock()
+            .map_err(|error| format!("LAN transfer state lock: {error}"))?;
+        transfer
+            .data_channel
+            .clone()
+            .ok_or_else(|| "accepted manifest has no open DataChannel".to_string())?
+    };
+    let source = session
+        .source
+        .lock()
+        .map_err(|error| format!("LAN source state lock: {error}"))?
+        .take()
+        .ok_or_else(|| "native source file was already consumed".to_string())?;
+    if channel.state() != DataChannelState::Open {
+        return Err("LAN DataChannel closed before manifest acceptance completed".to_string());
+    }
+    emit_lan_event(
+        &app,
+        &runtime,
+        "fling://lan/progress",
+        task_event_with_metadata(
+            &session,
+            "ready-to-transfer",
+            0,
+            0,
+            source.size_bytes,
+            None,
+            Some(source.name.clone()),
+        ),
+    );
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = run_sender(
+            app.clone(),
+            runtime.clone(),
+            session.clone(),
+            channel,
+            source,
+        )
+        .await
+        {
+            fail_session(&app, &runtime, &session, error);
+        }
+    });
+    Ok(())
+}
+
+async fn run_sender(
+    app: AppHandle,
+    runtime: NativeLanRuntime,
+    session: Arc<NativeLanSession>,
+    channel: DataChannel,
+    mut source: NativeSource,
+) -> Result<(), String> {
+    if channel.state() != DataChannelState::Open {
+        return Err("LAN DataChannel is not open after manifest acceptance".to_string());
+    }
+    let transfer_id = outgoing_transfer_id(&session)?;
+    emit_lan_event(
+        &app,
+        &runtime,
+        "fling://lan/progress",
+        task_event_with_metadata(
+            &session,
+            "sending",
+            0,
+            0,
+            source.size_bytes,
+            None,
+            Some(source.name.clone()),
+        ),
+    );
+    let mut sent_hasher = Sha256::new();
+    let mut seq = 0u32;
+    let mut hashed_seq = 0u32;
+    let mut sent_bytes = 0u64;
+    let mut recovery_retries = 0u8;
+    let mut last_progress_bytes = 0u64;
+    let mut last_progress_at = Instant::now();
+    while seq < source.total_chunks {
+        let acked = session
+            .ack_next_seq
+            .load(std::sync::atomic::Ordering::Acquire);
+        if seq < acked {
+            seq = acked;
+            let offset = u64::from(seq)
+                .checked_mul(NATIVE_CHUNK_SIZE)
+                .ok_or_else(|| "resume offset overflow".to_string())?;
+            source
+                .file
+                .seek(SeekFrom::Start(offset))
+                .map_err(|error| format!("seek native source: {error}"))?;
+            sent_bytes = sent_bytes.max(offset.min(source.size_bytes));
+        }
+        if seq.saturating_sub(acked) >= SENDER_WINDOW_CHUNKS {
+            let target = acked.saturating_add(ACK_INTERVAL_CHUNKS);
+            if !wait_for_ack(&session, target, false).await? {
+                let latest_acked = session
+                    .ack_next_seq
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if latest_acked > acked {
+                    recovery_retries = 0;
+                } else {
+                    if recovery_retries >= MAX_ACK_RECOVERY_RETRIES {
+                        return Err(
+                            "cumulative file ACK timed out after 3 recovery retries".to_string()
+                        );
+                    }
+                    recovery_retries += 1;
+                    seq = latest_acked;
+                    let offset = u64::from(seq)
+                        .checked_mul(NATIVE_CHUNK_SIZE)
+                        .ok_or_else(|| "recovery offset overflow".to_string())?;
+                    source
+                        .file
+                        .seek(SeekFrom::Start(offset))
+                        .map_err(|error| format!("seek native source for recovery: {error}"))?;
+                }
+            } else {
+                recovery_retries = 0;
+            }
+            continue;
+        }
+        let mut payload = vec![0u8; NATIVE_CHUNK_SIZE as usize];
+        let chunk_offset = u64::from(seq)
+            .checked_mul(NATIVE_CHUNK_SIZE)
+            .ok_or_else(|| "source offset overflow".to_string())?;
+        let remaining = source.size_bytes.saturating_sub(chunk_offset);
+        let expected = remaining.min(NATIVE_CHUNK_SIZE) as usize;
+        if expected == 0 {
+            return Err("native source ended before declared chunk count".to_string());
+        }
+        source
+            .file
+            .read_exact(&mut payload[..expected])
+            .map_err(|error| format!("read native source: {error}"))?;
+        payload.truncate(expected);
+        if seq == hashed_seq {
+            sent_hasher.update(&payload);
+            hashed_seq += 1;
+        } else if seq > hashed_seq {
+            return Err("sender recovery skipped an unhashed source chunk".to_string());
+        }
+        let frame = native_lan::encode_direct_file_frame(
+            &transfer_id,
+            seq,
+            &payload,
+            NATIVE_CHUNK_SIZE as u16,
+            1,
+        )?;
+        let drain_started = Instant::now();
+        while channel.buffered_amount() > MAX_BUFFERED_BYTES {
+            if channel.state() != DataChannelState::Open {
+                return Err("LAN DataChannel closed while applying backpressure".to_string());
+            }
+            if drain_started.elapsed() > Duration::from_secs(15) {
+                return Err("LAN DataChannel send buffer did not drain".to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        channel
+            .send(&frame, true)
+            .map_err(|error| format!("send FLNG frame: {error}"))?;
+        sent_bytes = sent_bytes.max(chunk_offset.saturating_add(expected as u64));
+        seq += 1;
+        if sent_bytes.saturating_sub(last_progress_bytes) >= PROGRESS_MIN_BYTES
+            || last_progress_at.elapsed() >= PROGRESS_MIN_INTERVAL
+        {
+            let elapsed_ms = last_progress_at.elapsed().as_millis().max(1) as u64;
+            let delta = sent_bytes.saturating_sub(last_progress_bytes);
+            let speed_bps = delta.saturating_mul(1000) / elapsed_ms;
+            let saved_bytes = u64::from(
+                session
+                    .ack_next_seq
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+            .saturating_mul(NATIVE_CHUNK_SIZE)
+            .min(source.size_bytes);
+            last_progress_bytes = sent_bytes;
+            last_progress_at = Instant::now();
+            emit_lan_event(
+                &app,
+                &runtime,
+                "fling://lan/progress",
+                progress_event(
+                    &session,
+                    "sending",
+                    sent_bytes,
+                    saved_bytes,
+                    source.size_bytes,
+                    speed_bps,
+                    Some(source.name.clone()),
+                ),
+            );
+        }
+        if seq.saturating_sub(acked) >= SENDER_WINDOW_CHUNKS {
+            let target = seq.saturating_sub(ACK_INTERVAL_CHUNKS);
+            if !wait_for_ack(&session, target, false).await? {
+                let latest_acked = session
+                    .ack_next_seq
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if latest_acked > acked {
+                    recovery_retries = 0;
+                } else {
+                    if recovery_retries >= MAX_ACK_RECOVERY_RETRIES {
+                        return Err(
+                            "cumulative file ACK timed out after 3 recovery retries".to_string()
+                        );
+                    }
+                    recovery_retries += 1;
+                    seq = latest_acked;
+                    let offset = u64::from(seq)
+                        .checked_mul(NATIVE_CHUNK_SIZE)
+                        .ok_or_else(|| "recovery offset overflow".to_string())?;
+                    source
+                        .file
+                        .seek(SeekFrom::Start(offset))
+                        .map_err(|error| format!("seek native source for recovery: {error}"))?;
+                }
+            } else {
+                recovery_retries = 0;
+            }
+        }
+    }
+    let digest = format!("{:x}", sent_hasher.finalize());
+    if !digest.eq_ignore_ascii_case(&source.sha256) {
+        return Err("source changed during transfer; SHA-256 mismatch".to_string());
+    }
+    if !wait_for_ack(&session, source.total_chunks, true).await? {
+        return Err("durable completion ACK timed out".to_string());
+    }
+    send_authenticated_control(
+        &session,
+        NativeControlMessage::TaskAck {
+            task_id: session.task_id.clone(),
+        },
+    )
+    .await?;
+    session
+        .completed
+        .store(true, std::sync::atomic::Ordering::Release);
+    emit_lan_event(
+        &app,
+        &runtime,
+        "fling://lan/progress",
+        task_event_with_metadata(
+            &session,
+            "complete",
+            source.size_bytes,
+            source.size_bytes,
+            source.size_bytes,
+            None,
+            Some(source.name),
+        ),
+    );
+    schedule_session_cleanup(runtime, session);
+    Ok(())
+}
+
+async fn wait_for_ack(
+    session: &NativeLanSession,
+    target_seq: u32,
+    require_durable: bool,
+) -> Result<bool, String> {
+    loop {
+        let notified = session.ack_notify.notified();
+        let acked = session
+            .ack_next_seq
+            .load(std::sync::atomic::Ordering::Acquire);
+        let durable = session
+            .durable_complete
+            .load(std::sync::atomic::Ordering::Acquire);
+        if acked >= target_seq && (!require_durable || durable) {
+            return Ok(true);
+        }
+        if timeout(ACK_TIMEOUT, notified).await.is_err() {
+            return Ok(false);
+        }
+    }
+}
+
+async fn handle_chunk_ack(
+    app: &AppHandle,
+    runtime: &NativeLanRuntime,
+    session: &NativeLanSession,
+    id: String,
+    next_seq: u32,
+    received_bytes: u64,
+    saved_bytes: Option<u64>,
+    complete: Option<bool>,
+    failed: Option<bool>,
+) -> Result<(), String> {
+    if session.role != super::PairingRole::Initiator || id != outgoing_transfer_id(session)? {
+        return Err("file ACK transfer binding mismatch".to_string());
+    }
+    if session
+        .source
+        .lock()
+        .map_err(|_| "LAN source state lock".to_string())?
+        .is_some()
+    {
+        return Err("file ACK received before manifest acceptance".to_string());
+    }
+    let (expected_bytes, total_bytes, total_chunks, name) = {
+        let source = session
+            .source
+            .lock()
+            .map_err(|error| format!("LAN source state lock: {error}"))?;
+        let (size, chunks, name) = if let Some(source) = source.as_ref() {
+            (source.size_bytes, source.total_chunks, source.name.clone())
+        } else {
+            // Sender worker owns the source after manifest acceptance; manifest
+            // metadata is retained by this per-session transfer descriptor below.
+            let transfer = session
+                .transfer
+                .lock()
+                .map_err(|error| format!("LAN transfer state lock: {error}"))?;
+            let manifest = transfer
+                .outgoing_manifest
+                .as_ref()
+                .ok_or_else(|| "sender manifest state missing".to_string())?;
+            (manifest.size, manifest.total_chunks, manifest.name.clone())
+        };
+        if next_seq > chunks {
+            return Err("cumulative ACK exceeds declared chunks".to_string());
+        }
+        let offset = u64::from(next_seq)
+            .checked_mul(NATIVE_CHUNK_SIZE)
+            .ok_or_else(|| "ACK byte offset overflow".to_string())?;
+        (offset.min(size), size, chunks, name)
+    };
+    if received_bytes != expected_bytes || saved_bytes.is_some_and(|saved| saved > received_bytes) {
+        return Err("cumulative ACK byte count mismatch".to_string());
+    }
+    if failed == Some(true) {
+        return Err("recipient failed while saving the file".to_string());
+    }
+    session
+        .ack_next_seq
+        .fetch_max(next_seq, std::sync::atomic::Ordering::AcqRel);
+    if complete == Some(true) {
+        if received_bytes != expected_bytes || next_seq != total_chunks {
+            return Err("durable ACK does not cover the complete source".to_string());
+        }
+        session
+            .durable_complete
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    session.ack_notify.notify_waiters();
+    let progress = {
+        let mut transfer = session
+            .transfer
+            .lock()
+            .map_err(|error| format!("LAN transfer state lock: {error}"))?;
+        let elapsed = transfer.last_sender_progress_at.elapsed();
+        let delta = received_bytes.saturating_sub(transfer.last_sender_progress_bytes);
+        if delta >= PROGRESS_MIN_BYTES || elapsed >= PROGRESS_MIN_INTERVAL || complete == Some(true)
+        {
+            let speed_bps = delta.saturating_mul(1000) / elapsed.as_millis().max(1) as u64;
+            transfer.last_sender_progress_bytes = received_bytes;
+            transfer.last_sender_progress_at = Instant::now();
+            Some(speed_bps)
+        } else {
+            None
+        }
+    };
+    if let Some(speed_bps) = progress {
+        emit_lan_event(
+            app,
+            runtime,
+            "fling://lan/progress",
+            progress_event(
+                session,
+                "sending",
+                received_bytes,
+                saved_bytes.unwrap_or_default(),
+                total_bytes,
+                speed_bps,
+                Some(name),
+            ),
+        );
+    }
+    Ok(())
+}
+
+async fn send_file_chunk_ack(
+    session: &NativeLanSession,
+    id: &str,
+    next_seq: u32,
+    received_bytes: u64,
+    saved_bytes: Option<u64>,
+    complete: Option<bool>,
+    failed: Option<bool>,
+) -> Result<(), String> {
+    send_authenticated_control(
+        session,
+        NativeControlMessage::FileChunkAck {
+            id: id.to_string(),
+            next_seq,
+            received_bytes,
+            saved_bytes,
+            complete,
+            failed,
+        },
+    )
+    .await
+}
+
+fn send_file_chunk_ack_nowait(
+    session: &NativeLanSession,
+    id: &str,
+    next_seq: u32,
+    received_bytes: u64,
+    saved_bytes: Option<u64>,
+    complete: Option<bool>,
+    failed: Option<bool>,
+) -> Result<(), String> {
+    send_authenticated_control_nowait(
+        session,
+        NativeControlMessage::FileChunkAck {
+            id: id.to_string(),
+            next_seq,
+            received_bytes,
+            saved_bytes,
+            complete,
+            failed,
+        },
+    )
+}
+
+async fn send_authenticated_control(
+    session: &NativeLanSession,
+    message: NativeControlMessage,
+) -> Result<(), String> {
+    enqueue_ordered_control(&session.control_tx, &session.control_send_lock, || {
+        let frame = encrypt_authenticated_control(session, &message)?;
+        Ok((frame, ()))
+    })
+    .await
+}
+fn send_authenticated_control_nowait(
+    session: &NativeLanSession,
+    message: NativeControlMessage,
+) -> Result<(), String> {
+    try_enqueue_ordered_control(&session.control_tx, &session.control_send_lock, || {
+        let frame = encrypt_authenticated_control(session, &message)?;
+        Ok((frame, ()))
+    })
+}
+
+fn encrypt_authenticated_control(
+    session: &NativeLanSession,
+    message: &NativeControlMessage,
+) -> Result<crate::native_lan::EncryptedControlFrame, String> {
+    let mut auth = session
+        .auth
+        .lock()
+        .map_err(|error| format!("LAN auth state lock: {error}"))?;
+    match &mut *auth {
+        super::LocalAuthState::Authenticated(authenticated) => {
+            authenticated.encrypt_control(message)
+        }
+        _ => Err("LAN control message requires an authenticated session".to_string()),
+    }
+}
+
+fn fail_session(
+    app: &AppHandle,
+    runtime: &NativeLanRuntime,
+    session: &NativeLanSession,
+    reason: String,
+) {
+    if session.completed.load(std::sync::atomic::Ordering::Acquire) || *session.cancel_tx.borrow() {
+        return;
+    }
+    if reason.contains("DataChannel") && (reason.contains("closed") || reason.contains("not open"))
+    {
+        let kind = if reason.contains("closed") {
+            super::LanFailureKind::Close
+        } else {
+            super::LanFailureKind::Error
+        };
+        super::interrupt_session(app, runtime, session, reason, kind);
+        return;
+    }
+    if !session.claim_terminal() {
+        runtime.remove_session(&session.session_id);
+        return;
+    }
+    eprintln!("{}", super::safe_failure_log("transfer-failed", &reason));
+    let failed_ack = session.transfer.lock().ok().and_then(|mut transfer| {
+        transfer.incoming.take().map(|incoming| {
+            let ack = cumulative_ack(&incoming, false, Some(true));
+            if !incoming.complete {
+                let _ = incoming.store.abort(&incoming.store_session_id);
+            }
+            ack
+        })
+    });
+    if session.role == super::PairingRole::Responder {
+        if let Some(ack) = failed_ack {
+            let _ = send_file_chunk_ack_nowait(
+                session,
+                &ack.id,
+                ack.next_seq,
+                ack.received_bytes,
+                ack.saved_bytes,
+                ack.complete,
+                ack.failed,
+            );
+        } else {
+            let _ = send_authenticated_control_nowait(
+                session,
+                NativeControlMessage::TaskCancel {
+                    task_id: session.task_id.clone(),
+                },
+            );
+        }
+    } else {
+        let _ = send_authenticated_control_nowait(
+            session,
+            NativeControlMessage::TaskCancel {
+                task_id: session.task_id.clone(),
+            },
+        );
+    }
+    emit_lan_event(
+        app,
+        runtime,
+        "fling://lan/progress",
+        task_event_with_metadata(session, "failed", 0, 0, 0, Some(reason), None),
+    );
+    runtime.remove_session(&session.session_id);
+}
+
+fn schedule_session_cleanup(runtime: NativeLanRuntime, session: Arc<NativeLanSession>) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        runtime.remove_session(&session.session_id);
+    });
+}
+
+pub(super) fn close(session: &NativeLanSession) {
+    if let Ok(mut transfer) = session.transfer.lock() {
+        if let Some(channel) = transfer.data_channel.take() {
+            channel.close();
+        }
+        if let Some(peer) = transfer.pc.take() {
+            peer.close();
+        }
+        if let Some(incoming) = transfer.incoming.take() {
+            if !incoming.complete {
+                let _ = incoming.store.abort(&incoming.store_session_id);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_nonce_allocations_are_unique_and_ids_are_not_reused() {
+        let used = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let allocations = (0..8)
+            .map(|_| {
+                let used = Arc::clone(&used);
+                std::thread::spawn(move || {
+                    (0..12)
+                        .map(|_| {
+                            let mut used = used.lock().unwrap();
+                            fresh_transfer_nonce(&mut used).unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let nonces = allocations
+            .into_iter()
+            .flat_map(|thread| thread.join().unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(nonces.len(), 96);
+        let ids = nonces
+            .iter()
+            .map(|nonce| super::super::transfer_id_for_session("session", "task", nonce))
+            .collect::<HashSet<_>>();
+        assert_eq!(ids.len(), 96);
+    }
+
+    fn manifest(session_id: &str, task_id: &str, nonce: &str) -> NativeFileManifest {
+        NativeFileManifest {
+            id: super::super::transfer_id_for_session(session_id, task_id, nonce),
+            transfer_nonce: nonce.to_string(),
+            name: "contract-test.bin".to_string(),
+            size: 1,
+            sha256: "a".repeat(64),
+            chunk_size: NATIVE_CHUNK_SIZE as u32,
+            total_chunks: 1,
+            kind: "file".to_string(),
+        }
+    }
+
+    #[test]
+    fn matching_manifest_binding_is_accepted_and_wrong_bindings_are_rejected() {
+        let session = "session-contract-sentinel";
+        let task = "task-contract-sentinel";
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let valid = manifest(session, task, nonce);
+        assert!(validate_manifest_for_session(session, task, &valid).is_ok());
+        assert!(validate_manifest_for_session("other-session", task, &valid).is_err());
+        assert!(validate_manifest_for_session(session, "other-task", &valid).is_err());
+
+        let mut wrong_nonce = valid.clone();
+        wrong_nonce.transfer_nonce = "fedcba9876543210fedcba9876543210".to_string();
+        assert!(validate_manifest_for_session(session, task, &wrong_nonce).is_err());
+
+        let mut wrong_id = valid;
+        wrong_id.id = "000000000000000000000000".to_string();
+        assert!(validate_manifest_for_session(session, task, &wrong_id).is_err());
+    }
+
+    #[test]
+    fn transfer_nonce_replay_is_rejected() {
+        let mut seen = HashSet::new();
+        let nonce = "0123456789abcdef0123456789abcdef";
+        assert!(claim_transfer_nonce(&mut seen, nonce).is_ok());
+        assert!(claim_transfer_nonce(&mut seen, nonce).is_err());
+    }
+}

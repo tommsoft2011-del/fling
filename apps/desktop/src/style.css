@@ -589,3 +589,48 @@ label.filebtn { cursor: pointer; }
 }
 .group .trow:last-child { border-bottom: none; }
 .group .trow:hover { background: var(--surface-2); }
+
+
+/* ---------- isolated Rust-owned LAN test console ---------- */
+.mode-card { max-width: 420px; }
+.mode-button { width: 100%; margin: 0 0 10px; }
+.mode-card .hint { display: block; margin-top: 8px; line-height: 1.6; }
+#lanScreen { flex-direction: column; overflow: hidden; }
+.lan-head {
+  flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; padding: 16px 22px; background: var(--surface); border-bottom: 1px solid var(--border);
+}
+.lan-head h1 { margin: 0 0 2px; font-size: 19px; }
+.lan-content { flex: 1; width: min(100%, 920px); margin: 0 auto; padding: 18px 22px 36px; overflow-y: auto; }
+.lan-content .card { margin-bottom: 12px; }
+.lan-status { margin: 10px 0; color: var(--accent); font-weight: 600; }
+.lan-status.error { color: var(--danger); }
+#lanPeerSelect { margin-top: 10px; }
+.lan-source-row { margin: 10px 0 12px; flex-wrap: wrap; }
+.lan-source-row .hint { min-width: 0; overflow-wrap: anywhere; }
+#lanSend { min-width: 150px; }
+#lanTasks { display: flex; flex-direction: column; gap: 8px; }
+.lan-task { position: relative; padding: 10px 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-2); }
+.lan-task-title { font-weight: 700; overflow-wrap: anywhere; }
+.lan-task .hint { margin-top: 3px; }
+.lan-cancel { margin-top: 8px; }
+.lan-counter-row { margin-top: 10px; }
+#lanCounters { min-height: 34px; max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 0; padding: 8px; border-radius: 7px; background: var(--surface-2); color: var(--muted); font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.lan-code-line { padding: 10px 0; color: var(--muted); }
+.lan-code-line strong { color: var(--accent); font-size: 21px; letter-spacing: .18em; }
+#lanPeerCode { margin: 4px 0 8px; text-align: center; letter-spacing: .12em; }
+@media (max-width: 620px) {
+  .lan-head { padding: 12px 14px; }
+  .lan-content { padding: 14px; }
+  .mode-card { width: min(92vw, 420px); }
+}
+
+/* LAN review: separate current activity/history and keep engineering details optional. */
+#lanHistory { display: flex; flex-direction: column; gap: 8px; }
+.lan-history-label { color: var(--muted); font-size: 12px; margin-bottom: 5px; }
+.lan-send-reason { margin-top: 7px; }
+.lan-task progress { display: block; width: 100%; height: 9px; margin-top: 7px; accent-color: var(--accent); }
+.lan-retry { margin-top: 8px; }
+#lanDiagnostics summary { cursor: pointer; font-weight: 650; }
+#lanDiagnostics[open] summary { margin-bottom: 12px; }
+.lan-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
