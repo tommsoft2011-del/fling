@@ -11,6 +11,14 @@ import {
   type FlingMessage,
   type OfferItem,
   type OfferMessage,
+  DIRECT_PEER_PROGRESS_TIMEOUT_MS,
+  FILE_STARTUP_PREPARATION_TIMEOUT_MS,
+  FILE_SOURCE_READ_TIMEOUT_MS,
+  MANIFEST_PREPARATION_TIMEOUT_MS,
+  peerProgressTimeoutExpired,
+  runWithStageTimeout,
+  startPeerProgressWatchdogAfterFrameAccepted,
+  StageTimeoutError,
 } from '@fling/core';
 import {
   connectFlingRoom,
@@ -241,8 +249,8 @@ const OFFER_REANNOUNCE_MS = 5000;
 const WAIT_PEER_TIMEOUT_MS = 5 * 60 * 1000;
 /** Receiver reports are emitted once per second; allow relay ACK jitter without
  * masking a genuinely silent direct path. */
-const DIRECT_PEER_PROGRESS_TIMEOUT_MS = 8_000;
 const DIRECT_HEALTH_CHECK_MS = 1000;
+const PEER_PROGRESS_WATCHDOG_STAGE = 'peer_progress_after_first_frame';
 /** Progress is an aggregate, throttled lower-bound; replay an overlap to cover interior holes. */
 const DIRECT_REPLAY_OVERLAP_CHUNKS = 64;
 /** Relay throughput is variable; fail only after it stops making progress for this long. */
@@ -302,12 +310,13 @@ export class SendTask {
   private currentPeerProgressTarget: number | null = null;
   private currentFileFinalizing = false;
   /** At most one loaded next Blob is hashed while the current file is durably saved. */
-  private preparedManifest: { index: number; promise: Promise<FileManifest | null> } | null = null;
+  private preparedManifest: { index: number; deadlineAt: number; promise: Promise<FileManifest | null> } | null = null;
   private lobbyLeave?: () => void;
   private announceTimer?: ReturnType<typeof setInterval>;
   private waitTimer?: ReturnType<typeof setTimeout>;
   private peerJoined = false;
   private cancelled = false;
+  private readonly stageAbortController = new AbortController();
   /** 接收方中途取消（收到 task-cancel）：不再标成功 */
   private peerCancelled = false;
   private lastBytes = 0;
@@ -320,6 +329,7 @@ export class SendTask {
   private watchdogPauseReason: string | null = null;
   private currentFileStartedAt = 0;
   private currentFileFirstFrameAccepted = false;
+  private currentFileStartupDeadlineAt = 0;
   private lastPeerProgressLogAt = 0;
   private peerDoneBytesAtLastLog = 0;
   private peerSavedBytesAtLastLog = 0;
@@ -337,6 +347,38 @@ export class SendTask {
       doneBytes: 0,
       totalBytes: c.size,
     }));
+  }
+
+  private runStartupStage<T>(
+    stage: string,
+    timeoutMs: number,
+    operation: () => T | PromiseLike<T>,
+    deadlineAt = this.currentFileStartupDeadlineAt,
+  ): Promise<T> {
+    const remainingMs = deadlineAt > 0 ? deadlineAt - Date.now() : timeoutMs;
+    const effectiveTimeoutMs = Math.min(timeoutMs, remainingMs);
+    if (effectiveTimeoutMs <= 0) {
+      const error = new StageTimeoutError('source_manifest_startup', FILE_STARTUP_PREPARATION_TIMEOUT_MS);
+      log('xfer', 'startup timer stage fired', {
+        taskId: this.taskId,
+        timerStage: error.stage,
+        timeoutMs: error.timeoutMs,
+        attemptedStage: stage,
+        firstDirectFrameAccepted: this.currentFileFirstFrameAccepted,
+      });
+      return Promise.reject(error);
+    }
+    return runWithStageTimeout(stage, effectiveTimeoutMs, operation, this.stageAbortController.signal).catch((error: unknown) => {
+      if (error instanceof StageTimeoutError) {
+        log('xfer', 'startup timer stage fired', {
+          taskId: this.taskId,
+          timerStage: error.stage,
+          timeoutMs: error.timeoutMs,
+          firstDirectFrameAccepted: this.currentFileFirstFrameAccepted,
+        });
+      }
+      throw error;
+    });
   }
 
   /**
@@ -359,17 +401,24 @@ export class SendTask {
       });
       return;
     }
+    const nextKind = next.kind;
     if (this.preparedManifest?.index === nextIndex) return;
 
     const file = wrapWebFile(next.blob, next.name, next.relPath);
     const startedAt = performance.now();
+    const deadlineAt = Date.now() + FILE_STARTUP_PREPARATION_TIMEOUT_MS;
     log('xfer', 'next manifest prehash started', {
       taskId: this.taskId,
       size: next.size,
       source: 'in_memory_blob',
       overlapsCurrentItemSize: this.currentSendingItem.size,
     });
-    const promise = buildManifest(file, next.kind).then((manifest) => {
+    const promise = this.runStartupStage(
+      'manifest_preparation',
+      MANIFEST_PREPARATION_TIMEOUT_MS,
+      () => buildManifest(file, nextKind),
+      deadlineAt,
+    ).then((manifest) => {
       log('xfer', 'next manifest prehash complete', {
         taskId: this.taskId,
         size: next.size,
@@ -384,9 +433,11 @@ export class SendTask {
         elapsedMs: Math.round(performance.now() - startedAt),
         errorType: errorType(error),
       });
+      if (error instanceof StageTimeoutError) throw error;
       return null;
     });
-    this.preparedManifest = { index: nextIndex, promise };
+    void promise.catch(() => undefined);
+    this.preparedManifest = { index: nextIndex, deadlineAt, promise };
   }
 
   get peerLabel(): string {
@@ -508,6 +559,7 @@ export class SendTask {
           if (taskId === this.taskId) {
             log('task', 'task-cancel received', { taskId });
             this.peerCancelled = true;
+            this.stageAbortController.abort();
             this.ackResolve?.(false);
           }
         },
@@ -614,6 +666,7 @@ export class SendTask {
                 watchdogTimeoutMs: DIRECT_PEER_PROGRESS_TIMEOUT_MS,
                 peerProgressAlreadySeen: this.peerDoneBytes > 0,
               });
+              this.startDirectHealthAfterFirstFrame();
             }
           }
         },
@@ -678,6 +731,7 @@ export class SendTask {
         if (src.kind !== 'text') {
           this.currentFileStartedAt = Date.now();
           this.currentFileFirstFrameAccepted = false;
+          this.currentFileStartupDeadlineAt = this.currentFileStartedAt + FILE_STARTUP_PREPARATION_TIMEOUT_MS;
           this.markDirectTransferStart();
         }
         st.status = 'active';
@@ -696,9 +750,11 @@ export class SendTask {
                 taskId: this.taskId, source: 'native_path', expectedSize: src.size,
               });
               try {
-                const bytes = (await invoke('read_file_bytes', {
-                  path: src.filePath,
-                })) as unknown as Uint8Array;
+                const bytes = (await this.runStartupStage(
+                  'file_source_read',
+                  FILE_SOURCE_READ_TIMEOUT_MS,
+                  () => invoke('read_file_bytes', { path: src.filePath }),
+                )) as unknown as Uint8Array;
                 log('xfer', 'native source read returned', {
                   taskId: this.taskId, source: 'native_path', bytes: bytes.byteLength,
                   status: 'ok', elapsedMs: Math.round(performance.now() - readStartedAt),
@@ -734,7 +790,14 @@ export class SendTask {
               ? (await this.preparedManifest.promise) ?? undefined
               : undefined;
             if (this.preparedManifest?.index === i) this.preparedManifest = null;
-            const manifest = await this.room!.sendFile(file, onFileProgress, src.kind, prepared);
+            const manifest = await this.room!.sendFile(
+              file,
+              onFileProgress,
+              src.kind,
+              prepared,
+              0,
+              this.currentFileStartupDeadlineAt,
+            );
             st.sha256 = manifest.sha256;
             st.mimeType = manifest.mimeType;
 
@@ -949,43 +1012,49 @@ export class SendTask {
     this.p2pLink = null;
   }
 
-  /** Begin/refresh the sender-side watchdog for a direct file transfer. */
+  /** Keep old-file silence from leaking into a new file's source/manifest startup. */
   private markDirectTransferStart(): void {
-    if (this.p2p !== 'open' || !this.room?.directActive) return;
+    this.stopDirectHealth('waiting_for_first_direct_frame');
+    this.lastWatchdogArmedAt = 0;
+    this.lastPeerProgressAt = 0;
+    if (this.p2p === 'open' && this.room?.directActive) {
+      log('p2p', 'peer progress watchdog deferred until first accepted frame', {
+        taskId: this.taskId,
+        timerStage: 'source_manifest_first_frame_startup',
+        currentFileStartedAt: this.currentFileStartedAt,
+        currentFileSize: this.currentSendingItem?.size,
+        firstDirectFrameAccepted: this.currentFileFirstFrameAccepted,
+        timeoutMs: DIRECT_PEER_PROGRESS_TIMEOUT_MS,
+      });
+    }
+  }
+
+  /** Start the peer-progress watchdog only after DataChannel.send() accepts a data frame. */
+  private startDirectHealthAfterFirstFrame(): void {
+    if (this.p2p !== 'open' || !this.room?.directActive || !this.currentFileFirstFrameAccepted) return;
     const now = Date.now();
     this.lastWatchdogArmedAt = now;
     this.lastPeerProgressAt = now;
-    if (this.directHealthTimer) {
-      log('p2p', 'peer progress watchdog refreshed for file', {
-        taskId: this.taskId,
-        timeoutMs: DIRECT_PEER_PROGRESS_TIMEOUT_MS,
-        armedAt: now,
-        originalStartedAt: this.watchdogStartedAt,
-        currentFileStartedAt: this.currentFileStartedAt,
-        currentFileSize: this.currentSendingItem?.size,
-        currentFilePhase: 'before_file_source_or_manifest_preparation',
-        firstDirectFrameAccepted: this.currentFileFirstFrameAccepted,
-        sentBytes: this.doneBytes,
-        peerDoneBytes: this.peerDoneBytes,
-      });
-      return;
-    }
     this.watchdogStartedAt = now;
     this.watchdogPauseReason = null;
     log('p2p', 'peer progress watchdog started', {
       taskId: this.taskId,
+      timerStage: PEER_PROGRESS_WATCHDOG_STAGE,
       timeoutMs: DIRECT_PEER_PROGRESS_TIMEOUT_MS,
       startedAt: now,
       armedAt: now,
       currentFileStartedAt: this.currentFileStartedAt,
       currentFileSize: this.currentSendingItem?.size,
-      currentFilePhase: 'before_file_source_or_manifest_preparation',
+      currentFilePhase: 'after_first_direct_frame_accepted',
       firstDirectFrameAccepted: this.currentFileFirstFrameAccepted,
       sentBytes: this.doneBytes,
       peerDoneBytes: this.peerDoneBytes,
       directChannelOpen: this.room.directActive,
     });
-    this.directHealthTimer = setInterval(() => {
+    const timer = startPeerProgressWatchdogAfterFrameAccepted(
+      this.currentFileFirstFrameAccepted,
+      DIRECT_HEALTH_CHECK_MS,
+      () => {
       if (this.phase !== 'sending' || this.p2p !== 'open' || !this.room?.directActive) {
         this.stopDirectHealth('phase_changed_or_direct_path_lost');
         return;
@@ -1013,11 +1082,12 @@ export class SendTask {
         });
         this.watchdogPauseReason = null;
       }
-      if (silentMs < DIRECT_PEER_PROGRESS_TIMEOUT_MS) return;
+      if (!peerProgressTimeoutExpired(this.lastPeerProgressAt, Date.now(), DIRECT_PEER_PROGRESS_TIMEOUT_MS)) return;
       const reason = 'peer_progress_silence_timeout';
       log('p2p', 'peer progress watchdog timed out; relay fallback requested', {
         taskId: this.taskId,
         reason,
+        timerStage: PEER_PROGRESS_WATCHDOG_STAGE,
         timeoutMs: DIRECT_PEER_PROGRESS_TIMEOUT_MS,
         silentMs,
         watchdogElapsedMs: Math.max(0, Date.now() - this.watchdogStartedAt),
@@ -1036,7 +1106,10 @@ export class SendTask {
       });
       this.stopDirectHealth('watchdog_timeout');
       this.room?.fallbackToRelay(reason);
-    }, DIRECT_HEALTH_CHECK_MS);
+      },
+    );
+    if (timer === null) return;
+    this.directHealthTimer = timer as ReturnType<typeof setInterval>;
   }
 
   private stopDirectHealth(reason = 'not_active'): void {
@@ -1136,6 +1209,7 @@ export class SendTask {
     if (!this.active) return;
     log('task', 'sender observed peer rejection', { taskId: this.taskId, phase: this.phase, sentBytes: this.doneBytes, peerDoneBytes: this.peerDoneBytes, firstDirectFrameAccepted: this.currentFileFirstFrameAccepted });
     this.cancelled = true;
+    this.stageAbortController.abort();
     this.phase = 'rejected';
     this.error = '对方拒绝了传输';
     for (const it of this.items) {
@@ -1198,6 +1272,7 @@ export class SendTask {
     if (!this.active) return;
     log('task', 'sender cancellation requested', { taskId: this.taskId, phase: this.phase, sentBytes: this.doneBytes, peerDoneBytes: this.peerDoneBytes, currentFileSize: this.currentSendingItem?.size, firstDirectFrameAccepted: this.currentFileFirstFrameAccepted });
     this.cancelled = true;
+    this.stageAbortController.abort();
     clearTimeout(this.waitTimer);
     this.stopAnnounce();
     // 尽力撤回 offer（对方若还没确认，待确认卡会消失）

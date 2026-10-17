@@ -7,4 +7,5 @@ export * from './files.js';
 export * from './transport.js';
 export * from './token.js';
 export * from './p2p.js';
+export * from './stage-timeout.js';
 export * from './room.js';

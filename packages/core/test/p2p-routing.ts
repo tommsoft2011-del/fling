@@ -13,6 +13,7 @@ import { FlingRoom, type FlingRoomEvents } from '../src/room.js';
 import { P2P_DRAIN_THRESHOLD, type DirectChannel } from '../src/p2p.js';
 import { buildManifest, FILE_HASH_CHUNK_SIZE, FileReceiver, type FileLike, wrapWebFile } from '../src/files.js';
 import { decodeDirectFileChunkFrame, encodeDirectFileChunkFrame, FILE_CHUNK_SIZE } from '../src/protocol.js';
+import { MANIFEST_PREPARATION_TIMEOUT_MS } from '../src/stage-timeout.js';
 import type { DataHandler, FlingTransport } from '../src/transport.js';
 
 let failures = 0;
@@ -300,6 +301,66 @@ async function runSevenFileWindowAB(maxWindowBytes: number): Promise<void> {
   await receiver.close();
 }
 
+async function testFirstFrameStartupTimeoutRecovery(): Promise<void> {
+  const hub = new Hub();
+  const sender = new FlingRoom(new MockTransport('startup-sender', hub), 'Sender', P2P_DRAIN_THRESHOLD, 8 * 1024 * 1024, {
+    manifestPreparationMs: 1_000,
+    fileChunkPreparationMs: 500,
+    manifestPublishMs: 500,
+    firstDirectFrameStartupMs: 25,
+    relayPublishMs: 500,
+  });
+  const receiver = new FlingRoom(new MockTransport('startup-receiver', hub), 'Receiver');
+  const logs: string[] = [];
+  let receivedBytes = 0;
+  await sender.connect('x', 'tok', 'startup-timeout', { onLog: (_tag, message) => logs.push(message) });
+  await receiver.connect('x', 'tok', 'startup-timeout', {
+    onFileComplete: (_id, _manifest, bytes) => { receivedBytes = bytes.byteLength; },
+  });
+  const directSender = new FakeDirect('startup A->B');
+  const directReceiver = new FakeDirect('startup B->A');
+  let acceptedDataFrames = 0;
+  directSender.onSend = (count) => { if (count > 1) acceptedDataFrames++; };
+  sender.setDirectChannel(directSender);
+  receiver.setDirectChannel(directReceiver);
+  const wire = () => {
+    const fromSender = directSender.sent;
+    directSender.sent = [];
+    directSender.bufferedAmount = 0;
+    fromSender.forEach((frame) => directReceiver.onmessage?.(frame as Uint8Array<ArrayBuffer>));
+    const fromReceiver = directReceiver.sent;
+    directReceiver.sent = [];
+    directReceiver.bufferedAmount = 0;
+    fromReceiver.forEach((frame) => directSender.onmessage?.(frame as Uint8Array<ArrayBuffer>));
+  };
+  const file = fileLike('slow-first-frame.bin', 70_000);
+  const originalSlice = file.slice.bind(file);
+  let sliceCount = 0;
+  file.slice = async (start, end) => {
+    sliceCount++;
+    if (sliceCount === 2) await new Promise((resolve) => setTimeout(resolve, 75));
+    return originalSlice(start, end);
+  };
+  let settled = false;
+  let sendError: unknown;
+  const pending = sender.sendFile(file, undefined, 'file');
+  void pending.then(() => { settled = true; }, (error) => { sendError = error; settled = true; });
+  for (let i = 0; i < 1_000 && !settled; i++) {
+    wire();
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  if (!settled) throw new Error('first-frame startup timeout recovery hung');
+  await pending;
+  wire();
+  check(!sendError && receivedBytes === 70_000, 'first-frame startup timeout repairs through relay and completes the same file');
+  check(logs.some((message) => message.includes('timer stage fired: stage=first_direct_frame_startup')),
+    'first-frame startup timeout reports the exact timer stage');
+  check(acceptedDataFrames === 0 && logs.some((message) => message.startsWith('direct fallback to relay: first direct frame startup timeout')),
+    'a delayed initial payload is not sent late over DataChannel after startup timeout');
+  await sender.close();
+  await receiver.close();
+}
+
 async function main(): Promise<void> {
   const hub = new Hub();
   const tA = new MockTransport('A', hub);
@@ -397,6 +458,36 @@ async function main(): Promise<void> {
       directFileLogs.some((message) => message.startsWith('first direct frame send_accepted')),
     'first direct frame preparation, native send attempt, and local acceptance stay visible',
   );
+
+  // Manifest preparation can legitimately exceed the former 8-second peer
+  // watchdog. It must finish before the first direct frame starts that timer.
+  done = freshBox();
+  const slowManifestFile = fileLike('manifest-prep-over-8s.bin', 64 * 1024);
+  const originalSlice = slowManifestFile.slice.bind(slowManifestFile);
+  let delayManifestPreparation = true;
+  slowManifestFile.slice = async (start, end) => {
+    if (delayManifestPreparation) {
+      delayManifestPreparation = false;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return originalSlice(start, end);
+  };
+  const slowPrepLogStart = directWindowLogs.length;
+  const slowPrepStartedAt = performance.now();
+  const slowPrepSend = roomA.sendFile(slowManifestFile, undefined, 'file');
+  for (let i = 0; i < 2_200 && !done.cur; i++) {
+    wire();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  await slowPrepSend;
+  const slowPrepElapsedMs = performance.now() - slowPrepStartedAt;
+  const slowPrepLogs = directWindowLogs.slice(slowPrepLogStart);
+  const prepLog = slowPrepLogs.find((message) => message.startsWith('manifest preparation complete')) ?? '';
+  const prepMs = Number(/elapsedMs=(\d+)/.exec(prepLog)?.[1] ?? 0);
+  check(slowPrepElapsedMs > 0 && slowPrepElapsedMs < MANIFEST_PREPARATION_TIMEOUT_MS,
+    `manifest preparation completes under the 120s startup deadline (${Math.round(slowPrepElapsedMs)}ms end-to-end)`);
+  check(!!done.cur && done.cur.bytes.byteLength === 64 * 1024 && prepMs >= 40,
+    'file transfers successfully after a delayed manifest preparation, before the first direct frame is accepted');
 
   // --- 1a. direct-only coalescing is negotiated against each peer's actual SCTP max ---
   directA = new FakeDirect('A->B 64 KiB coalescing candidate', 96 * 1024);
@@ -592,6 +683,11 @@ async function main(): Promise<void> {
     directWindowLogs.slice(blackholeLogStart).some((message) => message.startsWith('direct fallback to relay:')),
     'direct-to-relay fallback state transition is retained separately from progress summaries',
   );
+  const blackholeLogs = directWindowLogs.slice(blackholeLogStart);
+  const acceptedFrameAt = blackholeLogs.findIndex((message) => message.startsWith('first direct frame send_accepted'));
+  const ackTimeoutAt = blackholeLogs.findIndex((message) => message.startsWith('direct chunk ACK timeout'));
+  check(acceptedFrameAt >= 0 && ackTimeoutAt > acceptedFrameAt,
+    'the 8s receiver ACK-stall timer fires only after the first direct data frame was accepted');
   check(!roomA.directActive, 'black-hole fallback detaches direct channel');
 
   // --- 1d. partial silent loss -> replay the same manifest through relay ---
@@ -625,6 +721,7 @@ async function main(): Promise<void> {
   directA.blackhole = false;
   roomA.setDirectChannel(directA); // re-attach the (now dead) channel
   const file2 = fileLike('world.bin', 70_000);
+  const nativeFailureLogStart = directWindowLogs.length;
   const p2 = roomA.sendFile(file2, undefined, 'file');
   for (let i = 0; i < 50 && !done.cur; i++) {
     wire();
@@ -642,6 +739,11 @@ async function main(): Promise<void> {
     'fallback bytes intact',
   );
   check(!roomA.directActive, 'directActive false after failure');
+  const nativeFailureLogs = directWindowLogs.slice(nativeFailureLogStart);
+  check(nativeFailureLogs.some((message) => message.includes('direct send failed for file-manifest')) &&
+    nativeFailureLogs.some((message) => message.startsWith('direct fallback to relay:')) &&
+    !nativeFailureLogs.some((message) => message.startsWith('manifest ACK timeout')),
+  'explicit native send failure falls back immediately without waiting for the manifest ACK timer');
 
   // --- 2a. duplicate/out-of-order cumulative ACKs never move the prefix back ---
   const ackProbeId = 'abcdef0123456789abcdef01';
@@ -739,6 +841,7 @@ async function main(): Promise<void> {
   check(cancelledChunk === null && cancelledFinalize === false, 'room close cancels both chunk and durable-finalization ACK waiters');
   check(performance.now() - cancelStartedAt < 500, 'cancelled waiters settle promptly instead of lingering on timers');
   await roomB.close();
+  await testFirstFrameStartupTimeoutRecovery();
 
   if (failures > 0) {
     throw new Error(`${failures} FAILURES`);
