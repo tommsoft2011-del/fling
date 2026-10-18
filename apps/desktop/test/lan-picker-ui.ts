@@ -58,6 +58,8 @@ let nextPick: Promise<unknown> = Promise.resolve(null);
 let nextRefresh: Promise<unknown> = Promise.resolve({ validServices: 0, lanEligiblePeers: 0, uiEmittedPeers: 0 });
 let nextExport: Promise<unknown> = Promise.resolve({ saved: false });
 let nextTask = 0;
+let nextSend: Promise<unknown> | null = null;
+let failPairUiReport = false;
 let failUiReport = false;
 let currentMockPair = '';
 const progress = (taskId: string, phase: string, extra: Record<string, unknown> = {}) =>
@@ -72,7 +74,8 @@ mock.module('@tauri-apps/api/core', () => ({
     if (command === 'discovery_refresh') return await nextRefresh;
     if (command === 'discovery_export_diagnostics') return await nextExport;
     if (command === 'discovery_report_ui' && failUiReport) throw new Error('diagnostic-write-failed');
-    if (command === 'native_lan_start_send') return `test-send-${++nextTask}`;
+    if (command === 'pairing_report_ui' && failPairUiReport) throw new Error('private-diagnostic-error');
+    if (command === 'native_lan_start_send') return nextSend ? await nextSend : `test-send-${++nextTask}`;
     if (command === 'native_lan_pair_decision' && (!args.approved || args.peerCode !== '12345678')) {
       progress(currentMockPair, args.approved ? 'interrupted' : 'cancelled',
         args.approved ? { failureKind: 'close', error: 'secondary control close' } : {});
@@ -174,7 +177,7 @@ settled();
 assert.match(info.textContent, /保留原文件/);
 await send.onclick!();
 assert.deepEqual(calls.find((call) => call.command === 'native_lan_start_send')?.args,
-  { peerId: 'peer-b', sourceId: 'opaque-source-A' });
+  { peerId: 'peer-b', sourceId: 'opaque-source-A', uiAttempt: 1 });
 assert.ok(calls.filter((call) => call.command === 'native_lan_pick_source').every((call) => call.args === undefined));
 console.log('ok - picker cancel/error/success, opaque source IPC, retry and focus restoration (mock)');
 
@@ -415,4 +418,69 @@ for (const { args } of reports()) {
   assert.ok(['initialized', 'peer-up', 'peer-down', 'refresh-completed'].includes(args.reason));
 }
 console.log('ok - aggregate-only UI receipt/render snapshots distinguish duplicates; diagnostic failure does not affect discovery/transfer (mock)');
+
+const failureSourceInfo = info.textContent;
+const failureTasks = get('lanTasks').textContent;
+const failureHistory = get('lanHistory').textContent;
+for (const [stage, reason, expected] of [
+  ['tcp_connect', 'connect_timeout', /连接对端超时/],
+  ['hello_send', 'hello_write', /配对请求发送失败/],
+  ['response_receive', 'hello_timeout', /等待对端响应超时/],
+  ['identity_validation', 'unexpected_peer', /身份校验未通过/],
+  ['prompt_emit', 'prompt_emit_failed', /提示未能发送到界面/],
+] as const) {
+  nextSend = Promise.reject({ stage, reason, sourceRetained: true, attempt: 9,
+    message: 'private-file-path 192.168.1.2 session-secret short-code-secret' });
+  await send.onclick!();
+  assert.match(get('lanStatus').textContent, expected);
+  assert.match(get('lanStatus').textContent, /已保留所选文件/);
+  assert.doesNotMatch(get('lanStatus').textContent, /重新选择文件|private-file|192\.168|session-secret|short-code/);
+  assert.equal(info.textContent, failureSourceInfo);
+  assert.equal(send.disabled, false);
+  assert.equal(get('lanTasks').textContent, failureTasks);
+  assert.equal(get('lanHistory').textContent, failureHistory);
+  assert.equal(calls.filter((call) => call.command === 'native_lan_start_send').at(-1)!.args.sourceId, 'opaque-source-refresh');
+}
+let rejectSend!: (reason: unknown) => void;
+nextSend = new Promise((_, reject) => { rejectSend = reject; });
+failPairUiReport = true;
+const sendCount = calls.filter((call) => call.command === 'native_lan_start_send').length;
+const pendingSend = send.onclick!();
+assert.equal(send.disabled, true);
+assert.equal(button.disabled, true);
+await send.onclick!();
+await button.onclick!();
+assert.equal(calls.filter((call) => call.command === 'native_lan_start_send').length, sendCount + 1);
+rejectSend({ stage: 'tcp_connect', reason: 'connect_refused', sourceRetained: true, attempt: 10 });
+await pendingSend;
+assert.equal(send.disabled, false);
+assert.equal(button.disabled, false);
+assert.equal(info.textContent, failureSourceInfo);
+assert.match(get('lanStatus').textContent, /拒绝.*配对连接/);
+nextSend = Promise.reject(new Error('private-file-path 192.168.1.2'));
+await send.onclick!();
+assert.match(get('lanStatus').textContent, /尚未确认失败阶段/);
+assert.match(get('lanStatus').textContent, /文件选择未改动/);
+assert.equal(send.disabled, false);
+assert.equal(info.textContent, failureSourceInfo);
+nextSend = Promise.reject({ stage: 'request_start', reason: 'source_missing', sourceRetained: false, attempt: 11 });
+await send.onclick!();
+assert.equal(send.disabled, true);
+assert.match(info.textContent, /所选文件已失效/);
+assert.match(get('lanStatus').textContent, /重新选择文件/);
+failPairUiReport = false;
+events.get('fling://lan/pairing')!({ payload: {
+  sessionId: 'not-a-diagnostic-id', taskId: 'not-a-diagnostic-task', peerDeviceId: 'peer-b',
+  peerDeviceLabel: 'B', verificationCode: '12345678', role: 'responder', diagnosticAttempt: 3456,
+} });
+assert.equal(get('lanPairModal').hidden, false);
+const pairReports = calls.filter((call) => call.command === 'pairing_report_ui');
+assert.deepEqual(pairReports.at(-1)!.args, { phase: 'prompt-received', uiAttempt: null, attempt: 3456 });
+for (const { args } of pairReports) {
+  assert.deepEqual(Object.keys(args).sort(), ['attempt', 'phase', 'uiAttempt']);
+  assert.doesNotMatch(JSON.stringify(args), /opaque-source|not-a-diagnostic|12345678|verificationCode|sessionId|taskId|peerId/);
+}
+const uiAttempts = calls.filter((call) => call.command === 'native_lan_start_send').map((call) => call.args.uiAttempt);
+assert.ok(uiAttempts.every((attempt, index) => Number.isInteger(attempt) && attempt > 0 && (!index || attempt > uiAttempts[index - 1])));
+console.log('ok - stage failures/timeouts retain source and history; only confirmed loss clears source; no overlapping sends/picks; UI reports only local sequence (mock)');
 console.log('LAN picker/state/accessibility-contract harness passed. Native window and spoken-reader results remain separate.');

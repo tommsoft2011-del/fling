@@ -29,6 +29,7 @@ const allowedCommands = new Set([
   'discovery_refresh',
   'discovery_export_diagnostics',
   'discovery_report_ui',
+  'pairing_report_ui',
   'native_lan_start_mode',
   'native_lan_stop_mode',
   'native_lan_pick_source',
@@ -66,5 +67,14 @@ assert.match(reportSignature, /\breason:\s*String\b/);
 assert.doesNotMatch(reportSignature, /\breport:/, 'Tauri expects flat camelCase arguments, not an unprovided wrapper');
 assert.match(nativeSource, /async fn discovery_refresh\s*\([^)]*\)\s*->\s*Result<discovery_round::RoundCounts,\s*String>/);
 assert.match(source, /invoke<DiscoveryResult>\('discovery_refresh'\)/);
+
+const runtimeSource = readFileSync(new URL('../src-tauri/src/native_lan_runtime.rs', import.meta.url), 'utf8');
+const startSignature = /async fn native_lan_start_send\s*\(([^)]*)\)\s*->\s*Result<String,\s*StartSendError>/.exec(runtimeSource)?.[1] ?? '';
+assert.match(startSignature, /ui_attempt:\s*u32/);
+assert.match(runtimeSource, /source_retained:\s*Option<bool>/);
+assert.match(runtimeSource, /diagnostic_attempt:\s*u64/);
+const pairReportSignature = /async fn pairing_report_ui\s*\(([^)]*)\)/.exec(nativeSource)?.[1] ?? '';
+assert.match(pairReportSignature, /ui_attempt:\s*Option<u32>/);
+assert.match(pairReportSignature, /attempt:\s*Option<u64>/);
 
 console.log(`LAN IPC contract passed: ${commands.length} allowed command call sites, ${events.length} allowed event listeners; no file payload APIs.`);

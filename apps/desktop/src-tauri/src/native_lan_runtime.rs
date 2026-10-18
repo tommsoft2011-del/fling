@@ -2,6 +2,9 @@ use crate::native_lan::{
     self, AuthenticatedLocalSession, EncryptedControlFrame, NativeControlMessage, PairingDecision,
     PairingRole, PendingLocalPair, SessionReplayGuard,
 };
+use crate::pairing_diagnostics::{
+    new_pair_trace, PairReason, PairRole, PairStage, PairState, PairTrace,
+};
 use crate::{ensure_config, DiscoveryCmd, DiscoveryState};
 #[path = "native_lan_transfer.rs"]
 mod transfer;
@@ -98,6 +101,19 @@ struct NativeSource {
     total_chunks: u32,
 }
 
+impl NativeSource {
+    fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            _path: self._path.clone(),
+            file: self.file.try_clone()?,
+            name: self.name.clone(),
+            size_bytes: self.size_bytes,
+            sha256: self.sha256.clone(),
+            total_chunks: self.total_chunks,
+        })
+    }
+}
+
 enum LocalAuthState {
     Pending(PendingLocalPair),
     Authenticated(AuthenticatedLocalSession),
@@ -135,6 +151,7 @@ struct PairingEvent {
     peer_device_label: String,
     verification_code: String,
     role: &'static str,
+    diagnostic_attempt: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -521,73 +538,358 @@ pub(crate) fn native_lan_stop_mode(
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartSendError {
+    pub stage: PairStage,
+    pub reason: PairReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_retained: Option<bool>,
+    pub attempt: u64,
+}
+
+impl StartSendError {
+    fn new(
+        trace: &PairTrace,
+        stage: PairStage,
+        state: PairState,
+        reason: PairReason,
+        source_retained: Option<bool>,
+        endpoint_count: Option<u32>,
+    ) -> Self {
+        trace.record(stage, state, reason, endpoint_count);
+        Self {
+            stage,
+            reason,
+            source_retained,
+            attempt: trace.id(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PairStepFailure {
+    stage: PairStage,
+    state: PairState,
+    reason: PairReason,
+}
+
+fn failed_pair_step(
+    trace: &PairTrace,
+    stage: PairStage,
+    state: PairState,
+    reason: PairReason,
+    endpoints: Option<u32>,
+) -> PairStepFailure {
+    trace.record(stage, state, reason, endpoints);
+    PairStepFailure {
+        stage,
+        state,
+        reason,
+    }
+}
+
+async fn run_pair_step<T, E, F, C>(
+    trace: &PairTrace,
+    stage: PairStage,
+    deadline: Duration,
+    timeout_reason: PairReason,
+    classify: C,
+    endpoints: Option<u32>,
+    future: F,
+) -> Result<T, PairStepFailure>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    C: FnOnce(E) -> PairReason,
+{
+    trace.record(stage, PairState::Start, PairReason::None, endpoints);
+    match tokio::time::timeout(deadline, future).await {
+        Ok(Ok(value)) => {
+            trace.record(stage, PairState::Ok, PairReason::None, endpoints);
+            Ok(value)
+        }
+        Ok(Err(error)) => Err(failed_pair_step(
+            trace,
+            stage,
+            PairState::Error,
+            classify(error),
+            endpoints,
+        )),
+        Err(_) => Err(failed_pair_step(
+            trace,
+            stage,
+            PairState::Timeout,
+            timeout_reason,
+            endpoints,
+        )),
+    }
+}
+
+fn validate_pair_condition(
+    trace: &PairTrace,
+    stage: PairStage,
+    matched: bool,
+) -> Result<(), PairStepFailure> {
+    trace.record(stage, PairState::Start, PairReason::None, None);
+    if matched {
+        trace.record(stage, PairState::Ok, PairReason::None, None);
+        Ok(())
+    } else {
+        Err(failed_pair_step(
+            trace,
+            stage,
+            PairState::Rejected,
+            PairReason::UnexpectedPeer,
+            None,
+        ))
+    }
+}
+
+impl NativeLanRuntime {
+    fn source_retained(&self, source_id: &str) -> Option<bool> {
+        self.inner
+            .sources
+            .lock()
+            .ok()
+            .map(|sources| sources.contains_key(source_id))
+    }
+}
+
+// This cleanup is deliberately after successful installation: a failed install or
+// prompt emission must never consume the original source. The installed session
+// owns a valid cloned handle, so an absent original is harmless after success.
+fn finish_source_transaction<T, E>(
+    runtime: &NativeLanRuntime,
+    source_id: &str,
+    outcome: Result<T, E>,
+) -> Result<T, E> {
+    if outcome.is_ok() {
+        if let Ok(mut sources) = runtime.inner.sources.lock() {
+            sources.remove(source_id);
+        }
+    }
+    outcome
+}
+
+impl StartSendError {
+    fn from_step(trace: &PairTrace, failure: PairStepFailure, retained: Option<bool>) -> Self {
+        Self {
+            stage: failure.stage,
+            reason: failure.reason,
+            source_retained: retained,
+            attempt: trace.id(),
+        }
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn native_lan_start_send(
     app: AppHandle,
     runtime: State<'_, NativeLanRuntime>,
     peer_id: String,
     source_id: String,
-) -> Result<String, String> {
+    ui_attempt: u32,
+) -> Result<String, StartSendError> {
     let runtime = runtime.inner().clone();
+    let trace = new_pair_trace(PairRole::Sender, Some(ui_attempt));
+    trace.record(
+        PairStage::RequestStart,
+        PairState::Start,
+        PairReason::None,
+        None,
+    );
+    let failure = |stage, state, reason, count| {
+        StartSendError::new(
+            &trace,
+            stage,
+            state,
+            reason,
+            runtime.source_retained(&source_id),
+            count,
+        )
+    };
     if !runtime.is_enabled() {
-        return Err("请先进入仅局域网测试模式".to_string());
+        return Err(failure(
+            PairStage::RequestStart,
+            PairState::Rejected,
+            PairReason::LanDisabled,
+            None,
+        ));
     }
-    if !runtime
-        .inner
-        .sources
-        .lock()
-        .map_err(|error| format!("source registry lock: {error}"))?
-        .contains_key(&source_id)
-    {
-        return Err("源文件已失效，请重新选择".to_string());
+    let prepared = match runtime.inner.sources.lock() {
+        Ok(sources) => sources.get(&source_id).map(NativeSource::try_clone),
+        Err(_) => {
+            return Err(StartSendError::new(
+                &trace,
+                PairStage::RequestStart,
+                PairState::Error,
+                PairReason::SourceRegistryUnavailable,
+                None,
+                None,
+            ))
+        }
+    };
+    let source = match prepared {
+        None => {
+            return Err(failure(
+                PairStage::RequestStart,
+                PairState::Rejected,
+                PairReason::SourceMissing,
+                None,
+            ))
+        }
+        Some(Err(_)) => {
+            return Err(failure(
+                PairStage::RequestStart,
+                PairState::Error,
+                PairReason::Io,
+                None,
+            ))
+        }
+        Some(Ok(source)) => source,
+    };
+    let endpoints = runtime.endpoints_for_peer(&peer_id).map_err(|_| {
+        failure(
+            PairStage::Endpoints,
+            PairState::Rejected,
+            PairReason::PeerUnavailable,
+            Some(0),
+        )
+    })?;
+    let endpoint_count = endpoints
+        .iter()
+        .filter(|e| is_local_network_address(e.ip(), runtime.ipv6_listener_ready()))
+        .count()
+        .min(u32::MAX as usize) as u32;
+    trace.record(
+        PairStage::Endpoints,
+        PairState::Ok,
+        PairReason::None,
+        Some(endpoint_count),
+    );
+    if endpoint_count == 0 {
+        return Err(failure(
+            PairStage::Endpoints,
+            PairState::Rejected,
+            PairReason::EndpointNotEligible,
+            Some(0),
+        ));
     }
-    let endpoints = runtime.endpoints_for_peer(&peer_id)?;
-    let cfg = ensure_config(&app)?.1;
+    let cfg = ensure_config(&app)
+        .map_err(|_| {
+            failure(
+                PairStage::SecureSession,
+                PairState::Error,
+                PairReason::ConfigUnavailable,
+                Some(endpoint_count),
+            )
+        })?
+        .1;
     let task_id = random_hex_id();
-    let mut last_error = "附近设备当前不可连接".to_string();
+    let mut last_connect_failure = None;
     for endpoint in endpoints {
         if !is_local_network_address(endpoint.ip(), runtime.ipv6_listener_ready()) {
             continue;
         }
         let (ephemeral, hello) =
-            native_lan::start_pairing(&task_id, &cfg.device_id, &cfg.device_name, &peer_id)?;
-        let connected =
-            tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(endpoint)).await;
-        let mut stream = match connected {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(error)) => {
-                last_error = format!("无法连接附近设备：{error}");
-                continue;
-            }
-            Err(_) => {
-                last_error = "连接附近设备超时".to_string();
+            native_lan::start_pairing(&task_id, &cfg.device_id, &cfg.device_name, &peer_id)
+                .map_err(|_| {
+                    failure(
+                        PairStage::SecureSession,
+                        PairState::Error,
+                        PairReason::KeyAgreementRejected,
+                        Some(endpoint_count),
+                    )
+                })?;
+        let mut stream = match run_pair_step(
+            &trace,
+            PairStage::TcpConnect,
+            Duration::from_secs(4),
+            PairReason::ConnectTimeout,
+            |error| connect_error_reason(&error),
+            Some(endpoint_count),
+            TcpStream::connect(endpoint),
+        )
+        .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                last_connect_failure = Some(error);
                 continue;
             }
         };
-        stream
-            .set_nodelay(true)
-            .map_err(|error| format!("configure LAN control socket: {error}"))?;
-        tokio::time::timeout(
+        stream.set_nodelay(true).map_err(|_| {
+            failure(
+                PairStage::TcpConnect,
+                PairState::Error,
+                PairReason::Io,
+                Some(endpoint_count),
+            )
+        })?;
+        run_pair_step(
+            &trace,
+            PairStage::HelloSend,
             Duration::from_secs(10),
+            PairReason::HelloTimeout,
+            |_| PairReason::HelloWrite,
+            Some(endpoint_count),
             native_lan::write_pairing_hello(&mut stream, &hello),
         )
         .await
-        .map_err(|_| "发送配对请求超时".to_string())?
-        .map_err(|error| format!("发送配对请求失败：{error}"))?;
-        let peer_hello = tokio::time::timeout(
+        .map_err(|error| {
+            StartSendError::from_step(&trace, error, runtime.source_retained(&source_id))
+        })?;
+        let peer_hello = run_pair_step(
+            &trace,
+            PairStage::ResponseReceive,
             Duration::from_secs(10),
+            PairReason::HelloTimeout,
+            |_| PairReason::HelloReadOrInvalid,
+            Some(endpoint_count),
             native_lan::read_pairing_hello(&mut stream),
         )
         .await
-        .map_err(|_| "等待对端配对响应超时".to_string())?
-        .map_err(|error| format!("读取对端配对响应失败：{error}"))?;
-        if peer_hello.from_device_id != peer_id {
-            return Err("配对响应的设备身份与所选设备不一致".to_string());
-        }
-        runtime.reserve_session_id(&hello.session_id)?;
-        let secure = native_lan::establish_local_session(ephemeral, &hello, &peer_hello)?;
-        let source = runtime.take_source(&source_id)?;
-        install_control_session(
+        .map_err(|error| {
+            StartSendError::from_step(&trace, error, runtime.source_retained(&source_id))
+        })?;
+        validate_pair_condition(
+            &trace,
+            PairStage::IdentityValidation,
+            peer_hello.from_device_id == peer_id,
+        )
+        .map_err(|error| {
+            StartSendError::from_step(&trace, error, runtime.source_retained(&source_id))
+        })?;
+        runtime.reserve_session_id(&hello.session_id).map_err(|_| {
+            failure(
+                PairStage::SecureSession,
+                PairState::Rejected,
+                PairReason::ReplayRejected,
+                Some(endpoint_count),
+            )
+        })?;
+        trace.record(
+            PairStage::SecureSession,
+            PairState::Start,
+            PairReason::None,
+            Some(endpoint_count),
+        );
+        let secure =
+            native_lan::establish_local_session(ephemeral, &hello, &peer_hello).map_err(|_| {
+                failure(
+                    PairStage::SecureSession,
+                    PairState::Rejected,
+                    PairReason::KeyAgreementRejected,
+                    Some(endpoint_count),
+                )
+            })?;
+        trace.record(
+            PairStage::SecureSession,
+            PairState::Ok,
+            PairReason::None,
+            Some(endpoint_count),
+        );
+        let installed = install_control_session(
             app.clone(),
             runtime.clone(),
             stream,
@@ -595,16 +897,19 @@ pub(crate) async fn native_lan_start_send(
             PairingRole::Initiator,
             peer_id.clone(),
             Some(source),
+            trace.clone(),
         )
-        .await?;
-        let request_bytes = serde_json::to_vec(&serde_json::json!({
-            "peerId": peer_id,
-            "sourceId": source_id,
-        }))
-        .map(|value| value.len())
+        .await;
+        finish_source_transaction(&runtime, &source_id, installed).map_err(|error| {
+            StartSendError::from_step(&trace, error, runtime.source_retained(&source_id))
+        })?;
+        let request_bytes = serde_json::to_vec(
+            &serde_json::json!({"peerId": peer_id, "sourceId": source_id, "uiAttempt": ui_attempt}),
+        )
+        .map(|v| v.len())
         .unwrap_or_default();
         let response_bytes = serde_json::to_vec(&task_id)
-            .map(|value| value.len())
+            .map(|v| v.len())
             .unwrap_or_default();
         runtime.count_ipc(
             "native_lan_start_send",
@@ -612,7 +917,33 @@ pub(crate) async fn native_lan_start_send(
         );
         return Ok(task_id);
     }
-    Err(last_error)
+    match last_connect_failure {
+        Some(error) => Err(StartSendError::from_step(
+            &trace,
+            error,
+            runtime.source_retained(&source_id),
+        )),
+        None => Err(failure(
+            PairStage::Endpoints,
+            PairState::Rejected,
+            PairReason::EndpointNotEligible,
+            Some(0),
+        )),
+    }
+}
+
+fn connect_error_reason(error: &std::io::Error) -> PairReason {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::ConnectionRefused => PairReason::ConnectRefused,
+        ErrorKind::TimedOut => PairReason::ConnectTimeout,
+        ErrorKind::PermissionDenied => PairReason::PermissionDenied,
+        ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable => {
+            PairReason::NetworkUnreachable
+        }
+        ErrorKind::NotFound | ErrorKind::AddrNotAvailable => PairReason::PeerUnavailable,
+        _ => PairReason::Io,
+    }
 }
 
 #[tauri::command]
@@ -947,6 +1278,285 @@ fn transfer_id_for_session(session_id: &str, task_id: &str, transfer_nonce: &str
 mod tests {
     use super::*;
 
+    fn registered_pair_test_source() -> (NativeLanRuntime, PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("fling-pair-diagnostic-{}.tmp", random_hex_id()));
+        let file = File::create(&path).unwrap();
+        let runtime = NativeLanRuntime::new();
+        runtime
+            .insert_source(
+                "test-source".into(),
+                NativeSource {
+                    _path: path.clone(),
+                    file,
+                    name: "fixture".into(),
+                    size_bytes: 0,
+                    sha256: String::new(),
+                    total_chunks: 0,
+                },
+            )
+            .unwrap();
+        (runtime, path)
+    }
+
+    #[tokio::test]
+    async fn pair_stage_timeout_failure_and_identity_preserve_registered_source() {
+        let (runtime, path) = registered_pair_test_source();
+        let trace = new_pair_trace(PairRole::Sender, Some(42));
+        for (stage, timeout_reason, error_reason) in [
+            (
+                PairStage::TcpConnect,
+                PairReason::ConnectTimeout,
+                PairReason::ConnectRefused,
+            ),
+            (
+                PairStage::HelloSend,
+                PairReason::HelloTimeout,
+                PairReason::HelloWrite,
+            ),
+            (
+                PairStage::ResponseReceive,
+                PairReason::HelloTimeout,
+                PairReason::HelloReadOrInvalid,
+            ),
+            (
+                PairStage::HelloReceive,
+                PairReason::HelloTimeout,
+                PairReason::HelloReadOrInvalid,
+            ),
+            (
+                PairStage::ResponseSend,
+                PairReason::HelloTimeout,
+                PairReason::HelloWrite,
+            ),
+        ] {
+            let timeout = run_pair_step(
+                &trace,
+                stage,
+                Duration::from_millis(1),
+                timeout_reason,
+                |_: String| error_reason,
+                Some(1),
+                std::future::pending::<Result<(), String>>(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(timeout.stage, stage);
+            assert_eq!(timeout.state, PairState::Timeout);
+            assert_eq!(timeout.reason, timeout_reason);
+            let failure = run_pair_step(
+                &trace,
+                stage,
+                Duration::from_secs(1),
+                timeout_reason,
+                |_: String| error_reason,
+                Some(1),
+                std::future::ready(Err::<(), _>("RAW_PRIVATE_PATH_ADDRESS_SESSION".to_string())),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(failure.state, PairState::Error);
+            assert_eq!(failure.reason, error_reason);
+            let error =
+                StartSendError::from_step(&trace, failure, runtime.source_retained("test-source"));
+            assert_eq!(error.stage, stage);
+            assert_eq!(error.source_retained, Some(true));
+            assert!(!serde_json::to_string(&error)
+                .unwrap()
+                .contains("RAW_PRIVATE"));
+            assert_eq!(runtime.source_retained("test-source"), Some(true));
+        }
+        let identity =
+            validate_pair_condition(&trace, PairStage::IdentityValidation, false).unwrap_err();
+        assert_eq!(identity.reason, PairReason::UnexpectedPeer);
+        assert_eq!(identity.state, PairState::Rejected);
+        assert!(validate_pair_condition(&trace, PairStage::IdentityValidation, true).is_ok());
+        assert_eq!(runtime.source_retained("test-source"), Some(true));
+        drop(runtime);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn real_pairhello_reader_timeout_and_eof_are_distinct_and_keep_source() {
+        let (runtime, path) = registered_pair_test_source();
+        let trace = new_pair_trace(PairRole::Sender, Some(45));
+        let (writer, mut reader) = tokio::io::duplex(64);
+        let timeout = run_pair_step(
+            &trace,
+            PairStage::ResponseReceive,
+            Duration::from_millis(1),
+            PairReason::HelloTimeout,
+            |_| PairReason::HelloReadOrInvalid,
+            None,
+            native_lan::read_pairing_hello(&mut reader),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(timeout.state, PairState::Timeout);
+        assert_eq!(timeout.reason, PairReason::HelloTimeout);
+        drop(writer);
+        let eof = run_pair_step(
+            &trace,
+            PairStage::ResponseReceive,
+            Duration::from_secs(1),
+            PairReason::HelloTimeout,
+            |_| PairReason::HelloReadOrInvalid,
+            None,
+            native_lan::read_pairing_hello(&mut reader),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(eof.state, PairState::Error);
+        assert_eq!(eof.reason, PairReason::HelloReadOrInvalid);
+        assert_eq!(runtime.source_retained("test-source"), Some(true));
+        drop(runtime);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn failed_install_or_prompt_never_consumes_source_success_commits_once() {
+        let (runtime, path) = registered_pair_test_source();
+        let trace = new_pair_trace(PairRole::Sender, Some(43));
+        for (stage, reason) in [
+            (PairStage::SessionInstall, PairReason::SessionInstall),
+            (PairStage::PromptEmit, PairReason::PromptEmitFailed),
+        ] {
+            let failure = failed_pair_step(&trace, stage, PairState::Error, reason, None);
+            let result = finish_source_transaction::<(), _>(&runtime, "test-source", Err(failure));
+            let error = StartSendError::from_step(
+                &trace,
+                result.unwrap_err(),
+                runtime.source_retained("test-source"),
+            );
+            assert_eq!(error.stage, stage);
+            assert_eq!(error.reason, reason);
+            assert_eq!(error.source_retained, Some(true));
+            let clone = runtime
+                .inner
+                .sources
+                .lock()
+                .unwrap()
+                .get("test-source")
+                .unwrap()
+                .try_clone()
+                .unwrap();
+            drop(clone);
+        }
+        assert!(
+            finish_source_transaction::<(), PairStepFailure>(&runtime, "test-source", Ok(()))
+                .is_ok()
+        );
+        assert_eq!(runtime.source_retained("test-source"), Some(false));
+        assert!(
+            finish_source_transaction::<(), PairStepFailure>(&runtime, "test-source", Ok(()))
+                .is_ok()
+        );
+        drop(runtime);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn missing_source_and_unknown_registry_have_different_safe_results() {
+        let runtime = NativeLanRuntime::new();
+        let trace = new_pair_trace(PairRole::Sender, Some(44));
+        let error = StartSendError::new(
+            &trace,
+            PairStage::RequestStart,
+            PairState::Rejected,
+            PairReason::SourceMissing,
+            runtime.source_retained("missing"),
+            None,
+        );
+        assert_eq!(error.source_retained, Some(false));
+        let data = serde_json::to_value(&error).unwrap();
+        assert_eq!(data["sourceRetained"], false);
+        assert_eq!(data["reason"], "source_missing");
+        let unknown = StartSendError::new(
+            &trace,
+            PairStage::RequestStart,
+            PairState::Error,
+            PairReason::SourceRegistryUnavailable,
+            None,
+            None,
+        );
+        assert!(serde_json::to_value(&unknown)
+            .unwrap()
+            .get("sourceRetained")
+            .is_none());
+    }
+
+    #[test]
+    fn connect_error_kinds_map_to_closed_reasons_without_raw_error_text() {
+        use std::io::ErrorKind;
+        assert_eq!(
+            connect_error_reason(&std::io::Error::from(ErrorKind::ConnectionRefused)),
+            PairReason::ConnectRefused
+        );
+        assert_eq!(
+            connect_error_reason(&std::io::Error::from(ErrorKind::TimedOut)),
+            PairReason::ConnectTimeout
+        );
+        assert_eq!(
+            connect_error_reason(&std::io::Error::from(ErrorKind::PermissionDenied)),
+            PairReason::PermissionDenied
+        );
+        assert_eq!(
+            connect_error_reason(&std::io::Error::from(ErrorKind::NotFound)),
+            PairReason::PeerUnavailable
+        );
+        assert_eq!(
+            connect_error_reason(&std::io::Error::from(ErrorKind::Other)),
+            PairReason::Io
+        );
+    }
+
+    #[test]
+    fn cloned_native_source_stays_registered_until_successful_take() {
+        let path =
+            std::env::temp_dir().join(format!("fling-native-source-{}.tmp", random_hex_id()));
+        let file = File::create(&path).unwrap();
+        let runtime = NativeLanRuntime::new();
+        runtime
+            .insert_source(
+                "opaque-source-id".into(),
+                NativeSource {
+                    _path: path.clone(),
+                    file,
+                    name: "safe-test-name".into(),
+                    size_bytes: 0,
+                    sha256: String::new(),
+                    total_chunks: 0,
+                },
+            )
+            .unwrap();
+        let clone = runtime
+            .inner
+            .sources
+            .lock()
+            .unwrap()
+            .get("opaque-source-id")
+            .unwrap()
+            .try_clone()
+            .unwrap();
+        drop(clone);
+        assert!(runtime
+            .inner
+            .sources
+            .lock()
+            .unwrap()
+            .contains_key("opaque-source-id"));
+        drop(runtime.take_source("opaque-source-id").unwrap());
+        assert!(!runtime
+            .inner
+            .sources
+            .lock()
+            .unwrap()
+            .contains_key("opaque-source-id"));
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn terminal_claim_suppresses_cleanup_after_pairing_failure_but_allows_disconnect() {
         let (tx, _rx) = watch::channel(false);
@@ -1242,21 +1852,55 @@ pub(crate) fn start_listener(
                     match listener.accept().await {
                         Ok((stream, remote)) => {
                             let runtime = app.state::<NativeLanRuntime>().inner().clone();
-                            if !runtime.is_enabled() || !is_local_network_address(remote.ip(), true)
-                            {
+                            let trace = new_pair_trace(PairRole::Receiver, None);
+                            trace.record(
+                                PairStage::TcpAccept,
+                                PairState::Ok,
+                                PairReason::None,
+                                None,
+                            );
+                            if !runtime.is_enabled() {
+                                trace.record(
+                                    PairStage::TcpAccept,
+                                    PairState::Rejected,
+                                    PairReason::LanDisabled,
+                                    None,
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                            if !is_local_network_address(remote.ip(), true) {
+                                trace.record(
+                                    PairStage::TcpAccept,
+                                    PairState::Rejected,
+                                    PairReason::EndpointNotEligible,
+                                    None,
+                                );
                                 drop(stream);
                                 continue;
                             }
                             let app = app.clone();
                             tauri::async_runtime::spawn(async move {
-                                if let Err(error) =
-                                    handle_incoming_pairing(app, runtime, stream, remote.ip()).await
+                                if let Err(error) = handle_incoming_pairing(
+                                    app,
+                                    runtime,
+                                    stream,
+                                    remote.ip(),
+                                    trace,
+                                )
+                                .await
                                 {
                                     eprintln!("{}", safe_failure_log("pairing-rejected", &error));
                                 }
                             });
                         }
                         Err(error) => {
+                            new_pair_trace(PairRole::Receiver, None).record(
+                                PairStage::TcpAccept,
+                                PairState::Error,
+                                connect_error_reason(&error),
+                                None,
+                            );
                             eprintln!(
                                 "{}",
                                 safe_failure_log("listener-accept", &error.to_string())
@@ -1278,33 +1922,97 @@ async fn handle_incoming_pairing(
     runtime: NativeLanRuntime,
     mut stream: TcpStream,
     remote_ip: IpAddr,
+    trace: PairTrace,
 ) -> Result<(), String> {
-    let hello = tokio::time::timeout(
+    let hello = run_pair_step(
+        &trace,
+        PairStage::HelloReceive,
         Duration::from_secs(10),
+        PairReason::HelloTimeout,
+        |_| PairReason::HelloReadOrInvalid,
+        None,
         native_lan::read_pairing_hello(&mut stream),
     )
     .await
-    .map_err(|_| "LAN pairing hello timed out".to_string())?
-    .map_err(|error| format!("read LAN pairing hello: {error}"))?;
-    if !runtime.peer_matches_endpoint(&hello.from_device_id, remote_ip) {
-        return Err("LAN pairing peer was not discovered at this address".to_string());
-    }
-    runtime.reserve_session_id(&hello.session_id)?;
-    let cfg = ensure_config(&app)?.1;
+    .map_err(|_| "LAN pairing hello failed".to_string())?;
+    validate_pair_condition(
+        &trace,
+        PairStage::HelloValidation,
+        runtime.peer_matches_endpoint(&hello.from_device_id, remote_ip),
+    )
+    .map_err(|_| "LAN pairing identity rejected".to_string())?;
+    runtime.reserve_session_id(&hello.session_id).map_err(|_| {
+        failed_pair_step(
+            &trace,
+            PairStage::HelloValidation,
+            PairState::Rejected,
+            PairReason::ReplayRejected,
+            None,
+        );
+        "LAN pairing replay rejected".to_string()
+    })?;
+    trace.record(
+        PairStage::SecureSession,
+        PairState::Start,
+        PairReason::None,
+        None,
+    );
+    let cfg = ensure_config(&app)
+        .map_err(|_| {
+            failed_pair_step(
+                &trace,
+                PairStage::SecureSession,
+                PairState::Error,
+                PairReason::ConfigUnavailable,
+                None,
+            );
+            "LAN pairing configuration unavailable".to_string()
+        })?
+        .1;
     let (ephemeral, local_hello) = native_lan::respond_to_pairing(
         &hello,
         &cfg.device_id,
         &cfg.device_name,
         &hello.from_device_id,
-    )?;
-    tokio::time::timeout(
+    )
+    .map_err(|_| {
+        failed_pair_step(
+            &trace,
+            PairStage::SecureSession,
+            PairState::Rejected,
+            PairReason::KeyAgreementRejected,
+            None,
+        );
+        "LAN pairing response rejected".to_string()
+    })?;
+    run_pair_step(
+        &trace,
+        PairStage::ResponseSend,
         Duration::from_secs(10),
+        PairReason::HelloTimeout,
+        |_| PairReason::HelloWrite,
+        None,
         native_lan::write_pairing_hello(&mut stream, &local_hello),
     )
     .await
-    .map_err(|_| "LAN pairing response timed out".to_string())?
-    .map_err(|error| format!("write LAN pairing response: {error}"))?;
-    let secure = native_lan::establish_local_session(ephemeral, &local_hello, &hello)?;
+    .map_err(|_| "LAN pairing response write failed".to_string())?;
+    let secure =
+        native_lan::establish_local_session(ephemeral, &local_hello, &hello).map_err(|_| {
+            failed_pair_step(
+                &trace,
+                PairStage::SecureSession,
+                PairState::Rejected,
+                PairReason::KeyAgreementRejected,
+                None,
+            );
+            "LAN secure session rejected".to_string()
+        })?;
+    trace.record(
+        PairStage::SecureSession,
+        PairState::Ok,
+        PairReason::None,
+        None,
+    );
     install_control_session(
         app,
         runtime,
@@ -1313,8 +2021,10 @@ async fn handle_incoming_pairing(
         PairingRole::Responder,
         hello.from_device_id,
         None,
+        trace,
     )
     .await
+    .map_err(|_| "LAN local pairing installation failed".to_string())
 }
 
 async fn install_control_session(
@@ -1325,23 +2035,33 @@ async fn install_control_session(
     role: PairingRole,
     peer_device_id: String,
     source: Option<NativeSource>,
-) -> Result<(), String> {
+    trace: PairTrace,
+) -> Result<(), PairStepFailure> {
+    trace.record(
+        PairStage::SessionInstall,
+        PairState::Start,
+        PairReason::None,
+        None,
+    );
+    let install_error = || {
+        failed_pair_step(
+            &trace,
+            PairStage::SessionInstall,
+            PairState::Error,
+            PairReason::SessionInstall,
+            None,
+        )
+    };
     let pending = PendingLocalPair::new(secure);
-    let session_id = pending
-        .session_id()
-        .ok_or_else(|| "pairing session metadata missing".to_string())?
-        .to_string();
-    let task_id = pending
-        .task_id()
-        .ok_or_else(|| "pairing task metadata missing".to_string())?
-        .to_string();
+    let session_id = pending.session_id().ok_or_else(install_error)?.to_string();
+    let task_id = pending.task_id().ok_or_else(install_error)?.to_string();
     let peer_device_label = pending
         .peer_device_label()
-        .ok_or_else(|| "pairing peer label missing".to_string())?
+        .ok_or_else(install_error)?
         .to_string();
     let verification_code = pending
         .verification_code()
-        .ok_or_else(|| "pairing verification code missing".to_string())?
+        .ok_or_else(install_error)?
         .to_string();
     let (control_tx, control_rx) = async_mpsc::channel(32);
     let (data_channel_tx, data_channel_rx) = async_mpsc::unbounded_channel();
@@ -1367,24 +2087,43 @@ async fn install_control_session(
         control_send_lock: AsyncMutex::new(()),
         cancel_tx,
     });
-    runtime.insert_session(session.clone())?;
+    runtime
+        .insert_session(session.clone())
+        .map_err(|_| install_error())?;
     let role_label = match role {
         PairingRole::Initiator => "initiator",
         PairingRole::Responder => "responder",
     };
-    emit_lan_event(
-        &app,
-        &runtime,
-        "fling://lan/pairing",
-        PairingEvent {
-            session_id,
-            task_id,
-            peer_device_id,
-            peer_device_label,
-            verification_code,
-            role: role_label,
-        },
+    let pairing_event = PairingEvent {
+        session_id: session_id.clone(),
+        task_id: task_id.clone(),
+        peer_device_id: peer_device_id.clone(),
+        peer_device_label: peer_device_label.clone(),
+        verification_code: verification_code.clone(),
+        role: role_label,
+        diagnostic_attempt: trace.id(),
+    };
+    let event_bytes = serde_json::to_vec(&pairing_event)
+        .map(|v| v.len())
+        .unwrap_or_default();
+    runtime.count_ipc("event:fling://lan/pairing", event_bytes);
+    trace.record(
+        PairStage::PromptEmit,
+        PairState::Start,
+        PairReason::None,
+        None,
     );
+    if app.emit("fling://lan/pairing", &pairing_event).is_err() {
+        runtime.remove_session(&session.session_id);
+        return Err(failed_pair_step(
+            &trace,
+            PairStage::PromptEmit,
+            PairState::Error,
+            PairReason::PromptEmitFailed,
+            None,
+        ));
+    }
+    trace.record(PairStage::PromptEmit, PairState::Ok, PairReason::None, None);
     transfer::start_data_channel_router(
         app.clone(),
         runtime.clone(),
@@ -1410,6 +2149,12 @@ async fn install_control_session(
     tauri::async_runtime::spawn(async move {
         run_control_reader(app, runtime, session, reader, cancel_rx).await;
     });
+    trace.record(
+        PairStage::SessionInstall,
+        PairState::Ok,
+        PairReason::None,
+        None,
+    );
     Ok(())
 }
 

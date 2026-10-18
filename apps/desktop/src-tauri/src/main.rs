@@ -25,6 +25,7 @@ static HISTORY_IO_LOCK: Mutex<()> = Mutex::new(());
 mod discovery_diagnostics;
 mod discovery_round;
 mod embedded_config;
+mod pairing_diagnostics;
 
 #[allow(dead_code)]
 mod native_lan;
@@ -1801,6 +1802,29 @@ async fn discovery_report_ui(
 }
 
 #[tauri::command]
+async fn pairing_report_ui(
+    phase: String,
+    ui_attempt: Option<u32>,
+    attempt: Option<u64>,
+) -> Result<(), String> {
+    let button = match phase.as_str() {
+        "button-clicked" if ui_attempt.is_some() && attempt.is_none() => true,
+        "prompt-received" if attempt.is_some() && ui_attempt.is_none() => false,
+        _ => return Err("无效的配对界面诊断类别".to_string()),
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        if button {
+            pairing_diagnostics::record_ui_button(ui_attempt.unwrap());
+        } else if !pairing_diagnostics::record_ui_prompt(attempt.unwrap()) {
+            return Err("配对诊断尝试记录已过期".to_string());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| "配对界面诊断任务失败".to_string())?
+}
+
+#[tauri::command]
 fn discovery_set_browsing(app: tauri::AppHandle, on: bool) -> Result<(), String> {
     app.state::<DiscoveryState>()
         .send(DiscoveryCmd::SetBrowsing(on));
@@ -2236,6 +2260,7 @@ fn main() {
             discovery_set_browsing,
             discovery_refresh,
             discovery_report_ui,
+            pairing_report_ui,
             discovery_export_diagnostics,
             discovery_set_discoverable,
             native_lan_runtime::native_lan_start_mode,

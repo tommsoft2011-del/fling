@@ -71,6 +71,10 @@ pub enum UiReason {
 
 #[derive(Clone, Debug)]
 pub enum Event {
+    Pairing(crate::pairing_diagnostics::PairEntry),
+    PairingUiButton {
+        ui_attempt: u32,
+    },
     Environment,
     DaemonInitSucceeded,
     DaemonInitFailed,
@@ -255,6 +259,11 @@ fn sanitize_computer_name(name: &str) -> String {
 
 fn fields(event: Event) -> (&'static str, Value) {
     match event {
+        Event::Pairing(entry) => ("pairing_stage", json!(entry)),
+        Event::PairingUiButton { ui_attempt } => (
+            "pairing_ui_button",
+            json!({"uiAttempt": ui_attempt, "scope": "this_ui_instance", "evidence": "button_report_received_by_native_not_handshake_started"}),
+        ),
         Event::Environment => (
             "environment",
             json!({

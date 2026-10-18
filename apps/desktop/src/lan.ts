@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { startFailureFeedback } from './lan-start-error';
 
 interface Peer {
   id: string;
@@ -28,6 +29,7 @@ interface PairRequest {
   peerDeviceLabel: string;
   verificationCode: string;
   role: 'initiator' | 'responder';
+  diagnosticAttempt?: number;
 }
 
 interface IncomingManifest {
@@ -72,6 +74,7 @@ const tasks = new Map<string, TaskView>();
 let source: SourceMetadata | null = null;
 let pickingSource = false;
 let startingSend = false;
+let uiSendAttempt = 0;
 const pairingFailures = new Map<string, string>();
 let selectedPair: PairRequest | null = null;
 let selectedManifest: IncomingManifest | null = null;
@@ -154,6 +157,7 @@ function updateSendEnabled(): void {
     : !source ? '请选择文件'
     : '已选择设备和文件，点击请求发送并核对短码';
   byId<HTMLButtonElement>('lanSend').disabled = pickingSource || startingSend || Boolean(selectedPair) || !source || !peerSelected;
+  byId<HTMLButtonElement>('lanPickSource').disabled = pickingSource || startingSend;
   byId<HTMLElement>('lanSendReason').textContent = reason;
   byId<HTMLElement>('lanSendReason').setAttribute('aria-label', reason);
   byId<HTMLButtonElement>('lanSend').setAttribute('aria-label', byId<HTMLButtonElement>('lanSend').disabled ? `请求发送，${reason}` : '请求发送');
@@ -264,6 +268,10 @@ function renderTasks(): void {
   byId<HTMLElement>('lanHistorySection').hidden = historyCount === 0;
 }
 
+function reportPairingUi(phase: 'button-clicked' | 'prompt-received', uiAttempt: number | null, attempt: number | null): void {
+  void invoke('pairing_report_ui', { phase, uiAttempt, attempt }).catch(() => {});
+}
+
 function showPair(request: PairRequest): void {
   selectedPair = request;
   if (!tasks.has(request.taskId)) {
@@ -288,6 +296,9 @@ function showPair(request: PairRequest): void {
   updateSendEnabled();
   setStatus('等待双方核对短码，尚未开始传输');
   byId<HTMLInputElement>('lanPeerCode').focus();
+  if (Number.isSafeInteger(request.diagnosticAttempt) && request.diagnosticAttempt! > 0) {
+    reportPairingUi('prompt-received', null, request.diagnosticAttempt!);
+  }
 }
 
 function hidePair(): void {
@@ -423,6 +434,7 @@ export async function initLanPage(): Promise<LanIdentity> {
   byId<HTMLSelectElement>('lanPeerSelect').onchange = updateSendEnabled;
   const pickButton = byId<HTMLButtonElement>('lanPickSource');
   pickButton.onclick = async () => {
+    if (startingSend) return;
     if (pickButton.disabled) return;
     const previousSource = source;
     const sourceInfo = byId<HTMLSpanElement>('lanSourceInfo');
@@ -462,13 +474,17 @@ export async function initLanPage(): Promise<LanIdentity> {
   };
   byId<HTMLButtonElement>('lanSend').onclick = async () => {
     const peerId = byId<HTMLSelectElement>('lanPeerSelect').value;
-    if (!source || !peerId || startingSend || selectedPair) return;
+    if (!source || !peerId || pickingSource || startingSend || selectedPair) return;
+    const requestedSource = source;
     startingSend = true;
+    uiSendAttempt = uiSendAttempt >= 0xffffffff ? 1 : uiSendAttempt + 1;
+    reportPairingUi('button-clicked', uiSendAttempt, null);
     updateSendEnabled();
     try {
       const taskId = await invoke<string>('native_lan_start_send', {
         peerId,
-        sourceId: source.sourceId,
+        sourceId: requestedSource.sourceId,
+        uiAttempt: uiSendAttempt,
       });
       const peer = peers.get(peerId);
       tasks.set(taskId, {
@@ -482,12 +498,22 @@ export async function initLanPage(): Promise<LanIdentity> {
         speedBps: 0,
       });
       renderTasks();
-      source = null;
-      byId<HTMLSpanElement>('lanSourceInfo').textContent = '文件已准备；对方接受后显示详情';
+      if (source?.sourceId === requestedSource.sourceId) {
+        source = null;
+        byId<HTMLSpanElement>('lanSourceInfo').textContent = '文件已准备；对方接受后显示详情';
+      }
       updateSendEnabled();
       setStatus(`已请求与 ${peer?.name ?? '目标设备'} 配对；双方都需要核对短码并确认`);
-    } catch {
-      setStatus('无法开始传输，请重新选择文件并重试', true);
+    } catch (error) {
+      const failure = startFailureFeedback(error);
+      if (failure.sourceRetained === false && source?.sourceId === requestedSource.sourceId) {
+        source = null;
+        byId<HTMLSpanElement>('lanSourceInfo').textContent = '所选文件已失效，请重新选择文件';
+      }
+      const sourceNote = failure.sourceRetained === true
+        ? ' 已保留所选文件，可直接重试。'
+        : failure.sourceRetained === undefined ? ' 文件选择未改动。' : '';
+      setStatus(failure.message + sourceNote, true);
     } finally {
       startingSend = false;
       updateSendEnabled();
