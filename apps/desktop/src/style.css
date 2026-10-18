@@ -607,6 +607,10 @@ label.filebtn { cursor: pointer; }
 .lan-content .card { margin-bottom: 12px; }
 .lan-status { margin: 10px 0; color: var(--accent); font-weight: 600; }
 .lan-status.error { color: var(--danger); }
+.lan-discovery-row { justify-content: space-between; flex-wrap: wrap; margin-bottom: 8px; }
+.lan-discovery-row .card-t { margin: 0; }
+#lanRefreshStatus { overflow-wrap: anywhere; }
+#lanRefreshStatus.error { color: var(--danger); }
 #lanPeerSelect { margin-top: 10px; }
 .lan-source-row { margin: 10px 0 12px; flex-wrap: wrap; }
 .lan-source-row .hint { min-width: 0; overflow-wrap: anywhere; }

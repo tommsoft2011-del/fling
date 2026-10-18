@@ -55,6 +55,7 @@ get('lanPickSource').textContent = '在本机选择文件';
 const events = new Map<string, (event: { payload: any }) => void>();
 const calls: { command: string; args: any }[] = [];
 let nextPick: Promise<unknown> = Promise.resolve(null);
+let nextRefresh: Promise<unknown> = Promise.resolve();
 let nextTask = 0;
 let currentMockPair = '';
 const progress = (taskId: string, phase: string, extra: Record<string, unknown> = {}) =>
@@ -66,6 +67,7 @@ mock.module('@tauri-apps/api/core', () => ({
     calls.push({ command, args });
     if (command === 'native_lan_start_mode') return { deviceId: 'a', deviceName: 'A' };
     if (command === 'native_lan_pick_source') return await nextPick;
+    if (command === 'discovery_refresh') return await nextRefresh;
     if (command === 'native_lan_start_send') return `test-send-${++nextTask}`;
     if (command === 'native_lan_pair_decision' && (!args.approved || args.peerCode !== '12345678')) {
       progress(currentMockPair, args.approved ? 'interrupted' : 'cancelled',
@@ -98,6 +100,14 @@ const detailsTag = html.match(/<details[^>]*id="lanDiagnostics"[^>]*>/)![0];
 assert.doesNotMatch(detailsTag, /\bopen(?:\s|=|>)/);
 assert.match(html, /<summary[^>]*>诊断信息<\/summary>/);
 console.log('ok - no-device disabled reason and diagnostics default collapsed (mock/static HTML)');
+
+await get('lanRefreshPeers').onclick!();
+assert.match(get('lanRefreshStatus').textContent, /已重新发起发现/);
+assert.doesNotMatch(get('lanRefreshStatus').textContent, /已找到|刷新完成/);
+assert.match(get('lanPeerStatus').textContent, /尚未发现附近设备/);
+assert.equal(get('lanSend').disabled, true);
+assert.equal(get('lanRefreshPeers').disabled, false);
+console.log('ok - empty-list refresh retries discovery without claiming a peer was found (mock)');
 
 events.get('fling://lan/peer-up')!({ payload: { id: 'peer-b', name: 'B' } });
 get('lanPeerSelect').value = 'peer-b';
@@ -270,4 +280,56 @@ assert.doesNotMatch(get('lanTasks').textContent, /private-meta|accepted/);
 assert.match(get('lanStatus').textContent, /已接收 1\.0 MiB，已保存 1\.0 MiB/);
 assert.match(html, /id="lanStatus"[^>]*role="status"[^>]*aria-live="polite"[^>]*aria-atomic="true"/);
 console.log('ok - consent hides metadata; native durable-complete cannot be overwritten by invoke result (mock)');
+
+const refresh = get('lanRefreshPeers');
+const refreshStatus = get('lanRefreshStatus');
+assert.match(html, /<button[^>]*id="lanRefreshPeers"[^>]*type="button"[^>]*aria-describedby="lanRefreshStatus"/);
+assert.match(html, /id="lanRefreshStatus"[^>]*role="status"[^>]*aria-live="polite"/);
+get('lanPeerSelect').value = 'peer-b';
+nextPick = Promise.resolve({ sourceId: 'opaque-source-refresh' });
+await button.onclick!();
+progress('refresh-active', 'sending', { name: 'active.bin', totalBytes: 100, receivedBytes: 50, savedBytes: 0 });
+const primaryBeforeRefresh = get('lanStatus').textContent;
+const activeBeforeRefresh = get('lanTasks').textContent;
+const historyBeforeRefresh = get('lanHistory').textContent;
+const sourceBeforeRefresh = info.textContent;
+let resolveRefresh!: () => void;
+nextRefresh = new Promise<void>((resolve) => { resolveRefresh = resolve; });
+const refreshCalls = () => calls.filter((call) => call.command === 'discovery_refresh');
+const beforeRefreshCalls = refreshCalls().length;
+const pendingRefresh = refresh.onclick!();
+assert.equal(refresh.disabled, true);
+assert.equal(refresh.textContent, '正在刷新…');
+assert.equal(refresh.attributes.get('aria-busy'), 'true');
+await refresh.onclick!(); // Programmatic activation must also respect the in-flight guard.
+assert.equal(refreshCalls().length, beforeRefreshCalls + 1);
+events.get('fling://lan/peer-up')!({ payload: { id: 'peer-c', name: 'C' } });
+resolveRefresh();
+await pendingRefresh;
+assert.equal(refresh.disabled, false);
+assert.equal(refresh.textContent, '刷新设备');
+assert.equal(refresh.attributes.get('aria-busy'), 'false');
+assert.match(refreshStatus.textContent, /已重新发起发现.*持续更新/);
+assert.match(get('lanPeerStatus').textContent, /发现 2 台/);
+assert.equal(get('lanPeerSelect').value, 'peer-b');
+assert.equal(info.textContent, sourceBeforeRefresh);
+assert.equal(send.disabled, false);
+assert.equal(get('lanStatus').textContent, primaryBeforeRefresh);
+assert.equal(get('lanTasks').textContent, activeBeforeRefresh);
+assert.equal(get('lanHistory').textContent, historyBeforeRefresh);
+nextRefresh = Promise.reject(new Error('raw-error session-secret'));
+await refresh.onclick!();
+assert.match(refreshStatus.textContent, /刷新设备失败，可重试/);
+assert.equal(refreshStatus.classList.contains('error'), true);
+assert.doesNotMatch(refreshStatus.textContent, /raw-error|session-secret/);
+assert.equal(refresh.disabled, false);
+nextRefresh = Promise.resolve();
+await refresh.onclick!();
+assert.equal(refreshStatus.classList.contains('error'), false);
+assert.equal(refreshCalls().length, beforeRefreshCalls + 3);
+assert.ok(refreshCalls().every((call) => call.args === undefined));
+assert.equal(get('lanStatus').textContent, primaryBeforeRefresh);
+assert.equal(get('lanTasks').textContent, activeBeforeRefresh);
+assert.equal(get('lanHistory').textContent, historyBeforeRefresh);
+console.log('ok - repeat refresh, in-flight dedup, error/retry, live peer update; selection/source/active transfer/history preserved (mock)');
 console.log('LAN picker/state/accessibility-contract harness passed. Native window and spoken-reader results remain separate.');

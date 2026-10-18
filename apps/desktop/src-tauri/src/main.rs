@@ -1118,12 +1118,33 @@ struct PeerDownPayload {
 
 enum DiscoveryCmd {
     SetBrowsing(bool),
+    Refresh {
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
     SetDiscoverable(bool),
     UpdateIdentity {
         device_id: String,
         device_name: String,
     },
 }
+
+/// Stop the old queryer before browsing again. mdns-sd serializes these daemon
+/// commands, and a new browse replays matching records from its cache.
+fn refresh_browse<T>(
+    browsing: &mut bool,
+    mut stop: impl FnMut() -> Result<(), String>,
+    browse: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    if *browsing {
+        stop().map_err(|e| format!("停止现有 mDNS browse 失败: {e}"))?;
+        *browsing = false;
+    }
+    let receiver = browse().map_err(|e| format!("重新启动 mDNS browse 失败: {e}"))?;
+    *browsing = true;
+    Ok(receiver)
+}
+
+const DISCOVERY_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct DiscoveryState {
     tx: mpsc::Sender<DiscoveryCmd>,
@@ -1276,6 +1297,38 @@ fn discovery_thread(
                     }
                 }
             }
+            Ok(DiscoveryCmd::Refresh { reply }) => {
+                let refreshed = refresh_browse(
+                    &mut browsing,
+                    || {
+                        daemon
+                            .stop_browse(MDNS_SERVICE_TYPE)
+                            .map_err(|e| e.to_string())
+                    },
+                    || daemon.browse(MDNS_SERVICE_TYPE).map_err(|e| e.to_string()),
+                );
+                let result = match refreshed {
+                    Ok(receiver) => {
+                        browse_rx = Some(receiver);
+                        // browse() only queues work; SearchStarted confirms daemon processing.
+                        match browse_rx
+                            .as_ref()
+                            .unwrap()
+                            .recv_timeout(DISCOVERY_REFRESH_TIMEOUT)
+                        {
+                            Ok(ServiceEvent::SearchStarted(_)) => Ok(()),
+                            Ok(event) => {
+                                Err(format!("mDNS browse 未返回启动确认 (收到 {event:?})"))
+                            }
+                            Err(error) => {
+                                Err(format!("等待 mDNS browse 启动确认超时或接收失败: {error}"))
+                            }
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
             Ok(DiscoveryCmd::SetDiscoverable(on)) => {
                 discoverable = on;
                 if on {
@@ -1380,6 +1433,26 @@ fn discovery_set_browsing(app: tauri::AppHandle, on: bool) -> Result<(), String>
     app.state::<DiscoveryState>()
         .send(DiscoveryCmd::SetBrowsing(on));
     Ok(())
+}
+
+#[tauri::command]
+async fn discovery_refresh(app: tauri::AppHandle) -> Result<(), String> {
+    let tx = app.state::<DiscoveryState>().tx.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (reply, result) = mpsc::sync_channel(1);
+        tx.send(DiscoveryCmd::Refresh { reply })
+            .map_err(|_| "mDNS discovery 线程已停止，无法刷新".to_string())?;
+        result
+            .recv_timeout(DISCOVERY_REFRESH_TIMEOUT + std::time::Duration::from_secs(1))
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => "等待 mDNS 刷新结果超时".to_string(),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    "mDNS discovery 线程未返回刷新结果".to_string()
+                }
+            })?
+    })
+    .await
+    .map_err(|error| format!("mDNS 刷新工作线程失败: {error}"))?
 }
 
 #[tauri::command]
@@ -1696,6 +1769,7 @@ fn main() {
             set_download_dir,
             pick_download_dir,
             discovery_set_browsing,
+            discovery_refresh,
             discovery_set_discoverable,
             native_lan_runtime::native_lan_start_mode,
             native_lan_runtime::native_lan_stop_mode,
@@ -1847,6 +1921,70 @@ mod tests {
         cleared.sort();
         assert_eq!(cleared, vec!["id1".to_string(), "id2".to_string()]);
         assert!(ps.insert("a._fling._tcp.local.", "id1"));
+    }
+
+    #[test]
+    fn discovery_refresh_restarts_repeatedly_without_touching_peers_or_announcing() {
+        let mut browsing = true;
+        let mut peers = PeerSet::default();
+        peers.insert("peer._fling._tcp.local.", "peer-id");
+        let mut stops = 0;
+        let mut starts = 0;
+        // This workflow owns browse operations only; no register/unregister path
+        // is called, and peer/runtime state is deliberately outside its scope.
+        for _ in 0..2 {
+            refresh_browse(
+                &mut browsing,
+                || {
+                    stops += 1;
+                    Ok(())
+                },
+                || {
+                    starts += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!((stops, starts), (2, 2));
+        assert!(browsing);
+        assert!(peers.known_ids.contains("peer-id"));
+        assert_eq!(peers.by_fullname.len(), 1);
+    }
+
+    #[test]
+    fn discovery_refresh_reports_stop_and_browse_errors_and_tracks_state() {
+        let mut browsing = true;
+        let mut browse_called = false;
+        let error = refresh_browse(
+            &mut browsing,
+            || Err("stop denied".to_string()),
+            || {
+                browse_called = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("停止现有 mDNS browse 失败"));
+        assert!(browsing);
+        assert!(!browse_called);
+
+        let error = refresh_browse(
+            &mut browsing,
+            || Ok(()),
+            || Err::<(), _>("browse denied".to_string()),
+        )
+        .unwrap_err();
+        assert!(error.contains("重新启动 mDNS browse 失败"));
+        assert!(!browsing);
+
+        refresh_browse(
+            &mut browsing,
+            || panic!("not browsing: stop must not be called"),
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(browsing);
     }
 
     #[test]

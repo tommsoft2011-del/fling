@@ -45,9 +45,13 @@
         </aside>
         <main class="lan-content">
           <section class="card">
-            <div class="card-t">附近设备</div>
+            <div class="row lan-discovery-row">
+              <div class="card-t">附近设备</div>
+              <button class="ghostbtn" id="lanRefreshPeers" type="button" aria-describedby="lanRefreshStatus">刷新设备</button>
+            </div>
             <div class="hint">只显示本地网络中发现的设备；此模式不会自动回退到云端。</div>
             <div id="lanPeerStatus" class="lan-status" role="status" aria-live="polite">正在发现设备…</div>
+            <div id="lanRefreshStatus" class="hint" role="status" aria-live="polite" aria-atomic="true">找不到对方时可刷新设备，无需重启应用。</div>
             <select id="lanPeerSelect" class="textinput" aria-label="选择目标设备">
               <option value="">等待附近设备…</option>
             </select>

@@ -350,6 +350,28 @@ export async function initLanPage(): Promise<LanIdentity> {
   unlisten.push(await listen<IncomingManifest>('fling://lan/manifest', ({ payload }) => showManifest(payload)));
   unlisten.push(await listen<LanProgress>('fling://lan/progress', ({ payload }) => applyProgress(payload)));
 
+  const refreshButton = byId<HTMLButtonElement>('lanRefreshPeers');
+  refreshButton.onclick = async () => {
+    if (refreshButton.disabled) return;
+    const status = byId<HTMLElement>('lanRefreshStatus');
+    refreshButton.disabled = true;
+    refreshButton.textContent = '正在刷新…';
+    refreshButton.setAttribute('aria-busy', 'true');
+    status.classList.toggle('error', false);
+    status.textContent = '正在重新发起局域网发现…';
+    try {
+      await invoke('discovery_refresh');
+      status.textContent = '已重新发起发现，列表会持续更新；仍找不到时可再次刷新。';
+    } catch {
+      status.textContent = '刷新设备失败，可重试；请检查本地网络和防火墙是否允许设备发现。';
+      status.classList.toggle('error', true);
+    } finally {
+      refreshButton.disabled = false;
+      refreshButton.textContent = '刷新设备';
+      refreshButton.setAttribute('aria-busy', 'false');
+    }
+  };
+
   byId<HTMLSelectElement>('lanPeerSelect').onchange = updateSendEnabled;
   const pickButton = byId<HTMLButtonElement>('lanPickSource');
   pickButton.onclick = async () => {
