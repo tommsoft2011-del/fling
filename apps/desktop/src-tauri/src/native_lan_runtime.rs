@@ -2830,6 +2830,37 @@ async fn read_control_observed<R: tokio::io::AsyncRead + Unpin>(
             error
         })
 }
+async fn read_control_candidate_bounded<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    session: &NativeLanSession,
+) -> Result<EncryptedControlFrame, String> {
+    let deadline = transfer::candidate_mismatch_deadline(session).map_err(|error| {
+        session.diagnostic.terminal(Tr::StateLock);
+        error
+    })?;
+    let expiry = async {
+        match deadline {
+            Some(deadline) => {
+                // An already-expired Sleep may await a timer-driver tick on its
+                // first poll. Explicitly fail before polling an always-ready stream.
+                if deadline > tokio::time::Instant::now() {
+                    tokio::time::sleep_until(deadline).await;
+                }
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = expiry => {
+            session.diagnostic.terminal(Tr::CandidateMismatchTimeout);
+            Err("LAN ICE endpoint match timed out".into())
+        }
+        frame = read_control_observed(reader, &session.diagnostic) => {
+            frame.map_err(|error| format!("LAN control read failed: {error}"))
+        }
+    }
+}
 async fn run_control_reader(
     app: AppHandle,
     runtime: NativeLanRuntime,
@@ -2843,10 +2874,10 @@ async fn run_control_reader(
                 if changed.is_err() || *cancel_rx.borrow() { break "LAN session cancelled".to_string(); }
                 continue;
             }
-            frame = read_control_observed(&mut reader, &session.diagnostic) => {
+            frame = read_control_candidate_bounded(&mut reader, &session) => {
                 match frame {
                     Ok(frame) => frame,
-                    Err(error) => { break format!("LAN control read failed: {error}"); },
+                    Err(error) => { break error; },
                 }
             }
         };

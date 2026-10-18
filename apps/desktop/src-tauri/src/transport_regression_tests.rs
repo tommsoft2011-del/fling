@@ -224,10 +224,6 @@ async fn candidate_validation_has_one_rejection_category_per_received_payload() 
             ice_payload("candidate:CANDIDATE_MARKER 1 udp 9 203.0.113.42 49157 typ host"),
             "candidate_non_local",
         ),
-        (
-            ice_payload("candidate:CANDIDATE_MARKER 1 udp 9 192.168.246.19 49157 typ host"),
-            "candidate_peer_mismatch",
-        ),
     ];
     let cases = cases.into_iter().chain([
         (ice_payload("CANDIDATE_MARKER"), "candidate_malformed_line"),
@@ -776,7 +772,7 @@ fn first_rejected_candidate_context_is_fixed_and_never_emits_per_candidate_logs(
     );
 }
 #[tokio::test]
-async fn authenticated_answer_ok_then_unadvertised_host_preserves_real_terminal_cleanup_path() {
+async fn authenticated_reader_skips_link_local_mismatch_then_adds_exact_private_endpoint() {
     let (mut a, b, at, _, mut ar, mut br) = authenticated_pair();
     let (dc_tx, mut dc_rx) = async_mpsc::unbounded_channel();
     a.data_channel_tx = dc_tx;
@@ -808,23 +804,132 @@ async fn authenticated_answer_ok_then_unadvertised_host_preserves_real_terminal_
     runtime.insert_session(a.clone()).unwrap();
     let mismatch = NativeControlMessage::P2pIce {
         candidate: Some(ice_payload(
-            "candidate:CANDIDATE_MARKER 1 udp 9 192.168.247.23 49157 typ host",
+            "candidate:CANDIDATE_MARKER 1 udp 9 169.254.247.23 49157 typ host",
         )),
     };
     send_authenticated_control(&b, mismatch).await.unwrap();
     let frame = br.recv().await.unwrap();
+    let (mut writer, mut reader) = tokio::io::duplex(8192);
+    native_lan::write_control_frame(&mut writer, &frame)
+        .await
+        .unwrap();
+    let frame = super::super::read_control_candidate_bounded(&mut reader, &a)
+        .await
+        .unwrap();
     let ControlOutcome::Message(message) = process_control_frame(&a, &frame).unwrap() else {
         panic!("authenticated ICE")
+    };
+    assert!(route_transport_control(&runtime, &a, message).await.is_ok());
+    assert!(runtime.session(&a.session_id).is_ok());
+    assert!(a.transfer.lock().unwrap().pending_remote_ice.is_empty());
+    assert!(!entries(&at)
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["transport"]["phase"] == "first_terminal"));
+    assert!(candidate_mismatch_deadline(&a).unwrap().is_some());
+    send_authenticated_control(
+        &b,
+        NativeControlMessage::P2pIce {
+            candidate: Some(ice_payload(
+                "candidate:MATCHED_MARKER 1 udp 9 192.168.246.19 49157 typ host",
+            )),
+        },
+    )
+    .await
+    .unwrap();
+    native_lan::write_control_frame(&mut writer, &br.recv().await.unwrap())
+        .await
+        .unwrap();
+    let frame = super::super::read_control_candidate_bounded(&mut reader, &a)
+        .await
+        .unwrap();
+    let ControlOutcome::Message(message) = process_control_frame(&a, &frame).unwrap() else {
+        panic!("authenticated ICE")
+    };
+    route_transport_control(&runtime, &a, message)
+        .await
+        .unwrap();
+    assert!(candidate_mismatch_deadline(&a).unwrap().is_none());
+    a.diagnostic.snapshot();
+    let value = entries(&at);
+    let last = value.as_array().unwrap().last().unwrap();
+    assert_eq!(last["transport"]["candidateSteps"]["added"], 1);
+    assert_eq!(last["transport"]["candidateSteps"]["received"], 2);
+    assert!(last["transport"].get("firstTerminal").is_none());
+    // Same authenticated stream, native remote SDP already installed. Matched
+    // duplicate candidates still consume the total input budget, not just pending.
+    for _ in 2..MAX_REMOTE_ICE_INPUTS {
+        send_authenticated_control(
+            &b,
+            NativeControlMessage::P2pIce {
+                candidate: Some(ice_payload(
+                    "candidate:MATCHED_MARKER 1 udp 9 192.168.246.19 49157 typ host",
+                )),
+            },
+        )
+        .await
+        .unwrap();
+        native_lan::write_control_frame(&mut writer, &br.recv().await.unwrap())
+            .await
+            .unwrap();
+        let frame = super::super::read_control_candidate_bounded(&mut reader, &a)
+            .await
+            .unwrap();
+        let ControlOutcome::Message(message) = process_control_frame(&a, &frame).unwrap() else {
+            panic!("ICE")
+        };
+        route_transport_control(&runtime, &a, message)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        a.transfer.lock().unwrap().remote_ice_inputs,
+        MAX_REMOTE_ICE_INPUTS
+    );
+    send_authenticated_control(
+        &b,
+        NativeControlMessage::P2pIce {
+            candidate: Some(ice_payload(
+                "candidate:MATCHED_MARKER 1 udp 9 192.168.246.19 49157 typ host",
+            )),
+        },
+    )
+    .await
+    .unwrap();
+    native_lan::write_control_frame(&mut writer, &br.recv().await.unwrap())
+        .await
+        .unwrap();
+    let frame = super::super::read_control_candidate_bounded(&mut reader, &a)
+        .await
+        .unwrap();
+    let ControlOutcome::Message(message) = process_control_frame(&a, &frame).unwrap() else {
+        panic!("ICE")
     };
     assert!(route_transport_control(&runtime, &a, message)
         .await
         .is_err());
+    assert_eq!(
+        a.transfer.lock().unwrap().remote_ice_inputs,
+        MAX_REMOTE_ICE_INPUTS
+    );
     assert!(has(
         &at,
         "first_terminal",
         "error",
-        "candidate_peer_mismatch"
+        "candidate_input_budget"
     ));
+    a.diagnostic.snapshot();
+    let bounded = entries(&at);
+    let bounded = bounded.as_array().unwrap().last().unwrap();
+    assert_eq!(
+        bounded["transport"]["candidateSteps"]["added"],
+        MAX_REMOTE_ICE_INPUTS - 1
+    );
+    assert_eq!(
+        bounded["transport"]["candidateSteps"]["received"],
+        MAX_REMOTE_ICE_INPUTS
+    );
     runtime.remove_session(&a.session_id);
     assert!(has(&at, "cleanup", "start", "session_removal"));
     let value = entries(&at);
@@ -837,9 +942,9 @@ async fn authenticated_answer_ok_then_unadvertised_host_preserves_real_terminal_
     let context = &summary["transport"]["firstRejectedCandidate"];
     assert_eq!(
         context,
-        &serde_json::json!({"family":"ipv4","lanClass":"private_ipv4","endpointMatched":false})
+        &serde_json::json!({"family":"ipv4","lanClass":"link_local_ipv4","endpointMatched":false})
     );
-    assert_eq!(summary["transport"]["candidateSteps"]["added"], 0);
+    assert_eq!(summary["transport"]["candidateSteps"]["added"], 1);
     assert_eq!(summary["transport"]["candidateSteps"]["rejected"], 1);
     assert_eq!(
         value
@@ -852,13 +957,417 @@ async fn authenticated_answer_ok_then_unadvertised_host_preserves_real_terminal_
     );
     for marker in [
         "192.168.246.19",
-        "192.168.247.23",
+        "169.254.247.23",
         "49157",
         "CANDIDATE_MARKER",
+        "MATCHED_MARKER",
         "SERVICE_ID_MARKER",
     ] {
         assert!(!value.to_string().contains(marker));
     }
     close(&b);
     channel.close();
+}
+
+const UNADVERTISED: &str = "candidate:MISMATCH_MARKER 1 udp 9 169.254.247.23 49157 typ host";
+
+#[tokio::test]
+async fn all_mismatches_fail_at_fixed_budget_without_adding_and_cleanup_closes_auth() {
+    let (a, b, at, _, _ar, mut br) = authenticated_pair();
+    let runtime = NativeLanRuntime::new();
+    let a = Arc::new(a);
+    let _reader_cancel = a.cancel_tx.subscribe();
+    runtime.insert_session(a.clone()).unwrap();
+    let (mut writer, mut reader) = tokio::io::duplex(8192);
+    let mut first_deadline = None;
+    for n in 1..=MAX_CANDIDATE_MISMATCHES {
+        send_authenticated_control(
+            &b,
+            NativeControlMessage::P2pIce {
+                candidate: Some(ice_payload(UNADVERTISED)),
+            },
+        )
+        .await
+        .unwrap();
+        native_lan::write_control_frame(&mut writer, &br.recv().await.unwrap())
+            .await
+            .unwrap();
+        let frame = super::super::read_control_candidate_bounded(&mut reader, &a)
+            .await
+            .unwrap();
+        let ControlOutcome::Message(message) = process_control_frame(&a, &frame).unwrap() else {
+            panic!("ICE")
+        };
+        let result = route_transport_control(&runtime, &a, message).await;
+        if n < MAX_CANDIDATE_MISMATCHES {
+            assert!(result.is_ok());
+        } else {
+            assert!(result.is_err());
+        }
+        let deadline = candidate_mismatch_deadline(&a).unwrap();
+        if n == 1 {
+            first_deadline = deadline;
+        }
+        assert_eq!(deadline, first_deadline, "mismatch must not renew deadline");
+        assert!(a.transfer.lock().unwrap().pending_remote_ice.is_empty());
+    }
+    assert!(has(
+        &at,
+        "first_terminal",
+        "error",
+        "candidate_mismatch_budget"
+    ));
+    assert!(!a.completed.load(std::sync::atomic::Ordering::Acquire));
+    runtime.remove_session(&a.session_id);
+    assert!(runtime.session(&a.session_id).is_err());
+    assert!(*a.cancel_tx.borrow());
+    assert!(matches!(
+        *a.auth.lock().unwrap(),
+        super::super::LocalAuthState::Closed
+    ));
+    let value = entries(&at);
+    let summary = value
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|row| row["transport"]["phase"] == "candidate_summary")
+        .unwrap();
+    assert_eq!(summary["transport"]["candidateSteps"]["added"], 0);
+    assert_eq!(
+        summary["transport"]["candidateSteps"]["rejected"],
+        MAX_CANDIDATE_MISMATCHES
+    );
+    assert!(has(&at, "cleanup", "start", "session_removal"));
+    for marker in ["MISMATCH_MARKER", "169.254.247.23", "49157"] {
+        assert!(!value.to_string().contains(marker));
+    }
+    close(&b);
+}
+
+#[tokio::test]
+async fn mismatch_deadline_bounds_silent_partial_and_busy_control_streams() {
+    for mode in ["silent", "partial", "ready"] {
+        let (a, b, at, _, _ar, mut br) = authenticated_pair();
+        let runtime = NativeLanRuntime::new();
+        let a = Arc::new(a);
+        runtime.insert_session(a.clone()).unwrap();
+        route_transport_control(
+            &runtime,
+            &a,
+            NativeControlMessage::P2pIce {
+                candidate: Some(ice_payload(UNADVERTISED)),
+            },
+        )
+        .await
+        .unwrap();
+        let original = candidate_mismatch_deadline(&a).unwrap().unwrap();
+        assert!(original <= tokio::time::Instant::now() + CANDIDATE_MISMATCH_TIMEOUT);
+        let (mut writer, mut reader) = tokio::io::duplex(8192);
+        if mode == "partial" {
+            use tokio::io::AsyncWriteExt;
+            writer.write_all(&[0]).await.unwrap();
+        } else if mode == "ready" {
+            send_authenticated_control(&b, NativeControlMessage::P2pIce { candidate: None })
+                .await
+                .unwrap();
+            native_lan::write_control_frame(&mut writer, &br.recv().await.unwrap())
+                .await
+                .unwrap();
+        }
+        // Accelerate the same production absolute deadline, not a per-read timeout.
+        a.transfer.lock().unwrap().candidate_mismatch.deadline = Some(if mode == "ready" {
+            tokio::time::Instant::now() - Duration::from_millis(1)
+        } else {
+            tokio::time::Instant::now() + Duration::from_millis(20)
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::super::read_control_candidate_bounded(&mut reader, &a),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err(), "{mode}");
+        assert!(has(
+            &at,
+            "first_terminal",
+            "error",
+            "candidate_mismatch_timeout"
+        ));
+        runtime.remove_session(&a.session_id);
+        assert!(has(&at, "cleanup", "start", "session_removal"));
+        assert!(a.transfer.lock().unwrap().pending_remote_ice.is_empty());
+        assert!(!a.completed.load(std::sync::atomic::Ordering::Acquire));
+        close(&b);
+    }
+}
+
+#[test]
+fn mismatch_budget_is_constant_space_saturating_and_not_renewed() {
+    let mut budget = CandidateMismatchBudget::default();
+    assert!(budget.reject().is_ok());
+    let deadline = budget.deadline;
+    for _ in 1..MAX_CANDIDATE_MISMATCHES - 1 {
+        assert!(budget.reject().is_ok());
+    }
+    for _ in 0..10000 {
+        assert!(budget.reject().is_err());
+    }
+    assert_eq!(budget.rejected, MAX_CANDIDATE_MISMATCHES);
+    assert_eq!(budget.deadline, deadline);
+    budget.added();
+    assert!(budget.deadline.is_none());
+    assert!(
+        budget.reject().is_err(),
+        "adding never replenishes rejection budget"
+    );
+    assert!(budget.deadline.is_none());
+}
+
+#[tokio::test]
+async fn mismatch_tolerance_does_not_soften_malformed_or_unauthenticated_candidates() {
+    let runtime = NativeLanRuntime::new();
+    let mut missing_mid: IceCandidateInit =
+        serde_json::from_str(&ice_payload(UNADVERTISED)).unwrap();
+    missing_mid.sdp_mid = None;
+    let mut missing_mline: IceCandidateInit =
+        serde_json::from_str(&ice_payload(UNADVERTISED)).unwrap();
+    missing_mline.sdp_mline_index = None;
+    for (payload, reason) in [
+        (
+            serde_json::to_string(&missing_mid).unwrap(),
+            "candidate_missing_mid",
+        ),
+        (
+            serde_json::to_string(&missing_mline).unwrap(),
+            "candidate_missing_mline",
+        ),
+        (
+            ice_payload("candidate:MARKER 1 udp 9 169.254.247.23 BAD_PORT typ host"),
+            "candidate_parse",
+        ),
+        (
+            ice_payload("candidate:MARKER 1 udp 9 169.254.247.23 49157 typ srflx"),
+            "candidate_non_host",
+        ),
+        (
+            ice_payload("candidate:MARKER 1 udp 9 203.0.113.42 49157 typ host"),
+            "candidate_non_local",
+        ),
+        ("x".repeat(4097), "candidate_payload_bound"),
+        ("INVALID_MARKER".into(), "candidate_payload_malformed"),
+    ] {
+        let (a, b, at, _, _ar, _br) = authenticated_pair();
+        route_transport_control(
+            &runtime,
+            &a,
+            NativeControlMessage::P2pIce {
+                candidate: Some(ice_payload(UNADVERTISED)),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(route_transport_control(
+            &runtime,
+            &a,
+            NativeControlMessage::P2pIce {
+                candidate: Some(payload)
+            }
+        )
+        .await
+        .is_err());
+        assert!(has(&at, "first_terminal", "error", reason), "{reason}");
+        assert_eq!(a.transfer.lock().unwrap().candidate_mismatch.rejected, 1);
+        close(&a);
+        close(&b);
+    }
+    let (a, b, at, _, _ar, _br) = authenticated_pair();
+    *a.auth.lock().unwrap() = super::super::LocalAuthState::Closed;
+    assert!(route_transport_control(
+        &runtime,
+        &a,
+        NativeControlMessage::P2pIce {
+            candidate: Some(ice_payload(UNADVERTISED))
+        }
+    )
+    .await
+    .is_err());
+    assert!(has(&at, "first_terminal", "error", "control_decode"));
+    assert_eq!(a.transfer.lock().unwrap().candidate_mismatch.rejected, 0);
+    close(&a);
+    close(&b);
+}
+
+#[tokio::test]
+async fn each_post_mismatch_candidate_uses_authenticated_device_and_current_endpoint_set() {
+    let (a, b, at, _, _ar, _br) = authenticated_pair();
+    let runtime = NativeLanRuntime::new();
+    let candidate = "candidate:MARKER 1 udp 9 192.168.246.19 49157 typ host";
+    let endpoint: SocketAddr = "192.168.246.19:49157".parse().unwrap();
+    runtime.upsert_peer("FOREIGN_SERVICE", "FOREIGN_DEVICE", "NAME", vec![endpoint]);
+    for action in ["foreign_only", "matching", "removed", "mapped_matching"] {
+        if action == "matching" || action == "mapped_matching" {
+            let advertised = if action == "mapped_matching" {
+                "[::ffff:192.168.246.19]:49157".parse().unwrap()
+            } else {
+                endpoint
+            };
+            runtime.upsert_peer("SERVICE", &a.peer_device_id, "NAME", vec![advertised]);
+        } else if action == "removed" {
+            runtime.remove_peer("SERVICE");
+        }
+        // Preserve the existing mapped-address comparison compatibility without
+        // broadening the earlier LAN address eligibility gate for IPv6 candidates.
+        let line = candidate;
+        route_transport_control(
+            &runtime,
+            &a,
+            NativeControlMessage::P2pIce {
+                candidate: Some(ice_payload(line)),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let state = a.transfer.lock().unwrap();
+    assert_eq!(state.candidate_mismatch.rejected, 2);
+    assert_eq!(state.pending_remote_ice.len(), 2);
+    drop(state);
+    assert!(!entries(&at)
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["transport"]["phase"] == "first_terminal"));
+    close(&a);
+    close(&b);
+}
+
+#[tokio::test]
+async fn other_handler_errors_after_tolerated_mismatch_keep_terminal_and_cleanup() {
+    let (a, b, at, _, _ar, _br) = authenticated_pair();
+    let runtime = NativeLanRuntime::new();
+    let a = Arc::new(a);
+    runtime.insert_session(a.clone()).unwrap();
+    route_transport_control(
+        &runtime,
+        &a,
+        NativeControlMessage::P2pIce {
+            candidate: Some(ice_payload(UNADVERTISED)),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(route_transport_control(
+        &runtime,
+        &a,
+        NativeControlMessage::P2pAnswer {
+            sdp: "INVALID_SDP_MARKER".into()
+        }
+    )
+    .await
+    .is_err());
+    assert!(has(&at, "first_terminal", "error", "sdp_policy"));
+    runtime.remove_session(&a.session_id);
+    assert!(has(&at, "cleanup", "start", "session_removal"));
+    assert!(runtime.session(&a.session_id).is_err());
+    close(&b);
+}
+
+#[tokio::test]
+async fn mismatch_frames_cannot_bypass_pending_auth_identity_or_decryption() {
+    for mode in ["pending", "foreign_identity", "ciphertext", "closed"] {
+        let (a, b, _at, _, _ar, mut br) = authenticated_pair();
+        send_authenticated_control(
+            &b,
+            NativeControlMessage::P2pIce {
+                candidate: Some(ice_payload(UNADVERTISED)),
+            },
+        )
+        .await
+        .unwrap();
+        let mut frame = br.recv().await.unwrap();
+        let (pending, other_pending, _, _, _) = observed_pair();
+        let target = if mode == "pending" { &pending } else { &a };
+        if mode == "foreign_identity" {
+            frame.from_device_id = "FOREIGN_ID_MARKER".into();
+        }
+        if mode == "ciphertext" {
+            frame.ct = "INVALID_CIPHERTEXT_MARKER".into();
+        }
+        if mode == "closed" {
+            *a.auth.lock().unwrap() = super::super::LocalAuthState::Closed;
+        }
+        assert!(process_control_frame(target, &frame).is_err(), "{mode}");
+        assert_eq!(
+            target.transfer.lock().unwrap().candidate_mismatch.rejected,
+            0
+        );
+        assert!(target
+            .transfer
+            .lock()
+            .unwrap()
+            .pending_remote_ice
+            .is_empty());
+        close(&a);
+        close(&b);
+        close(&pending);
+        close(&other_pending);
+    }
+}
+
+#[tokio::test]
+async fn remote_ice_total_budget_counts_empty_frames_and_never_grows_or_resets() {
+    let (a, b, at, _, _ar, _br) = authenticated_pair();
+    let runtime = NativeLanRuntime::new();
+    let a = Arc::new(a);
+    runtime.insert_session(a.clone()).unwrap();
+    for n in 1..=MAX_REMOTE_ICE_INPUTS {
+        route_transport_control(
+            &runtime,
+            &a,
+            NativeControlMessage::P2pIce { candidate: None },
+        )
+        .await
+        .unwrap();
+        assert_eq!(a.transfer.lock().unwrap().remote_ice_inputs, n);
+        if n == MAX_REMOTE_ICE_INPUTS / 2 {
+            a.transfer.lock().unwrap().remote_description_set = true;
+            a.transfer.lock().unwrap().candidate_mismatch.added();
+        }
+    }
+    assert!(route_transport_control(
+        &runtime,
+        &a,
+        NativeControlMessage::P2pIce { candidate: None }
+    )
+    .await
+    .is_err());
+    let log_count = at.captured_entries().len();
+    for _ in 0..10000 {
+        assert!(route_transport_control(
+            &runtime,
+            &a,
+            NativeControlMessage::P2pIce {
+                candidate: Some(ice_payload(LOCAL))
+            }
+        )
+        .await
+        .is_err());
+    }
+    assert_eq!(
+        a.transfer.lock().unwrap().remote_ice_inputs,
+        MAX_REMOTE_ICE_INPUTS
+    );
+    assert!(a.transfer.lock().unwrap().pending_remote_ice.is_empty());
+    assert_eq!(at.captured_entries().len(), log_count);
+    assert!(has(
+        &at,
+        "first_terminal",
+        "error",
+        "candidate_input_budget"
+    ));
+    runtime.remove_session(&a.session_id);
+    assert!(has(&at, "cleanup", "start", "session_removal"));
+    assert!(!a.completed.load(std::sync::atomic::Ordering::Acquire));
+    close(&b);
 }

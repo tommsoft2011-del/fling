@@ -43,11 +43,49 @@ const CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const PROGRESS_MIN_BYTES: u64 = 1024 * 1024;
 const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_PENDING_ICE: usize = 128;
-
+const MAX_REMOTE_ICE_INPUTS: u16 = 256;
+const MAX_CANDIDATE_MISMATCHES: u8 = 16;
+const CANDIDATE_MISMATCH_TIMEOUT: Duration = Duration::from_secs(30);
+#[derive(Default)]
+struct CandidateMismatchBudget {
+    rejected: u8,
+    added: bool,
+    deadline: Option<tokio::time::Instant>,
+}
+impl CandidateMismatchBudget {
+    fn reject(&mut self) -> Result<(), String> {
+        self.rejected = self
+            .rejected
+            .saturating_add(1)
+            .min(MAX_CANDIDATE_MISMATCHES);
+        if !self.added && self.deadline.is_none() {
+            self.deadline = Some(tokio::time::Instant::now() + CANDIDATE_MISMATCH_TIMEOUT);
+        }
+        if self.rejected >= MAX_CANDIDATE_MISMATCHES {
+            return Err("LAN ICE endpoint mismatch budget exhausted".into());
+        }
+        Ok(())
+    }
+    fn added(&mut self) {
+        self.added = true;
+        self.deadline = None;
+    }
+}
+pub(super) fn candidate_mismatch_deadline(
+    session: &NativeLanSession,
+) -> Result<Option<tokio::time::Instant>, String> {
+    session
+        .transfer
+        .lock()
+        .map(|transfer| transfer.candidate_mismatch.deadline)
+        .map_err(|_| "LAN transfer state lock".into())
+}
 pub(super) struct TransferState {
     pc: Option<PeerConnection>,
     data_channel: Option<DataChannel>,
     pending_remote_ice: Vec<String>,
+    candidate_mismatch: CandidateMismatchBudget,
+    remote_ice_inputs: u16,
     remote_description_set: bool,
     pending_manifest: Option<NativeFileManifest>,
     outgoing_manifest: Option<NativeFileManifest>,
@@ -63,6 +101,8 @@ impl Default for TransferState {
             pc: None,
             data_channel: None,
             pending_remote_ice: Vec::new(),
+            candidate_mismatch: CandidateMismatchBudget::default(),
+            remote_ice_inputs: 0,
             remote_description_set: false,
             pending_manifest: None,
             outgoing_manifest: None,
@@ -497,6 +537,24 @@ async fn route_transport_control(
         NativeControlMessage::P2pOffer { sdp } => handle_offer(session, sdp).await?,
         NativeControlMessage::P2pAnswer { sdp } => handle_answer(session, sdp).await?,
         NativeControlMessage::P2pIce { candidate } => {
+            // Count every remote ICE input, including duplicate/matched candidates
+            // after remote SDP and empty end-of-candidates frames. Never reset.
+            let exhausted = {
+                let mut transfer = session
+                    .transfer
+                    .lock()
+                    .map_err(|_| "LAN transfer state lock".to_string())?;
+                if transfer.remote_ice_inputs >= MAX_REMOTE_ICE_INPUTS {
+                    true
+                } else {
+                    transfer.remote_ice_inputs += 1;
+                    false
+                }
+            };
+            if exhausted {
+                session.diagnostic.terminal(Tr::CandidateInputBudget);
+                return Err("LAN remote ICE input budget exhausted".into());
+            }
             if let Some(candidate) = candidate {
                 receive_ice_candidate(runtime, session, candidate).await?;
             }
@@ -777,6 +835,34 @@ async fn receive_ice_candidate(
         }
     };
     if let Err((reason, error)) = classify_peer_candidate(runtime, session, &init.candidate) {
+        if reason == Tr::CandidatePeerMismatch {
+            // Only a fully well-formed host/LAN candidate from an authenticated
+            // stream may be skipped. Never add or retain an unmatched candidate.
+            let authenticated = session
+                .auth
+                .lock()
+                .map(|auth| matches!(*auth, super::LocalAuthState::Authenticated(_)))
+                .unwrap_or(false);
+            if !authenticated {
+                return rejected(
+                    session,
+                    Tr::ControlDecode,
+                    "LAN ICE requires authentication".into(),
+                );
+            }
+            parse_remote_ice(session, &init).map_err(|(_, error)| error)?;
+            session.diagnostic.candidate_rejected(reason);
+            let result = session
+                .transfer
+                .lock()
+                .map_err(|_| "LAN transfer state lock".to_string())?
+                .candidate_mismatch
+                .reject();
+            if result.is_err() {
+                session.diagnostic.terminal(Tr::CandidateMismatchBudget);
+            }
+            return result;
+        }
         return rejected(session, reason, error);
     }
     let ready = {
@@ -838,6 +924,33 @@ async fn add_remote_ice_classified(
             )
         }
     };
+    let candidate = parse_remote_ice(session, &init)?;
+    let peer = match current_peer(session) {
+        Ok(peer) => peer,
+        Err(error) => return rejected_classified(session, Tr::PeerNotReady, error),
+    };
+    match peer.add_ice_candidate(candidate).await {
+        Ok(()) => {
+            session.diagnostic.count(Cs::Added, 1);
+            session
+                .transfer
+                .lock()
+                .map_err(|_| (Tr::StateLock, "LAN transfer state lock".into()))?
+                .candidate_mismatch
+                .added();
+            Ok(())
+        }
+        Err(error) => rejected_classified(
+            session,
+            Tr::CandidateAdd,
+            format!("add LAN ICE candidate: {error}"),
+        ),
+    }
+}
+fn parse_remote_ice(
+    session: &NativeLanSession,
+    init: &IceCandidateInit,
+) -> Result<IceCandidate, (Tr, String)> {
     let Some(mid) = init.sdp_mid.as_deref() else {
         return rejected_classified(
             session,
@@ -852,29 +965,12 @@ async fn add_remote_ice_classified(
             "ICE candidate missing sdpMLineIndex".into(),
         );
     };
-    let candidate = match IceCandidate::parse(mid, mline, &init.candidate) {
-        Ok(candidate) => candidate,
-        Err(error) => {
-            return rejected_classified(
-                session,
-                Tr::CandidateParse,
-                format!("parse LAN ICE candidate: {error}"),
-            )
-        }
-    };
-    let peer = match current_peer(session) {
-        Ok(peer) => peer,
-        Err(error) => return rejected_classified(session, Tr::PeerNotReady, error),
-    };
-    match peer.add_ice_candidate(candidate).await {
-        Ok(()) => {
-            session.diagnostic.count(Cs::Added, 1);
-            Ok(())
-        }
+    match IceCandidate::parse(mid, mline, &init.candidate) {
+        Ok(candidate) => Ok(candidate),
         Err(error) => rejected_classified(
             session,
-            Tr::CandidateAdd,
-            format!("add LAN ICE candidate: {error}"),
+            Tr::CandidateParse,
+            format!("parse LAN ICE candidate: {error}"),
         ),
     }
 }
