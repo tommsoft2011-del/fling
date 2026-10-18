@@ -463,6 +463,80 @@ mod tests {
         std::env::temp_dir().join(format!("fling-diagnostics-test-{}", rand::random::<u64>()))
     }
     #[test]
+    fn candidate_diagnostic_export_never_contains_raw_network_or_identifier_sentinels() {
+        use crate::pairing_diagnostics::{
+            new_pair_trace, CandidateDiagnostic, PairReason, PairRole, PairStage, PairState,
+            SourceFingerprint,
+        };
+        let root = temp();
+        let path = root.join("discovery-diagnostics").join("discovery.log");
+        let sentinels = [
+            "SERVICE_ID_SENTINEL._fling._tcp.local.",
+            "DEVICE_ID_SENTINEL",
+            "SESSION_ID_SENTINEL",
+            "TRANSFER_ID_SENTINEL",
+            "aa:bb:cc:dd:ee:ff",
+            "C:\\secret\\PRIVATE_FILE_SENTINEL.txt",
+            "SHORT_CODE_SENTINEL",
+            "KEY_SECRET_SENTINEL",
+            "PAYLOAD_CONTENT_SENTINEL",
+        ];
+        let source = SourceFingerprint::from_fullname(&sentinels.join("/"));
+        let trace = new_pair_trace(PairRole::Sender, Some(19));
+        for (index, socket) in ["192.168.246.19:49157", "[fd12:3456:789a::42]:49157"]
+            .into_iter()
+            .enumerate()
+        {
+            let candidate = CandidateDiagnostic::new(
+                index + 1,
+                socket.parse().unwrap(),
+                true,
+                vec![source.clone()],
+            );
+            for (stage, state, reason) in [
+                (PairStage::Endpoints, PairState::Ok, PairReason::None),
+                (PairStage::TcpConnect, PairState::Start, PairReason::None),
+                (
+                    PairStage::TcpConnect,
+                    PairState::Timeout,
+                    PairReason::ConnectTimeout,
+                ),
+            ] {
+                trace.record_candidate(stage, state, reason, &candidate, None, Some(2));
+            }
+        }
+        for entry in trace.captured_entries() {
+            append_with_context(&path, Event::Pairing(entry), 0, 0).unwrap();
+        }
+        let text = export_text(&root).unwrap();
+        for raw in sentinels.into_iter().chain([
+            "192.168.246.19",
+            "fd12:3456:789a::42",
+            ":49157",
+            "\"port\":49157",
+        ]) {
+            assert!(
+                !text.contains(raw),
+                "raw sentinel escaped allowlisted export"
+            );
+        }
+        let rows = text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 6);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row["event"], "pairing_stage");
+            assert_eq!(row["data"]["attempt"], trace.id());
+            assert_eq!(row["data"]["candidate"]["index"], index / 3 + 1);
+            assert_eq!(row["data"]["candidate"]["portNonzero"], true);
+            assert!(row["data"]["candidate"].get("port").is_none());
+            assert!(row["data"]["candidate"].get("address").is_none());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rotation_is_bounded_and_export_is_allowlisted() {
         let root = temp();
         let dir = root.join("discovery-diagnostics");

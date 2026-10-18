@@ -3,7 +3,8 @@ use crate::native_lan::{
     PairingRole, PendingLocalPair, SessionReplayGuard,
 };
 use crate::pairing_diagnostics::{
-    new_pair_trace, PairReason, PairRole, PairStage, PairState, PairTrace,
+    new_pair_trace, CandidateDiagnostic, PairReason, PairRole, PairStage, PairState, PairTrace,
+    SourceFingerprint,
 };
 use crate::{ensure_config, DiscoveryCmd, DiscoveryState};
 #[path = "native_lan_transfer.rs"]
@@ -89,6 +90,13 @@ struct DiscoveredPeer {
     device_id: String,
     device_name: String,
     endpoints: Vec<SocketAddr>,
+}
+
+// Socket addresses remain runtime-only. Only the separately constructed,
+// allowlisted diagnostic can reach the diagnostic logger.
+struct PeerEndpoint {
+    endpoint: SocketAddr,
+    diagnostic: CandidateDiagnostic,
 }
 
 /// Rust-only source record. Neither the path nor the file handle is serializable.
@@ -293,7 +301,7 @@ impl NativeLanRuntime {
         }
     }
 
-    fn endpoints_for_peer(&self, device_id: &str) -> Result<Vec<SocketAddr>, String> {
+    fn endpoints_for_peer(&self, device_id: &str) -> Result<Vec<PeerEndpoint>, String> {
         let peers = self
             .inner
             .peers_by_fullname
@@ -309,7 +317,30 @@ impl NativeLanRuntime {
         if endpoints.is_empty() {
             return Err("设备当前没有可连接的局域网地址".to_string());
         }
-        Ok(endpoints)
+        // Preserve the original SocketAddr sort/dedup order. Provenance is taken
+        // from the same locked snapshot, not a second lookup that could race refresh.
+        Ok(endpoints
+            .into_iter()
+            .enumerate()
+            .map(|(index, endpoint)| {
+                let sources = peers
+                    .iter()
+                    .filter(|(_, peer)| {
+                        peer.device_id == device_id && peer.endpoints.contains(&endpoint)
+                    })
+                    .map(|(fullname, _)| SourceFingerprint::from_fullname(fullname))
+                    .collect();
+                PeerEndpoint {
+                    endpoint,
+                    diagnostic: CandidateDiagnostic::new(
+                        index + 1,
+                        endpoint,
+                        is_local_network_address(endpoint.ip(), self.ipv6_listener_ready()),
+                        sources,
+                    ),
+                }
+            })
+            .collect())
     }
 
     fn peer_matches_endpoint(&self, device_id: &str, remote: IpAddr) -> bool {
@@ -625,6 +656,60 @@ where
     }
 }
 
+// Same single connect future and timeout as before; no route probing, retries,
+// socket options, parallel dialing or network API calls are added.
+async fn run_candidate_connect<F>(
+    trace: &PairTrace,
+    candidate: &CandidateDiagnostic,
+    endpoint_count: u32,
+    deadline: Duration,
+    future: F,
+) -> Result<TcpStream, PairStepFailure>
+where
+    F: std::future::Future<Output = std::io::Result<TcpStream>>,
+{
+    trace.record_candidate(
+        PairStage::TcpConnect,
+        PairState::Start,
+        PairReason::None,
+        candidate,
+        None,
+        Some(endpoint_count),
+    );
+    let result = match tokio::time::timeout(deadline, future).await {
+        Ok(Ok(stream)) => {
+            trace.record_candidate(
+                PairStage::TcpConnect,
+                PairState::Ok,
+                PairReason::None,
+                candidate,
+                stream.local_addr().ok(),
+                Some(endpoint_count),
+            );
+            return Ok(stream);
+        }
+        Ok(Err(error)) => PairStepFailure {
+            stage: PairStage::TcpConnect,
+            state: PairState::Error,
+            reason: connect_error_reason(&error),
+        },
+        Err(_) => PairStepFailure {
+            stage: PairStage::TcpConnect,
+            state: PairState::Timeout,
+            reason: PairReason::ConnectTimeout,
+        },
+    };
+    trace.record_candidate(
+        result.stage,
+        result.state,
+        result.reason,
+        candidate,
+        None,
+        Some(endpoint_count),
+    );
+    Err(result)
+}
+
 fn validate_pair_condition(
     trace: &PairTrace,
     stage: PairStage,
@@ -758,9 +843,29 @@ pub(crate) async fn native_lan_start_send(
     })?;
     let endpoint_count = endpoints
         .iter()
-        .filter(|e| is_local_network_address(e.ip(), runtime.ipv6_listener_ready()))
+        .filter(|e| is_local_network_address(e.endpoint.ip(), runtime.ipv6_listener_ready()))
         .count()
         .min(u32::MAX as usize) as u32;
+    for candidate in &endpoints {
+        let eligible =
+            is_local_network_address(candidate.endpoint.ip(), runtime.ipv6_listener_ready());
+        trace.record_candidate(
+            PairStage::Endpoints,
+            if eligible {
+                PairState::Ok
+            } else {
+                PairState::Rejected
+            },
+            if eligible {
+                PairReason::None
+            } else {
+                PairReason::EndpointNotEligible
+            },
+            &candidate.diagnostic,
+            None,
+            Some(endpoint_count),
+        );
+    }
     trace.record(
         PairStage::Endpoints,
         PairState::Ok,
@@ -787,7 +892,8 @@ pub(crate) async fn native_lan_start_send(
         .1;
     let task_id = random_hex_id();
     let mut last_connect_failure = None;
-    for endpoint in endpoints {
+    for candidate in endpoints {
+        let endpoint = candidate.endpoint;
         if !is_local_network_address(endpoint.ip(), runtime.ipv6_listener_ready()) {
             continue;
         }
@@ -801,13 +907,11 @@ pub(crate) async fn native_lan_start_send(
                         Some(endpoint_count),
                     )
                 })?;
-        let mut stream = match run_pair_step(
+        let mut stream = match run_candidate_connect(
             &trace,
-            PairStage::TcpConnect,
+            &candidate.diagnostic,
+            endpoint_count,
             Duration::from_secs(4),
-            PairReason::ConnectTimeout,
-            |error| connect_error_reason(&error),
-            Some(endpoint_count),
             TcpStream::connect(endpoint),
         )
         .await
@@ -1277,6 +1381,167 @@ fn transfer_id_for_session(session_id: &str, task_id: &str, transfer_nonce: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_snapshot_preserves_original_order_dedup_and_source_provenance() {
+        let runtime = NativeLanRuntime::new();
+        runtime.set_listener_ready(true);
+        let a: SocketAddr = "192.168.246.19:49157".parse().unwrap();
+        let b: SocketAddr = "169.254.2.3:0".parse().unwrap();
+        let c: SocketAddr = "[fd12:3456:789a::42]:49157".parse().unwrap();
+        runtime.upsert_peer(
+            "SERVICE_ONE_SENTINEL",
+            "DEVICE_ID_SENTINEL",
+            "Peer",
+            vec![c, a, a],
+        );
+        runtime.upsert_peer(
+            "SERVICE_TWO_SENTINEL",
+            "DEVICE_ID_SENTINEL",
+            "Peer",
+            vec![a, b],
+        );
+        runtime.upsert_peer(
+            "UNRELATED_SERVICE",
+            "OTHER_DEVICE",
+            "Other",
+            vec!["10.2.3.4:9".parse().unwrap()],
+        );
+        let candidates = runtime.endpoints_for_peer("DEVICE_ID_SENTINEL").unwrap();
+        let mut expected = vec![c, a, a, a, b];
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(
+            candidates.iter().map(|c| c.endpoint).collect::<Vec<_>>(),
+            expected
+        );
+        for (index, candidate) in candidates.iter().enumerate() {
+            let data = serde_json::to_value(&candidate.diagnostic).unwrap();
+            assert_eq!(data["index"], index + 1);
+            assert_eq!(data["portNonzero"], candidate.endpoint.port() != 0);
+            assert_eq!(
+                data["sourceFingerprints"].as_array().unwrap().len(),
+                if candidate.endpoint == a { 2 } else { 1 }
+            );
+            assert!(!data.to_string().contains("SENTINEL"));
+        }
+        let repeated = runtime.endpoints_for_peer("DEVICE_ID_SENTINEL").unwrap();
+        assert_eq!(
+            serde_json::to_value(&candidates[0].diagnostic).unwrap(),
+            serde_json::to_value(&repeated[0].diagnostic).unwrap()
+        );
+        runtime.remove_peer("SERVICE_ONE_SENTINEL");
+        assert_eq!(
+            runtime
+                .endpoints_for_peer("DEVICE_ID_SENTINEL")
+                .unwrap()
+                .len(),
+            2
+        );
+        runtime.clear_peers();
+        assert!(runtime.endpoints_for_peer("DEVICE_ID_SENTINEL").is_err());
+    }
+
+    #[tokio::test]
+    async fn candidate_connect_records_link_attempt_order_start_end_and_outcome() {
+        let trace = new_pair_trace(PairRole::Sender, Some(71));
+        let other = new_pair_trace(PairRole::Sender, Some(72));
+        let candidate = CandidateDiagnostic::new(
+            3,
+            "192.168.246.19:49157".parse().unwrap(),
+            true,
+            vec![SourceFingerprint::from_fullname("SERVICE_ID_SENTINEL")],
+        );
+        let timeout = run_candidate_connect(
+            &trace,
+            &candidate,
+            1,
+            Duration::from_millis(1),
+            std::future::pending::<std::io::Result<TcpStream>>(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(timeout.state, PairState::Timeout);
+        let error = run_candidate_connect(
+            &trace,
+            &candidate,
+            1,
+            Duration::from_secs(1),
+            std::future::ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "192.168.246.19:49157 DEVICE_ID_SENTINEL SESSION_ID_SENTINEL TRANSFER_ID_SENTINEL",
+            ))),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.reason, PairReason::ConnectRefused);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_candidate =
+            CandidateDiagnostic::new(1, listener.local_addr().unwrap(), false, vec![]);
+        let stream = run_candidate_connect(
+            &other,
+            &local_candidate,
+            1,
+            Duration::from_secs(1),
+            TcpStream::connect(listener.local_addr().unwrap()),
+        )
+        .await
+        .unwrap();
+        drop(stream);
+        let entries = trace.captured_entries();
+        assert_eq!(entries.len(), 4);
+        let values = entries
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap())
+            .collect::<Vec<_>>();
+        for (index, value) in values.iter().enumerate() {
+            assert_eq!(value["attempt"], trace.id());
+            assert_eq!(value["uiAttempt"], 71);
+            assert_eq!(value["endpointCount"], 1);
+            assert_eq!(value["candidate"]["index"], 3);
+            assert_eq!(value["candidate"]["family"], "ipv4");
+            assert_eq!(value["candidate"]["addressClass"], "private_ipv4");
+            assert_eq!(value["candidate"]["portNonzero"], true);
+            if index > 0 {
+                assert!(
+                    value["attemptElapsedMs"].as_u64()
+                        >= values[index - 1]["attemptElapsedMs"].as_u64()
+                );
+            }
+        }
+        assert_eq!(values[0]["state"], "start");
+        assert_eq!(values[1]["state"], "timeout");
+        assert_eq!(
+            values[1]["reachability"],
+            "timeout_not_proof_of_no_route_or_no_syn"
+        );
+        assert_eq!(values[2]["state"], "start");
+        assert_eq!(values[3]["reason"], "connect_refused");
+        let success = serde_json::to_value(&other.captured_entries()[1]).unwrap();
+        assert_eq!(success["attempt"], other.id());
+        assert_ne!(success["attempt"], values[0]["attempt"]);
+        assert_eq!(success["state"], "ok");
+        assert_eq!(success["endpointCount"], 1);
+        assert_eq!(success["candidate"]["addressClass"], "loopback");
+        assert_eq!(success["localAddressClass"], "loopback");
+        assert_eq!(
+            success["reachability"],
+            "tcp_connected_not_pairhello_or_nic_proof"
+        );
+        let text = serde_json::to_string(&values).unwrap();
+        for secret in [
+            "192.168.246.19",
+            ":49157",
+            "SERVICE_ID_SENTINEL",
+            "DEVICE_ID_SENTINEL",
+            "SESSION_ID_SENTINEL",
+            "TRANSFER_ID_SENTINEL",
+        ] {
+            assert!(!text.contains(secret));
+        }
+    }
 
     fn registered_pair_test_source() -> (NativeLanRuntime, PathBuf) {
         let path =
