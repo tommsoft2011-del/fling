@@ -18,9 +18,11 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
+use tauri_plugin_dialog::DialogExt;
 
 static HISTORY_IO_LOCK: Mutex<()> = Mutex::new(());
 
+mod discovery_diagnostics;
 mod embedded_config;
 
 #[allow(dead_code)]
@@ -1247,10 +1249,12 @@ fn discovery_thread(
     let daemon = match mdns_sd::ServiceDaemon::new() {
         Ok(d) => d,
         Err(e) => {
+            discovery_diagnostics::record(discovery_diagnostics::Event::DaemonInitFailed);
             eprintln!("[fling] mDNS daemon init failed: {e}");
             return;
         }
     };
+    discovery_diagnostics::record(discovery_diagnostics::Event::DaemonInitSucceeded);
 
     let mut device_id = initial_id;
     let mut device_name = initial_name;
@@ -1269,6 +1273,9 @@ fn discovery_thread(
                         Ok(r) => {
                             browse_rx = Some(r);
                             browsing = true;
+                            discovery_diagnostics::record(
+                                discovery_diagnostics::Event::BrowsingStarted,
+                            );
                         }
                         Err(e) => eprintln!("[fling] mDNS browse failed: {e}"),
                     }
@@ -1301,11 +1308,21 @@ fn discovery_thread(
                 let refreshed = refresh_browse(
                     &mut browsing,
                     || {
-                        daemon
-                            .stop_browse(MDNS_SERVICE_TYPE)
-                            .map_err(|e| e.to_string())
+                        daemon.stop_browse(MDNS_SERVICE_TYPE).map_err(|e| {
+                            discovery_diagnostics::record(
+                                discovery_diagnostics::Event::RefreshStopFailed,
+                            );
+                            e.to_string()
+                        })
                     },
-                    || daemon.browse(MDNS_SERVICE_TYPE).map_err(|e| e.to_string()),
+                    || {
+                        daemon.browse(MDNS_SERVICE_TYPE).map_err(|e| {
+                            discovery_diagnostics::record(
+                                discovery_diagnostics::Event::RefreshBrowseFailed,
+                            );
+                            e.to_string()
+                        })
+                    },
                 );
                 let result = match refreshed {
                     Ok(receiver) => {
@@ -1318,15 +1335,24 @@ fn discovery_thread(
                         {
                             Ok(ServiceEvent::SearchStarted(_)) => Ok(()),
                             Ok(event) => {
+                                discovery_diagnostics::record(
+                                    discovery_diagnostics::Event::RefreshStartConfirmationFailed,
+                                );
                                 Err(format!("mDNS browse 未返回启动确认 (收到 {event:?})"))
                             }
                             Err(error) => {
+                                discovery_diagnostics::record(
+                                    discovery_diagnostics::Event::RefreshStartConfirmationFailed,
+                                );
                                 Err(format!("等待 mDNS browse 启动确认超时或接收失败: {error}"))
                             }
                         }
                     }
                     Err(error) => Err(error),
                 };
+                if result.is_ok() {
+                    discovery_diagnostics::record(discovery_diagnostics::Event::RefreshSucceeded);
+                }
                 let _ = reply.send(result);
             }
             Ok(DiscoveryCmd::SetDiscoverable(on)) => {
@@ -1377,6 +1403,11 @@ fn discovery_thread(
                                         endpoints.clone(),
                                     );
                                 if peers.insert(info.get_fullname(), &id) {
+                                    discovery_diagnostics::record(
+                                        discovery_diagnostics::Event::PeerUpCount(
+                                            peers.known_ids.len().min(u32::MAX as usize) as u32,
+                                        ),
+                                    );
                                     let payload = PeerUpPayload { id, name };
                                     let _ = app.emit("fling://peer-up", payload.clone());
                                     if app
@@ -1403,6 +1434,11 @@ fn discovery_thread(
                         app.state::<native_lan_runtime::NativeLanRuntime>()
                             .remove_peer(&fullname);
                         if let Some(id) = peers.remove(&fullname) {
+                            discovery_diagnostics::record(
+                                discovery_diagnostics::Event::PeerDownCount(
+                                    peers.known_ids.len().min(u32::MAX as usize) as u32,
+                                ),
+                            );
                             let payload = PeerDownPayload { id };
                             let _ = app.emit("fling://peer-down", payload.clone());
                             if app
@@ -1440,19 +1476,67 @@ async fn discovery_refresh(app: tauri::AppHandle) -> Result<(), String> {
     let tx = app.state::<DiscoveryState>().tx.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let (reply, result) = mpsc::sync_channel(1);
-        tx.send(DiscoveryCmd::Refresh { reply })
-            .map_err(|_| "mDNS discovery 线程已停止，无法刷新".to_string())?;
+        discovery_diagnostics::record(discovery_diagnostics::Event::RefreshRequested);
+        tx.send(DiscoveryCmd::Refresh { reply }).map_err(|_| {
+            discovery_diagnostics::record(discovery_diagnostics::Event::RefreshFailed);
+            "mDNS discovery 线程已停止，无法刷新".to_string()
+        })?;
         result
             .recv_timeout(DISCOVERY_REFRESH_TIMEOUT + std::time::Duration::from_secs(1))
             .map_err(|error| match error {
-                mpsc::RecvTimeoutError::Timeout => "等待 mDNS 刷新结果超时".to_string(),
+                mpsc::RecvTimeoutError::Timeout => {
+                    discovery_diagnostics::record(discovery_diagnostics::Event::RefreshTimeout);
+                    "等待 mDNS 刷新结果超时".to_string()
+                }
                 mpsc::RecvTimeoutError::Disconnected => {
+                    discovery_diagnostics::record(discovery_diagnostics::Event::RefreshFailed);
                     "mDNS discovery 线程未返回刷新结果".to_string()
                 }
             })?
     })
     .await
     .map_err(|error| format!("mDNS 刷新工作线程失败: {error}"))?
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiscoveryExportResult {
+    saved: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    saved_path: Option<String>,
+}
+
+#[tauri::command]
+async fn discovery_export_diagnostics(
+    app: tauri::AppHandle,
+) -> Result<DiscoveryExportResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let app_data = app
+            .path()
+            .app_data_dir()
+            .map_err(|_| "无法访问本地诊断目录")?;
+        let Some(file) = app
+            .dialog()
+            .file()
+            .set_file_name("fling-lan-discovery.log")
+            .blocking_save_file()
+        else {
+            return Ok(DiscoveryExportResult {
+                saved: false,
+                saved_path: None,
+            });
+        };
+        let path = file.as_path().ok_or("不支持此保存位置")?;
+        let content =
+            discovery_diagnostics::export_text(&app_data).map_err(|_| "无法读取本地诊断日志")?;
+        std::fs::write(path, content).map_err(|_| "无法保存诊断日志")?;
+        Ok(DiscoveryExportResult {
+            saved: true,
+            saved_path: Some(path.to_string_lossy().into_owned()),
+        })
+    })
+    .await
+    .map_err(|_| "诊断导出线程失败".to_string())?
 }
 
 #[tauri::command]
@@ -1730,6 +1814,9 @@ fn main() {
                     }
                 };
             let (tx, rx) = mpsc::channel::<DiscoveryCmd>();
+            if let Ok(data_dir) = app.path().app_data_dir() {
+                discovery_diagnostics::initialize(&data_dir);
+            }
             app.manage(ConfigLock(Mutex::new(())));
             app.manage(ReceivedFileStore::default());
             app.manage(RemoteConfig(Mutex::new(None)));
@@ -1770,6 +1857,7 @@ fn main() {
             pick_download_dir,
             discovery_set_browsing,
             discovery_refresh,
+            discovery_export_diagnostics,
             discovery_set_discoverable,
             native_lan_runtime::native_lan_start_mode,
             native_lan_runtime::native_lan_stop_mode,

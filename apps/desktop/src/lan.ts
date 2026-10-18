@@ -355,19 +355,23 @@ export async function initLanPage(): Promise<LanIdentity> {
     if (refreshButton.disabled) return;
     const status = byId<HTMLElement>('lanRefreshStatus');
     refreshButton.disabled = true;
-    refreshButton.textContent = '正在刷新…';
+    refreshButton.textContent = '正在搜索…';
     refreshButton.setAttribute('aria-busy', 'true');
     status.classList.toggle('error', false);
-    status.textContent = '正在重新发起局域网发现…';
+    status.textContent = '正在搜索附近设备，请稍候…';
     try {
       await invoke('discovery_refresh');
-      status.textContent = '已重新发起发现，列表会持续更新；仍找不到时可再次刷新。';
+      // mDNS keeps listening. This bounds the manual search round, not peer reachability.
+      await new Promise<void>((resolve) => setTimeout(resolve, 3000));
+      status.textContent = peers.size
+        ? `本轮搜索结束，当前发现 ${peers.size} 台附近设备；列表仍会持续更新。`
+        : '本轮搜索结束，仍未发现附近设备；可再次搜索，请检查同一局域网及防火墙。';
     } catch {
-      status.textContent = '刷新设备失败，可重试；请检查本地网络和防火墙是否允许设备发现。';
+      status.textContent = '搜索附近设备失败，可重试；请检查本地网络和防火墙是否允许设备发现。';
       status.classList.toggle('error', true);
     } finally {
       refreshButton.disabled = false;
-      refreshButton.textContent = '刷新设备';
+      refreshButton.textContent = '重新搜索附近设备';
       refreshButton.setAttribute('aria-busy', 'false');
     }
   };
@@ -521,6 +525,29 @@ export async function initLanPage(): Promise<LanIdentity> {
   };
   byId<HTMLButtonElement>('lanRefreshCounters').onclick = () => {
     void refreshCounters().catch(() => setStatus('诊断计数读取失败，请重试', true));
+  };
+  const exportButton = byId<HTMLButtonElement>('lanExportDiscoveryLog');
+  exportButton.onclick = async () => {
+    if (exportButton.disabled) return;
+    const status = byId<HTMLElement>('lanExportStatus');
+    exportButton.disabled = true;
+    exportButton.textContent = '正在导出…';
+    exportButton.setAttribute('aria-busy', 'true');
+    status.classList.toggle('error', false);
+    status.textContent = '请选择本地保存位置…';
+    try {
+      const result = await invoke<{ saved: boolean; savedPath?: string }>('discovery_export_diagnostics');
+      status.textContent = result.saved
+        ? `诊断日志已保存至：${result.savedPath ?? '所选位置'}。未上传。`
+        : '已取消导出，可随时重试。';
+    } catch {
+      status.textContent = '导出失败，请检查保存位置后重试。';
+      status.classList.toggle('error', true);
+    } finally {
+      exportButton.disabled = false;
+      exportButton.textContent = '导出诊断日志';
+      exportButton.setAttribute('aria-busy', 'false');
+    }
   };
   byId<HTMLButtonElement>('lanExit').onclick = async () => {
     try {

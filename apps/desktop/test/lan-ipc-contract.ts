@@ -27,6 +27,7 @@ for (const pattern of forbidden) {
 
 const allowedCommands = new Set([
   'discovery_refresh',
+  'discovery_export_diagnostics',
   'native_lan_start_mode',
   'native_lan_stop_mode',
   'native_lan_pick_source',

@@ -610,7 +610,7 @@ label.filebtn { cursor: pointer; }
 .lan-discovery-row { justify-content: space-between; flex-wrap: wrap; margin-bottom: 8px; }
 .lan-discovery-row .card-t { margin: 0; }
 #lanRefreshStatus { overflow-wrap: anywhere; }
-#lanRefreshStatus.error { color: var(--danger); }
+#lanRefreshStatus.error, #lanExportStatus.error { color: var(--danger); }
 #lanPeerSelect { margin-top: 10px; }
 .lan-source-row { margin: 10px 0 12px; flex-wrap: wrap; }
 .lan-source-row .hint { min-width: 0; overflow-wrap: anywhere; }
