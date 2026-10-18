@@ -76,9 +76,11 @@
           <details class="card" id="lanDiagnostics">
             <summary id="lanDiagnosticsToggle">诊断信息</summary>
             <div class="card-t">本地发现日志</div>
-            <div class="hint">日志仅在本机生成，只记录发现阶段、结果数量和失败类别，设有大小上限；不记录设备名称、网络地址、文件信息或配对秘密，不会自动上传。</div>
+            <div id="lanLogDisclosure" class="hint">日志仅在本机生成，包含本机和对端电脑名称、构建与系统版本、搜索阶段、数量、耗时和失败类别，设有大小上限；不记录 IP/MAC、文件信息、短码、密钥、内容或原始会话/传输 ID，不会自动上传。</div>
+            <div id="lanLogEvidenceNote" class="hint">日志只反映应用层观察和处理，不能证明报文实际进出网卡；该层证据仍需抓包。缓存记录不等于本轮收到新的网络响应。</div>
+            <div id="lanDiscoveryPhases" class="hint">尚无本轮阶段统计；有效服务、LAN 可用设备、成功提交的界面事件与实际可选条目数会分别记录。</div>
             <div class="row lan-source-row">
-              <button class="ghostbtn" id="lanExportDiscoveryLog" type="button" aria-describedby="lanExportStatus">导出诊断日志</button>
+              <button class="ghostbtn" id="lanExportDiscoveryLog" type="button" aria-describedby="lanLogDisclosure lanLogEvidenceNote lanExportStatus">导出诊断日志</button>
               <span id="lanExportStatus" class="hint" role="status" aria-live="polite" aria-atomic="true">手动选择保存位置后导出。</span>
             </div>
             <div class="card-t">WebView IPC 计数</div>

@@ -491,7 +491,17 @@ pub(crate) fn native_lan_start_mode(
         serde_json::to_vec(&identity).unwrap_or_default().len(),
     );
     for peer in runtime.peer_snapshot() {
-        emit_lan_event(&app, &runtime, "fling://lan/peer-up", peer);
+        runtime.count_ipc(
+            "event:fling://lan/peer-up",
+            serde_json::to_vec(&peer)
+                .map(|value| value.len())
+                .unwrap_or_default(),
+        );
+        let success = app.emit("fling://lan/peer-up", peer).is_ok();
+        crate::discovery_diagnostics::record(crate::discovery_diagnostics::Event::LanUiEvent {
+            up: true,
+            success,
+        });
     }
     Ok(identity)
 }

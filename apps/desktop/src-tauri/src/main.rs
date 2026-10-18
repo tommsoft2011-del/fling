@@ -23,6 +23,7 @@ use tauri_plugin_dialog::DialogExt;
 static HISTORY_IO_LOCK: Mutex<()> = Mutex::new(());
 
 mod discovery_diagnostics;
+mod discovery_round;
 mod embedded_config;
 
 #[allow(dead_code)]
@@ -1121,7 +1122,8 @@ struct PeerDownPayload {
 enum DiscoveryCmd {
     SetBrowsing(bool),
     Refresh {
-        reply: mpsc::SyncSender<Result<(), String>>,
+        ticket: discovery_round::RefreshTicket,
+        reply: mpsc::SyncSender<Result<discovery_round::RoundCounts, String>>,
     },
     SetDiscoverable(bool),
     UpdateIdentity {
@@ -1145,8 +1147,6 @@ fn refresh_browse<T>(
     *browsing = true;
     Ok(receiver)
 }
-
-const DISCOVERY_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct DiscoveryState {
     tx: mpsc::Sender<DiscoveryCmd>,
@@ -1176,8 +1176,59 @@ fn peer_from_txt(
     Some((id.to_string(), name.to_string()))
 }
 
+fn diagnostics_counts(
+    c: &discovery_round::RoundCounts,
+    resolved: u32,
+) -> discovery_diagnostics::PhaseCounts {
+    discovery_diagnostics::PhaseCounts {
+        resolved_services: resolved,
+        valid_services: c.valid_services,
+        lan_eligible_peers: c.lan_eligible_peers,
+        ui_emitted_peers: c.ui_emitted_peers,
+    }
+}
+
+fn finish_refresh(
+    ticket: &discovery_round::RefreshTicket,
+    outcome: discovery_diagnostics::Outcome,
+    reason: discovery_diagnostics::Reason,
+) -> bool {
+    if !ticket.finish_once() {
+        return false;
+    }
+    discovery_diagnostics::record_for_round(
+        ticket.round_id(),
+        ticket.started().elapsed().as_millis() as u64,
+        discovery_diagnostics::Event::RefreshOutcome {
+            outcome,
+            reason,
+            counts: ticket.counts(),
+        },
+    );
+    true
+}
+
 /// Tracks known peers for up/down dedup. Keyed by mDNS fullname (which may
 /// gain a " (2)" suffix on instance-name conflicts); identity is device_id.
+#[derive(Default)]
+struct LanPublishedSet(HashSet<String>);
+impl LanPublishedSet {
+    fn should_emit(&self, id: &str, enabled: bool, eligible: bool) -> bool {
+        enabled && eligible && !self.0.contains(id)
+    }
+    fn mark_emitted(&mut self, id: &str, success: bool) {
+        if success {
+            self.0.insert(id.to_string());
+        }
+    }
+    fn remove(&mut self, id: &str) {
+        self.0.remove(id);
+    }
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
 #[derive(Default)]
 struct PeerSet {
     by_fullname: HashMap<String, String>, // fullname -> device_id
@@ -1255,6 +1306,11 @@ fn discovery_thread(
         }
     };
     discovery_diagnostics::record(discovery_diagnostics::Event::DaemonInitSucceeded);
+    let local_name = default_device_name();
+    discovery_diagnostics::record(discovery_diagnostics::Event::ComputerName {
+        local: true,
+        name: local_name.clone(),
+    });
 
     let mut device_id = initial_id;
     let mut device_name = initial_name;
@@ -1264,8 +1320,23 @@ fn discovery_thread(
     // Initial announce (discoverable defaults to on).
     let mut registered_name = register_fling(&daemon, &device_id, &device_name, native_port);
     let mut peers = PeerSet::default();
+    let mut lan_published_ids = LanPublishedSet::default();
+    let mut refresh_round: Option<(
+        u64,
+        std::time::Instant,
+        discovery_round::DiscoveryRound,
+        mpsc::SyncSender<Result<discovery_round::RoundCounts, String>>,
+        discovery_round::RefreshTicket,
+    )> = None;
 
     loop {
+        // A caller timeout ends observation only, not automatic discovery or transfers.
+        if refresh_round
+            .as_ref()
+            .is_some_and(|(_, _, _, _, ticket)| ticket.is_terminal())
+        {
+            refresh_round.take();
+        }
         match rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(DiscoveryCmd::SetBrowsing(on)) => {
                 if on && !browsing {
@@ -1281,6 +1352,7 @@ fn discovery_thread(
                     }
                 } else if !on && browsing {
                     let _ = daemon.stop_browse(MDNS_SERVICE_TYPE);
+                    discovery_diagnostics::record(discovery_diagnostics::Event::BrowseStopped);
                     browse_rx = None;
                     browsing = false;
                     let lan_enabled = app
@@ -1288,6 +1360,19 @@ fn discovery_thread(
                         .is_enabled();
                     app.state::<native_lan_runtime::NativeLanRuntime>()
                         .clear_peers();
+                    lan_published_ids.clear();
+                    if let Some((_, _, tracker, reply, ticket)) = refresh_round.take() {
+                        ticket.update_counts(diagnostics_counts(
+                            &tracker.counts(),
+                            tracker.resolved_services(),
+                        ));
+                        finish_refresh(
+                            &ticket,
+                            discovery_diagnostics::Outcome::Error,
+                            discovery_diagnostics::Reason::ModeStopped,
+                        );
+                        let _ = reply.send(Err("mDNS browsing stopped during refresh".to_string()));
+                    }
                     for id in peers.clear() {
                         let payload = PeerDownPayload { id };
                         let _ = app.emit("fling://peer-down", payload.clone());
@@ -1299,61 +1384,64 @@ fn discovery_thread(
                                     .map(|value| value.len())
                                     .unwrap_or_default(),
                             );
-                            let _ = app.emit("fling://lan/peer-down", payload);
+                            let success = app.emit("fling://lan/peer-down", payload).is_ok();
+                            discovery_diagnostics::record(
+                                discovery_diagnostics::Event::LanUiEvent { up: false, success },
+                            );
                         }
                     }
                 }
             }
-            Ok(DiscoveryCmd::Refresh { reply }) => {
+            Ok(DiscoveryCmd::Refresh { ticket, reply }) => {
+                let round_id = ticket.round_id();
+                if ticket.is_terminal() {
+                    continue;
+                }
+                if refresh_round.is_some() {
+                    finish_refresh(
+                        &ticket,
+                        discovery_diagnostics::Outcome::Error,
+                        discovery_diagnostics::Reason::Overlap,
+                    );
+                    let _ = reply.send(Err("LAN discovery refresh is already running".to_string()));
+                    continue;
+                }
+                discovery_diagnostics::activate_round_at(round_id, ticket.started());
                 let refreshed = refresh_browse(
                     &mut browsing,
                     || {
-                        daemon.stop_browse(MDNS_SERVICE_TYPE).map_err(|e| {
-                            discovery_diagnostics::record(
-                                discovery_diagnostics::Event::RefreshStopFailed,
-                            );
-                            e.to_string()
-                        })
+                        daemon
+                            .stop_browse(MDNS_SERVICE_TYPE)
+                            .map_err(|_| "stop failed".to_string())
                     },
                     || {
-                        daemon.browse(MDNS_SERVICE_TYPE).map_err(|e| {
-                            discovery_diagnostics::record(
-                                discovery_diagnostics::Event::RefreshBrowseFailed,
-                            );
-                            e.to_string()
-                        })
+                        daemon
+                            .browse(MDNS_SERVICE_TYPE)
+                            .map_err(|_| "browse failed".to_string())
                     },
                 );
-                let result = match refreshed {
+                match refreshed {
                     Ok(receiver) => {
                         browse_rx = Some(receiver);
-                        // browse() only queues work; SearchStarted confirms daemon processing.
-                        match browse_rx
-                            .as_ref()
-                            .unwrap()
-                            .recv_timeout(DISCOVERY_REFRESH_TIMEOUT)
-                        {
-                            Ok(ServiceEvent::SearchStarted(_)) => Ok(()),
-                            Ok(event) => {
-                                discovery_diagnostics::record(
-                                    discovery_diagnostics::Event::RefreshStartConfirmationFailed,
-                                );
-                                Err(format!("mDNS browse 未返回启动确认 (收到 {event:?})"))
-                            }
-                            Err(error) => {
-                                discovery_diagnostics::record(
-                                    discovery_diagnostics::Event::RefreshStartConfirmationFailed,
-                                );
-                                Err(format!("等待 mDNS browse 启动确认超时或接收失败: {error}"))
-                            }
-                        }
+                        let now = ticket.started();
+                        refresh_round = Some((
+                            round_id,
+                            now,
+                            discovery_round::DiscoveryRound::new(now),
+                            reply,
+                            ticket,
+                        ));
                     }
-                    Err(error) => Err(error),
-                };
-                if result.is_ok() {
-                    discovery_diagnostics::record(discovery_diagnostics::Event::RefreshSucceeded);
+                    Err(error) => {
+                        let reason = if browsing {
+                            discovery_diagnostics::Reason::StopFailed
+                        } else {
+                            discovery_diagnostics::Reason::BrowseFailed
+                        };
+                        finish_refresh(&ticket, discovery_diagnostics::Outcome::Error, reason);
+                        let _ = reply.send(Err(error));
+                    }
                 }
-                let _ = reply.send(result);
             }
             Ok(DiscoveryCmd::SetDiscoverable(on)) => {
                 discoverable = on;
@@ -1380,20 +1468,132 @@ fn discovery_thread(
         }
 
         if let Some(brx) = browse_rx.as_ref() {
-            for ev in brx.try_iter() {
+            loop {
+                let ev = match brx.try_recv() {
+                    Ok(ev) => ev,
+                    Err(_) if !brx.is_disconnected() => break,
+                    Err(_) => {
+                        if let Some((_, _, tracker, reply, ticket)) = refresh_round.take() {
+                            ticket.update_counts(diagnostics_counts(
+                                &tracker.counts(),
+                                tracker.resolved_services(),
+                            ));
+                            finish_refresh(
+                                &ticket,
+                                discovery_diagnostics::Outcome::Error,
+                                discovery_diagnostics::Reason::BrowseDisconnected,
+                            );
+                            let _ = reply.send(Err("mDNS browse receiver disconnected".into()));
+                        }
+                        browse_rx = None;
+                        browsing = false;
+                        break;
+                    }
+                };
                 match ev {
+                    ServiceEvent::SearchStarted(_) => {
+                        discovery_diagnostics::record(
+                            discovery_diagnostics::Event::BrowseConfirmed,
+                        );
+                        if let Some((_, _, tracker, _, _)) = refresh_round.as_mut() {
+                            tracker.confirm(std::time::Instant::now());
+                        }
+                    }
                     ServiceEvent::ServiceResolved(info) => {
+                        discovery_diagnostics::record(discovery_diagnostics::Event::Resolved);
+                        if let Some((_, _, tracker, _, _)) = refresh_round.as_mut() {
+                            tracker.resolved();
+                        }
+                        let protocol_valid = peer_from_txt(
+                            info.get_property_val_str("v"),
+                            info.get_property_val_str("id"),
+                            info.get_property_val_str("name"),
+                        )
+                        .is_some();
+                        let self_service =
+                            info.get_property_val_str("id") == Some(device_id.as_str());
+                        discovery_diagnostics::record(discovery_diagnostics::Event::Protocol {
+                            valid: protocol_valid,
+                            reason: if self_service {
+                                discovery_diagnostics::Reason::SelfService
+                            } else if protocol_valid {
+                                discovery_diagnostics::Reason::None
+                            } else if info.get_property_val_str("v") != Some(FLING_PROTO_VERSION) {
+                                discovery_diagnostics::Reason::ProtocolMismatch
+                            } else {
+                                discovery_diagnostics::Reason::MissingIdentity
+                            },
+                        });
+
                         match peer_from_txt(
                             info.get_property_val_str("v"),
                             info.get_property_val_str("id"),
                             info.get_property_val_str("name"),
                         ) {
                             Some((id, name)) if id != device_id => {
+                                if let Some((_, _, round, _, _)) = refresh_round.as_mut() {
+                                    round.valid_service(info.get_fullname());
+                                }
+                                if info
+                                    .get_property_val_str("name")
+                                    .is_some_and(|actual| actual == name && actual != id)
+                                {
+                                    discovery_diagnostics::record(
+                                        discovery_diagnostics::Event::ComputerName {
+                                            local: false,
+                                            name: name.clone(),
+                                        },
+                                    );
+                                }
+                                let ipv6_ready = app
+                                    .state::<native_lan_runtime::NativeLanRuntime>()
+                                    .ipv6_listener_ready();
                                 let endpoints = native_lan_runtime::eligible_lan_endpoints(
                                     info.get_addresses(),
                                     info.get_port(),
-                                    app.state::<native_lan_runtime::NativeLanRuntime>()
-                                        .ipv6_listener_ready(),
+                                    ipv6_ready,
+                                );
+                                let mut private_ipv4 = 0u32;
+                                let mut link_local_ipv4 = 0u32;
+                                let mut ula_ipv6 = 0u32;
+                                for endpoint in &endpoints {
+                                    match endpoint.ip() {
+                                        std::net::IpAddr::V4(ip) if ip.is_private() => {
+                                            private_ipv4 += 1
+                                        }
+                                        std::net::IpAddr::V4(ip)
+                                            if ip.octets()[0] == 169 && ip.octets()[1] == 254 =>
+                                        {
+                                            link_local_ipv4 += 1
+                                        }
+                                        std::net::IpAddr::V6(ip)
+                                            if ipv6_ready && (ip.octets()[0] & 0xfe) == 0xfc =>
+                                        {
+                                            ula_ipv6 += 1
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                discovery_diagnostics::record(
+                                    discovery_diagnostics::Event::AddressEligibility {
+                                        private_ipv4,
+                                        link_local_ipv4,
+                                        ula_ipv6,
+                                        rejected: info
+                                            .get_addresses()
+                                            .len()
+                                            .saturating_sub(endpoints.len())
+                                            as u32,
+                                        reason: if info.get_port() == 0 {
+                                            discovery_diagnostics::Reason::ZeroPort
+                                        } else if endpoints.is_empty() && !ipv6_ready && info.get_addresses().iter().any(|ip| matches!(ip, std::net::IpAddr::V6(ip) if (ip.octets()[0] & 0xfe) == 0xfc)) {
+                                            discovery_diagnostics::Reason::Ipv6ListenerUnavailable
+                                        } else if endpoints.is_empty() {
+                                            discovery_diagnostics::Reason::NoEligible
+                                        } else {
+                                            discovery_diagnostics::Reason::None
+                                        },
+                                    },
                                 );
                                 app.state::<native_lan_runtime::NativeLanRuntime>()
                                     .upsert_peer(
@@ -1402,29 +1602,76 @@ fn discovery_thread(
                                         &name,
                                         endpoints.clone(),
                                     );
-                                if peers.insert(info.get_fullname(), &id) {
+                                if !endpoints.is_empty() {
+                                    if let Some((_, _, round, _, _)) = refresh_round.as_mut() {
+                                        round.eligible_peer(&id);
+                                    }
+                                }
+                                let first_seen = peers.insert(info.get_fullname(), &id);
+                                if first_seen {
                                     discovery_diagnostics::record(
                                         discovery_diagnostics::Event::PeerUpCount(
                                             peers.known_ids.len().min(u32::MAX as usize) as u32,
                                         ),
                                     );
-                                    let payload = PeerUpPayload { id, name };
+                                    let payload = PeerUpPayload {
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                    };
                                     let _ = app.emit("fling://peer-up", payload.clone());
-                                    if app
+                                }
+                                // LAN publication must not be gated by the legacy online PeerSet:
+                                // an earlier resolve can be valid but have no usable LAN address.
+                                if app
+                                    .state::<native_lan_runtime::NativeLanRuntime>()
+                                    .is_enabled()
+                                    && !endpoints.is_empty()
+                                    && lan_published_ids.should_emit(&id, true, true)
+                                {
+                                    let runtime =
+                                        app.state::<native_lan_runtime::NativeLanRuntime>();
+                                    runtime.count_ipc(
+                                        "event:fling://lan/peer-up",
+                                        serde_json::to_vec(&PeerUpPayload {
+                                            id: id.clone(),
+                                            name: name.clone(),
+                                        })
+                                        .map(|value| value.len())
+                                        .unwrap_or_default(),
+                                    );
+                                    let emitted = app
+                                        .emit(
+                                            "fling://lan/peer-up",
+                                            PeerUpPayload {
+                                                id: id.clone(),
+                                                name: name.clone(),
+                                            },
+                                        )
+                                        .is_ok();
+                                    lan_published_ids.mark_emitted(&id, emitted);
+                                    discovery_diagnostics::record(
+                                        discovery_diagnostics::Event::LanUiEvent {
+                                            up: true,
+                                            success: emitted,
+                                        },
+                                    );
+                                    if let Some((_, _, round, _, _)) = refresh_round.as_mut() {
+                                        round.emitted_peer(&id, emitted);
+                                    }
+                                } else {
+                                    let reason = if !app
                                         .state::<native_lan_runtime::NativeLanRuntime>()
                                         .is_enabled()
-                                        && !endpoints.is_empty()
                                     {
-                                        let runtime =
-                                            app.state::<native_lan_runtime::NativeLanRuntime>();
-                                        runtime.count_ipc(
-                                            "event:fling://lan/peer-up",
-                                            serde_json::to_vec(&payload)
-                                                .map(|value| value.len())
-                                                .unwrap_or_default(),
-                                        );
-                                        let _ = app.emit("fling://lan/peer-up", payload);
-                                    }
+                                        discovery_diagnostics::Reason::LanDisabled
+                                    } else if endpoints.is_empty() {
+                                        discovery_diagnostics::Reason::NoEligible
+                                    } else {
+                                        discovery_diagnostics::Reason::AlreadyPublished
+                                    };
+                                    discovery_diagnostics::record(
+                                        discovery_diagnostics::Event::LanUiSuppressed(reason),
+                                    );
                                 }
                             }
                             _ => {}
@@ -1434,6 +1681,9 @@ fn discovery_thread(
                         app.state::<native_lan_runtime::NativeLanRuntime>()
                             .remove_peer(&fullname);
                         if let Some(id) = peers.remove(&fullname) {
+                            if !peers.known_ids.contains(&id) {
+                                lan_published_ids.remove(&id);
+                            }
                             discovery_diagnostics::record(
                                 discovery_diagnostics::Event::PeerDownCount(
                                     peers.known_ids.len().min(u32::MAX as usize) as u32,
@@ -1452,16 +1702,102 @@ fn discovery_thread(
                                         .map(|value| value.len())
                                         .unwrap_or_default(),
                                 );
-                                let _ = app.emit("fling://lan/peer-down", payload);
+                                let success = app.emit("fling://lan/peer-down", payload).is_ok();
+                                discovery_diagnostics::record(
+                                    discovery_diagnostics::Event::LanUiEvent { up: false, success },
+                                );
                             }
                         }
                     }
                     _ => {}
                 }
+                if let Some((_, _, tracker, _, ticket)) = refresh_round.as_ref() {
+                    ticket.update_counts(diagnostics_counts(
+                        &tracker.counts(),
+                        tracker.resolved_services(),
+                    ));
+                }
+            }
+        }
+        let end = refresh_round.as_ref().and_then(|(_, _, tracker, _, _)| {
+            let now = std::time::Instant::now();
+            if tracker.confirmation_expired(now) {
+                Some(false)
+            } else if tracker.complete(now) {
+                Some(true)
+            } else {
+                None
+            }
+        });
+        if let Some(completed) = end {
+            if let Some((_, _, tracker, reply, ticket)) = refresh_round.take() {
+                ticket.update_counts(diagnostics_counts(
+                    &tracker.counts(),
+                    tracker.resolved_services(),
+                ));
+                let (outcome, reason) = if completed {
+                    (
+                        discovery_diagnostics::Outcome::Completed,
+                        discovery_diagnostics::Reason::None,
+                    )
+                } else {
+                    (
+                        discovery_diagnostics::Outcome::Timeout,
+                        discovery_diagnostics::Reason::StartTimeout,
+                    )
+                };
+                if finish_refresh(&ticket, outcome, reason) {
+                    let _ = reply.send(if completed {
+                        Ok(tracker.counts())
+                    } else {
+                        Err("mDNS browse start confirmation timed out".to_string())
+                    });
+                }
             }
         }
     }
+    if let Some((_, _, tracker, reply, ticket)) = refresh_round.take() {
+        ticket.update_counts(diagnostics_counts(
+            &tracker.counts(),
+            tracker.resolved_services(),
+        ));
+        if finish_refresh(
+            &ticket,
+            discovery_diagnostics::Outcome::Error,
+            discovery_diagnostics::Reason::WorkerDisconnected,
+        ) {
+            let _ = reply.send(Err("mDNS discovery worker stopped".to_string()));
+        }
+    }
     let _ = daemon.shutdown();
+}
+
+#[tauri::command]
+async fn discovery_report_ui(
+    received_up: u32,
+    received_down: u32,
+    rendered_peers: u32,
+    reason: String,
+) -> Result<(), String> {
+    use discovery_diagnostics::UiReason;
+    let reason = match reason.as_str() {
+        "initialized" => UiReason::Initialized,
+        "peer-up" => UiReason::PeerUp,
+        "peer-down" => UiReason::PeerDown,
+        "refresh-completed" => UiReason::RefreshCompleted,
+        _ => return Err("无效的诊断状态类别".to_string()),
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        discovery_diagnostics::record(discovery_diagnostics::Event::UiSnapshot {
+            received_up,
+            received_down,
+            rendered_peers,
+            reason,
+        })
+    })
+    .await
+    .map_err(|_| "UI diagnostics task failed".to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1472,30 +1808,64 @@ fn discovery_set_browsing(app: tauri::AppHandle, on: bool) -> Result<(), String>
 }
 
 #[tauri::command]
-async fn discovery_refresh(app: tauri::AppHandle) -> Result<(), String> {
+async fn discovery_refresh(app: tauri::AppHandle) -> Result<discovery_round::RoundCounts, String> {
     let tx = app.state::<DiscoveryState>().tx.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let ticket = discovery_round::RefreshTicket::new(discovery_diagnostics::next_round());
+    discovery_diagnostics::record_for_round(
+        ticket.round_id(),
+        0,
+        discovery_diagnostics::Event::RefreshRequested,
+    );
+    let worker_ticket = ticket.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let ticket = worker_ticket;
         let (reply, result) = mpsc::sync_channel(1);
-        discovery_diagnostics::record(discovery_diagnostics::Event::RefreshRequested);
-        tx.send(DiscoveryCmd::Refresh { reply }).map_err(|_| {
-            discovery_diagnostics::record(discovery_diagnostics::Event::RefreshFailed);
-            "mDNS discovery 线程已停止，无法刷新".to_string()
-        })?;
-        result
-            .recv_timeout(DISCOVERY_REFRESH_TIMEOUT + std::time::Duration::from_secs(1))
-            .map_err(|error| match error {
-                mpsc::RecvTimeoutError::Timeout => {
-                    discovery_diagnostics::record(discovery_diagnostics::Event::RefreshTimeout);
-                    "等待 mDNS 刷新结果超时".to_string()
-                }
-                mpsc::RecvTimeoutError::Disconnected => {
-                    discovery_diagnostics::record(discovery_diagnostics::Event::RefreshFailed);
-                    "mDNS discovery 线程未返回刷新结果".to_string()
-                }
-            })?
+        if tx
+            .send(DiscoveryCmd::Refresh {
+                ticket: ticket.clone(),
+                reply,
+            })
+            .is_err()
+        {
+            finish_refresh(
+                &ticket,
+                discovery_diagnostics::Outcome::Error,
+                discovery_diagnostics::Reason::WorkerDisconnected,
+            );
+            return Err("mDNS discovery 线程已停止，无法刷新".to_string());
+        }
+        match result.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                finish_refresh(
+                    &ticket,
+                    discovery_diagnostics::Outcome::Timeout,
+                    discovery_diagnostics::Reason::ReplyTimeout,
+                );
+                Err("等待 mDNS 刷新结果超时".to_string())
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                finish_refresh(
+                    &ticket,
+                    discovery_diagnostics::Outcome::Error,
+                    discovery_diagnostics::Reason::WorkerDisconnected,
+                );
+                Err("mDNS discovery 线程未返回刷新结果".to_string())
+            }
+        }
     })
-    .await
-    .map_err(|error| format!("mDNS 刷新工作线程失败: {error}"))?
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            finish_refresh(
+                &ticket,
+                discovery_diagnostics::Outcome::Error,
+                discovery_diagnostics::Reason::WorkerDisconnected,
+            );
+            Err("mDNS 刷新工作线程失败".to_string())
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1805,6 +2175,9 @@ fn main() {
         .setup(|app| {
             // Device identity (created on first run) + mDNS discovery thread.
             let (_, cfg) = ensure_config(app.handle())?;
+            if let Ok(data_dir) = app.path().app_data_dir() {
+                discovery_diagnostics::initialize(&data_dir);
+            }
             let (listeners, mut native_port, ipv6_ready) =
                 match native_lan_runtime::bind_lan_listeners() {
                     Ok(bound) => bound,
@@ -1814,9 +2187,14 @@ fn main() {
                     }
                 };
             let (tx, rx) = mpsc::channel::<DiscoveryCmd>();
-            if let Ok(data_dir) = app.path().app_data_dir() {
-                discovery_diagnostics::initialize(&data_dir);
+            discovery_diagnostics::record(discovery_diagnostics::Event::ListenerInit {
+                ipv4_ready: native_port != 0,
+                ipv6_ready,
+            });
+            if native_port == 0 {
+                discovery_diagnostics::record(discovery_diagnostics::Event::ListenerFailed);
             }
+            discovery_diagnostics::record(discovery_diagnostics::Event::InterfacePolicy);
             app.manage(ConfigLock(Mutex::new(())));
             app.manage(ReceivedFileStore::default());
             app.manage(RemoteConfig(Mutex::new(None)));
@@ -1857,6 +2235,7 @@ fn main() {
             pick_download_dir,
             discovery_set_browsing,
             discovery_refresh,
+            discovery_report_ui,
             discovery_export_diagnostics,
             discovery_set_discoverable,
             native_lan_runtime::native_lan_start_mode,
@@ -2009,6 +2388,61 @@ mod tests {
         cleared.sort();
         assert_eq!(cleared, vec!["id1".to_string(), "id2".to_string()]);
         assert!(ps.insert("a._fling._tcp.local.", "id1"));
+    }
+
+    #[test]
+    fn lan_publication_recovers_cached_peer_after_ineligible_resolution_and_refresh() {
+        let mut peers = PeerSet::default();
+        let mut lan = LanPublishedSet::default();
+        let fullname = "peer._fling._tcp.local.";
+        assert!(peers.insert(fullname, "device")); // valid TXT, no eligible endpoint: legacy gate remembers it
+        assert!(!lan.should_emit("device", true, false));
+        let mut browsing = true;
+        refresh_browse(&mut browsing, || Ok(()), || Ok(())).unwrap();
+        assert!(!peers.insert(fullname, "device")); // old outer gate would suppress this cached resolve
+        assert!(lan.should_emit("device", true, true)); // later resolve / refresh cached replay
+        lan.mark_emitted("device", true);
+        assert!(!lan.should_emit("device", true, true)); // repeated resolve is suppressed
+        lan.remove("device"); // removal allows future discovery again
+        assert!(lan.should_emit("device", true, true));
+        assert!(peers.known_ids.contains("device")); // no global peer clearing required
+    }
+
+    #[test]
+    fn refresh_outcome_guard_preserves_other_round_and_observed_counts() {
+        use discovery_diagnostics::{Outcome, Reason};
+        let active = discovery_round::RefreshTicket::new(900);
+        let rejected = discovery_round::RefreshTicket::new(901);
+        assert!(finish_refresh(&rejected, Outcome::Error, Reason::Overlap));
+        assert!(!rejected.finish_once());
+        assert!(!active.is_terminal());
+        let counts = discovery_diagnostics::PhaseCounts {
+            resolved_services: 2,
+            valid_services: 1,
+            lan_eligible_peers: 0,
+            ui_emitted_peers: 0,
+        };
+        active.update_counts(counts);
+        assert!(finish_refresh(
+            &active,
+            Outcome::Timeout,
+            Reason::ReplyTimeout
+        ));
+        assert!(!finish_refresh(&active, Outcome::Completed, Reason::None));
+        assert!(!finish_refresh(
+            &active,
+            Outcome::Error,
+            Reason::WorkerDisconnected
+        ));
+        assert_eq!(active.counts(), counts);
+    }
+
+    #[test]
+    fn failed_lan_emit_is_not_marked_published() {
+        let mut lan = LanPublishedSet::default();
+        assert!(lan.should_emit("device", true, true));
+        lan.mark_emitted("device", false);
+        assert!(lan.should_emit("device", true, true));
     }
 
     #[test]

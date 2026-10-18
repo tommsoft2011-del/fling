@@ -28,6 +28,7 @@ for (const pattern of forbidden) {
 const allowedCommands = new Set([
   'discovery_refresh',
   'discovery_export_diagnostics',
+  'discovery_report_ui',
   'native_lan_start_mode',
   'native_lan_stop_mode',
   'native_lan_pick_source',
@@ -55,5 +56,15 @@ assert.ok(events.length > 0, 'expected aggregate LAN event listeners');
 for (const event of events) {
   assert.ok(allowedEvents.has(event), `unexpected LAN IPC event: ${event}`);
 }
+
+const nativeSource = readFileSync(new URL('../src-tauri/src/main.rs', import.meta.url), 'utf8');
+const reportSignature = /async fn discovery_report_ui\s*\(([^)]*)\)/.exec(nativeSource)?.[1] ?? '';
+for (const field of ['received_up', 'received_down', 'rendered_peers']) {
+  assert.match(reportSignature, new RegExp(`\\b${field}:\\s*u32\\b`));
+}
+assert.match(reportSignature, /\breason:\s*String\b/);
+assert.doesNotMatch(reportSignature, /\breport:/, 'Tauri expects flat camelCase arguments, not an unprovided wrapper');
+assert.match(nativeSource, /async fn discovery_refresh\s*\([^)]*\)\s*->\s*Result<discovery_round::RoundCounts,\s*String>/);
+assert.match(source, /invoke<DiscoveryResult>\('discovery_refresh'\)/);
 
 console.log(`LAN IPC contract passed: ${commands.length} allowed command call sites, ${events.length} allowed event listeners; no file payload APIs.`);

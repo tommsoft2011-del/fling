@@ -15,6 +15,12 @@ interface LanIdentity {
   deviceName: string;
 }
 
+interface DiscoveryResult {
+  validServices: number;
+  lanEligiblePeers: number;
+  uiEmittedPeers: number;
+}
+
 interface PairRequest {
   sessionId: string;
   taskId: string;
@@ -71,12 +77,32 @@ let selectedPair: PairRequest | null = null;
 let selectedManifest: IncomingManifest | null = null;
 let unlisten: UnlistenFn[] = [];
 let initialized = false;
+let receivedPeerUp = 0;
+let receivedPeerDown = 0;
+let lastDiscoveryResult: DiscoveryResult | null = null;
+
+function reportDiscoveryUi(reason: 'initialized' | 'peer-up' | 'peer-down' | 'refresh-completed'): void {
+  // Counts only: never send names, addresses, identifiers or log content through this IPC.
+  void invoke('discovery_report_ui', {
+    receivedUp: receivedPeerUp,
+    receivedDown: receivedPeerDown,
+    renderedPeers: selectablePeerCount(),
+    reason,
+  }).catch(() => {}); // Diagnostics must not break discovery or transfers.
+}
 
 const byId = <T extends HTMLElement>(id: string): T => {
   const element = document.getElementById(id);
   if (!element) throw new Error(`Missing LAN UI element: ${id}`);
   return element as T;
 };
+
+function selectablePeerCount(): number {
+  return Array.from(byId<HTMLSelectElement>('lanPeerSelect').children).filter((child) => {
+    const option = child as HTMLOptionElement;
+    return Boolean(option.value) && !option.disabled;
+  }).length;
+}
 
 function formatBytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return '0 B';
@@ -89,6 +115,12 @@ function setStatus(message: string, error = false): void {
   const status = byId<HTMLDivElement>('lanStatus');
   status.textContent = message;
   status.classList.toggle('error', error);
+}
+
+function renderDiscoveryPhases(): void {
+  if (!lastDiscoveryResult) return;
+  const result = lastDiscoveryResult;
+  byId<HTMLElement>('lanDiscoveryPhases').textContent = `最近一轮应用层观察：有效服务 ${result.validServices}；LAN 可用设备 ${result.lanEligiblePeers}；成功提交界面事件的设备 ${result.uiEmittedPeers}；当前界面可选条目 ${selectablePeerCount()}。提交事件不等于界面已收到，也不代表网卡报文。`;
 }
 
 function renderPeers(): void {
@@ -106,7 +138,9 @@ function renderPeers(): void {
     select.append(option);
   }
   if (previous && peers.has(previous)) select.value = previous;
-  byId<HTMLElement>('lanPeerStatus').textContent = peers.size ? `发现 ${peers.size} 台附近设备，可选择后请求配对` : '尚未发现附近设备；请确认两台设备在同一局域网并允许本地设备发现';
+  const selectableCount = selectablePeerCount();
+  byId<HTMLElement>('lanPeerStatus').textContent = selectableCount ? `发现 ${selectableCount} 台附近设备，可选择后请求配对` : '尚未发现附近设备；请确认两台设备在同一局域网并允许本地设备发现';
+  renderDiscoveryPhases();
   updateSendEnabled();
 }
 
@@ -339,12 +373,16 @@ export async function initLanPage(): Promise<LanIdentity> {
   if (initialized) throw new Error('LAN page already initialized');
 
   unlisten.push(await listen<Peer>('fling://lan/peer-up', ({ payload }) => {
+    receivedPeerUp = Math.min(0xffffffff, receivedPeerUp + 1);
     peers.set(payload.id, payload);
     renderPeers();
+    reportDiscoveryUi('peer-up');
   }));
   unlisten.push(await listen<{ id: string }>('fling://lan/peer-down', ({ payload }) => {
+    receivedPeerDown = Math.min(0xffffffff, receivedPeerDown + 1);
     peers.delete(payload.id);
     renderPeers();
+    reportDiscoveryUi('peer-down');
   }));
   unlisten.push(await listen<PairRequest>('fling://lan/pairing', ({ payload }) => showPair(payload)));
   unlisten.push(await listen<IncomingManifest>('fling://lan/manifest', ({ payload }) => showManifest(payload)));
@@ -359,17 +397,23 @@ export async function initLanPage(): Promise<LanIdentity> {
     refreshButton.setAttribute('aria-busy', 'true');
     status.classList.toggle('error', false);
     status.textContent = '正在搜索附近设备，请稍候…';
+    lastDiscoveryResult = null;
+    byId<HTMLElement>('lanDiscoveryPhases').textContent = '正在收集本轮应用层阶段统计…';
     try {
-      await invoke('discovery_refresh');
-      // mDNS keeps listening. This bounds the manual search round, not peer reachability.
-      await new Promise<void>((resolve) => setTimeout(resolve, 3000));
-      status.textContent = peers.size
-        ? `本轮搜索结束，当前发现 ${peers.size} 台附近设备；列表仍会持续更新。`
+      // Native owns the bounded search round; a browse-start acknowledgment is not completion.
+      const result = await invoke<DiscoveryResult>('discovery_refresh');
+      lastDiscoveryResult = result;
+      renderDiscoveryPhases();
+      const selectableCount = selectablePeerCount();
+      status.textContent = selectableCount
+        ? `本轮搜索结束，当前发现 ${selectableCount} 台附近设备；列表仍会持续更新。`
         : '本轮搜索结束，仍未发现附近设备；可再次搜索，请检查同一局域网及防火墙。';
     } catch {
+      byId<HTMLElement>('lanDiscoveryPhases').textContent = '本轮搜索未正常完成；请导出诊断日志查看超时或失败类别。';
       status.textContent = '搜索附近设备失败，可重试；请检查本地网络和防火墙是否允许设备发现。';
       status.classList.toggle('error', true);
     } finally {
+      reportDiscoveryUi('refresh-completed');
       refreshButton.disabled = false;
       refreshButton.textContent = '重新搜索附近设备';
       refreshButton.setAttribute('aria-busy', 'false');
@@ -570,5 +614,6 @@ export async function initLanPage(): Promise<LanIdentity> {
   initialized = true;
   byId<HTMLDivElement>('lanDeviceLine').textContent = `本机：${identity.deviceName} · 仅本地网络，不连接云端`;
   renderPeers();
+  reportDiscoveryUi('initialized');
   return identity;
 }
