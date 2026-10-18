@@ -139,6 +139,7 @@ pub enum PairStage {
     UiDecisionRejected,
     UiDecisionCancelled,
     IceCandidateSummary,
+    Transport,
 }
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -148,6 +149,7 @@ pub enum PairState {
     Timeout,
     Error,
     Rejected,
+    Closed,
 }
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -178,6 +180,7 @@ pub enum PairReason {
     ControlWriteFailed,
     ControlWriteTimeout,
     LocalOperationFailed,
+    NotReported,
 }
 
 #[derive(Clone, Debug)]
@@ -219,6 +222,8 @@ pub struct PairEntry {
     candidate_counts: Option<CandidateCounts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     approved: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport: Option<crate::transport_diagnostics::Detail>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -258,6 +263,7 @@ pub enum FunnelEvent {
     AnswerWriteError,
     AnswerWriteTimeout,
     AnswerReceived,
+    IceCandidateWritten,
     IceGatheringNew,
     IceGatheringGathering,
     IceGatheringComplete,
@@ -338,6 +344,7 @@ pub struct CandidateCounts {
 }
 #[derive(Default)]
 struct FunnelState {
+    transport: crate::transport_diagnostics::State,
     candidates: HashMap<
         (
             CandidateFamily,
@@ -413,9 +420,160 @@ impl FunnelTrace {
             code_match,
             candidate_counts: None,
             approved,
+            transport: None,
         };
         self.trace.emit(entry);
     }
+    pub fn detail(&self, detail: crate::transport_diagnostics::Detail) {
+        let mut entry = self.trace.base_transport_entry();
+        entry.transport = Some(detail);
+        self.trace.emit(entry);
+    }
+    pub fn phase(
+        &self,
+        phase: crate::transport_diagnostics::Phase,
+        outcome: crate::transport_diagnostics::Outcome,
+        reason: crate::transport_diagnostics::Reason,
+        count: usize,
+    ) {
+        self.detail(crate::transport_diagnostics::Detail::new(
+            phase, outcome, reason, count,
+        ));
+    }
+    pub fn count(&self, step: crate::transport_diagnostics::CandidateStep, n: usize) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .transport
+            .count(step, n);
+    }
+    pub fn candidate_rejected(&self, reason: crate::transport_diagnostics::Reason) {
+        use crate::transport_diagnostics::CandidateStep;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.transport.count(CandidateStep::Rejected, 1);
+        let n = state.transport.rejections.entry(reason).or_default();
+        *n = n.saturating_add(1);
+    }
+    pub fn terminal(&self, reason: crate::transport_diagnostics::Reason) -> bool {
+        use crate::transport_diagnostics::{Detail, Outcome, Phase};
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.transport.first_terminal.is_some() {
+            return false;
+        }
+        state.transport.first_terminal = Some(reason);
+        let mut detail = Detail::new(
+            Phase::FirstTerminal,
+            if reason == crate::transport_diagnostics::Reason::Completed {
+                Outcome::Ok
+            } else {
+                Outcome::Error
+            },
+            reason,
+            0,
+        );
+        detail.first_terminal = Some(reason);
+        // Emit while holding the diagnostic-only lock: first terminal is ordered
+        // before a concurrent cleanup/close, and cannot be overwritten.
+        self.detail(detail);
+        drop(state);
+        self.snapshot();
+        self.flush_candidates();
+        true
+    }
+    pub fn local_close_requested(&self) {
+        use crate::transport_diagnostics::{CloseOrigin, Detail, Outcome, Phase, Reason};
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.transport.local_close_requested {
+            return;
+        }
+        state.transport.local_close_requested = true;
+        let mut detail = Detail::new(
+            Phase::LocalCloseRequested,
+            Outcome::Start,
+            state.transport.cleanup.unwrap_or(Reason::NotReported),
+            0,
+        );
+        detail.close_origin = Some(CloseOrigin::LocalCleanup);
+        detail.close_observed = Some(false);
+        detail.local_close_requested = Some(true);
+        self.detail(detail);
+    }
+    pub fn cleanup(&self, reason: crate::transport_diagnostics::Reason) {
+        use crate::transport_diagnostics::{Detail, Outcome, Phase};
+        self.terminal(reason);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.transport.cleanup.is_some() {
+            return;
+        }
+        state.transport.cleanup = Some(reason);
+        let mut detail = Detail::new(Phase::Cleanup, Outcome::Start, reason, 0);
+        detail.first_terminal = state.transport.first_terminal;
+        self.detail(detail);
+        drop(state);
+        self.snapshot();
+        self.flush_candidates();
+    }
+    pub fn snapshot(&self) {
+        use crate::transport_diagnostics::{Detail, Outcome, Phase, Reason};
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut detail = Detail::new(Phase::CandidateSummary, Outcome::Snapshot, Reason::None, 0);
+        detail.candidate_steps = Some(state.transport.steps.clone());
+        detail.candidate_rejections = Some(state.transport.rejections.clone());
+        self.detail(detail);
+    }
+    pub fn transition(
+        &self,
+        phase: crate::transport_diagnostics::Phase,
+        outcome: crate::transport_diagnostics::Outcome,
+    ) {
+        use crate::transport_diagnostics::{CloseOrigin, Detail, Outcome, Phase, Reason};
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Initial and subsequent DC states share a single previous-state slot.
+        let key = if phase == Phase::DataChannelInitial {
+            Phase::DataChannelTransition
+        } else {
+            phase
+        };
+        if state.transport.transitions.get(&key) == Some(&outcome) {
+            return;
+        }
+        state.transport.transitions.insert(key, outcome);
+        let mut detail = Detail::new(phase, outcome, Reason::NotReported, 0);
+        if matches!(
+            phase,
+            Phase::DataChannelInitial | Phase::DataChannelTransition
+        ) {
+            detail.close_observed = Some(outcome == Outcome::Closed);
+            // A local request and a later Closed callback are not causal proof.
+            detail.close_origin = Some(CloseOrigin::Unknown);
+            detail.local_close_requested = Some(state.transport.local_close_requested);
+        }
+        self.detail(detail);
+        let terminal = match (phase, outcome) {
+            (Phase::IceConnection, Outcome::Failed) => Some(Reason::IceFailed),
+            (Phase::IceConnection, Outcome::Disconnected) => Some(Reason::IceDisconnected),
+            (Phase::IceConnection, Outcome::Closed) => Some(Reason::IceClosed),
+            (Phase::DataChannelInitial | Phase::DataChannelTransition, Outcome::Closed) => {
+                Some(Reason::DataChannelClosed)
+            }
+            _ => None,
+        };
+        let first = terminal.filter(|_| {
+            state.transport.cleanup.is_none() && state.transport.first_terminal.is_none()
+        });
+        if let Some(reason) = first {
+            state.transport.first_terminal = Some(reason);
+            let mut detail = Detail::new(Phase::FirstTerminal, Outcome::Error, reason, 0);
+            detail.first_terminal = Some(reason);
+            self.detail(detail);
+        }
+        drop(state);
+        if first.is_some() {
+            self.snapshot();
+            self.flush_candidates();
+        }
+    }
+
     pub fn candidate(
         &self,
         family: CandidateFamily,
@@ -510,6 +668,7 @@ impl FunnelTrace {
             code_match: None,
             candidate_counts: Some(c),
             approved: None,
+            transport: None,
         });
     }
 }
@@ -533,6 +692,7 @@ fn funnel_mapping(
         | OfferWriteError | OfferWriteTimeout => PairStage::Offer,
         AnswerGenerated | AnswerError | AnswerQueued | AnswerSent | AnswerReceived
         | AnswerWriteStart | AnswerWriteError | AnswerWriteTimeout => PairStage::Answer,
+        IceCandidateWritten => PairStage::IceCandidateSummary,
         IceGatheringNew | IceGatheringGathering | IceGatheringComplete => PairStage::IceGathering,
         IceConnectionNew
         | IceConnectionChecking
@@ -581,6 +741,7 @@ fn funnel_mapping(
         | ManifestDenied
         | FirstFrameSendError
         | FirstFrameAppendError => PairState::Error,
+        DataChannelClose | IceConnectionClosed => PairState::Closed,
         DecisionLocalApprovedMismatch => PairState::Rejected,
         _ => PairState::Ok,
     };
@@ -594,6 +755,7 @@ fn funnel_mapping(
         DecisionLocalRejected | PeerDecisionRejected | ManifestDenied => {
             PairReason::DecisionRejected
         }
+        DataChannelClose => PairReason::NotReported,
         PeerDecisionInvalid => PairReason::DecisionInvalid,
         _ => PairReason::None,
     };
@@ -613,6 +775,27 @@ fn funnel_mapping(
 }
 
 impl PairTrace {
+    fn base_transport_entry(&self) -> PairEntry {
+        PairEntry {
+            attempt: self.attempt,
+            role: self.role,
+            ui_attempt: self.ui_attempt,
+            attempt_elapsed_ms: self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            stage: PairStage::Transport,
+            state: PairState::Start,
+            reason: PairReason::None,
+            endpoint_count: None,
+            candidate: None,
+            local_address_class: None,
+            reachability: None,
+            evidence: "typed_transport_observation_not_root_cause_or_remote_close_proof",
+            funnel_event: None,
+            code_match: None,
+            candidate_counts: None,
+            approved: None,
+            transport: None,
+        }
+    }
     pub fn id(&self) -> u64 {
         self.attempt
     }
@@ -640,6 +823,7 @@ impl PairTrace {
             code_match: None,
             candidate_counts: None,
             approved: None,
+            transport: None,
         };
         // A pairing attempt is not a discovery round. Its independent local sequence
         // and monotonic clock are explicit, without any session/task/device identity.
@@ -698,6 +882,7 @@ impl PairTrace {
             code_match: None,
             candidate_counts: None,
             approved: None,
+            transport: None,
         }
     }
 
@@ -862,6 +1047,7 @@ mod tests {
             code_match: None,
             candidate_counts: None,
             approved: None,
+            transport: None,
         };
         let value = serde_json::to_value(entry).unwrap();
         assert_eq!(value["uiAttempt"], 12);

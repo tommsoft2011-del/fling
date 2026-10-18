@@ -6,6 +6,7 @@ use crate::pairing_diagnostics::{
     new_pair_trace, CandidateDiagnostic, FunnelEvent, FunnelTrace, PairReason, PairRole, PairStage,
     PairState, PairTrace, SourceFingerprint,
 };
+use crate::transport_diagnostics::{CandidateStep as Cs, Reason as Tr};
 use crate::{ensure_config, DiscoveryCmd, DiscoveryState};
 #[path = "native_lan_transfer.rs"]
 mod transfer;
@@ -227,11 +228,12 @@ impl NativeLanSession {
             NativeControlMessage::P2pOffer { .. } => FunnelEvent::OfferSent,
             NativeControlMessage::P2pAnswer { .. } => FunnelEvent::AnswerSent,
             NativeControlMessage::FileManifest { .. } => FunnelEvent::ManifestSent,
+            NativeControlMessage::P2pIce { candidate: Some(_) } => FunnelEvent::IceCandidateWritten,
             _ => return,
         };
         if let Ok(mut writes) = self.diagnostic_control_writes.lock() {
             // Diagnostic failure must never affect control ordering or transport.
-            if writes.len() < 8 {
+            if writes.len() < 256 {
                 writes.insert(frame.sequence, event);
             }
         }
@@ -244,6 +246,9 @@ impl NativeLanSession {
             .ok()
             .and_then(|writes| writes.get(&sequence).copied());
         if let Some(event) = event {
+            if event == FunnelEvent::IceCandidateWritten {
+                return;
+            }
             self.diagnostic.record(match event {
                 FunnelEvent::OfferSent => FunnelEvent::OfferWriteStart,
                 FunnelEvent::AnswerSent => FunnelEvent::AnswerWriteStart,
@@ -260,6 +265,10 @@ impl NativeLanSession {
             .ok()
             .and_then(|mut writes| writes.remove(&sequence));
         if let Some(event) = event {
+            if event == FunnelEvent::IceCandidateWritten {
+                self.diagnostic.count(Cs::WriteFailed, 1);
+                return;
+            }
             self.diagnostic.record(match (event, timed_out) {
                 (FunnelEvent::OfferSent, false) => FunnelEvent::OfferWriteError,
                 (FunnelEvent::OfferSent, true) => FunnelEvent::OfferWriteTimeout,
@@ -279,6 +288,10 @@ impl NativeLanSession {
             .ok()
             .and_then(|mut writes| writes.remove(&sequence));
         if let Some(event) = event {
+            if event == FunnelEvent::IceCandidateWritten {
+                self.diagnostic.count(Cs::Written, 1);
+                return;
+            }
             self.diagnostic.record(event);
         }
     }
@@ -468,6 +481,13 @@ impl NativeLanRuntime {
     fn remove_session(&self, session_id: &str) {
         if let Ok(mut sessions) = self.inner.sessions.lock() {
             if let Some(session) = sessions.remove(session_id) {
+                session
+                    .diagnostic
+                    .cleanup(if session.completed.load(Ordering::Acquire) {
+                        Tr::Completed
+                    } else {
+                        Tr::SessionRemoval
+                    });
                 let _ = session.cancel_tx.send(true);
                 transfer::close(&session);
                 if let Ok(mut auth) = session.auth.lock() {
@@ -488,6 +508,8 @@ impl NativeLanRuntime {
             .map(|mut sessions| std::mem::take(&mut *sessions))
             .unwrap_or_default();
         for session in sessions.into_values() {
+            session.diagnostic.terminal(Tr::RuntimeClear);
+            session.diagnostic.cleanup(Tr::RuntimeClear);
             let _ = session.cancel_tx.send(true);
             transfer::close(&session);
             if let Ok(mut auth) = session.auth.lock() {
@@ -1188,7 +1210,12 @@ pub(crate) async fn native_lan_pair_decision(
             "fling://lan/progress",
             task_event(&session, "paired", 0, 0, 0, None),
         );
-        transfer::on_pair_confirmed(&app, &runtime, &session).await?;
+        transfer::on_pair_confirmed(&app, &runtime, &session)
+            .await
+            .map_err(|error| {
+                session.diagnostic.terminal(Tr::PeerInitialization);
+                error
+            })?;
     }
     Ok(())
 }
@@ -1248,6 +1275,8 @@ pub(crate) async fn native_lan_cancel(
         .map(|session| session.session_id.clone());
     if let Some(session_id) = session_id {
         if let Ok(session) = runtime.session(&session_id) {
+            session.diagnostic.terminal(Tr::LocalCancel);
+            session.diagnostic.cleanup(Tr::LocalCancel);
             let _ = try_enqueue_ordered_control(
                 &session.control_tx,
                 &session.control_send_lock,
@@ -2001,7 +2030,7 @@ mod tests {
         }
     }
 
-    fn observed_pair() -> (
+    pub(super) fn observed_pair() -> (
         NativeLanSession,
         NativeLanSession,
         PairTrace,
@@ -2032,7 +2061,7 @@ mod tests {
         )
     }
 
-    fn observed_decide(
+    pub(super) fn observed_decide(
         session: &NativeLanSession,
         approved: bool,
         code: &str,
@@ -2764,10 +2793,12 @@ async fn run_control_writer(
                 match result {
                     Ok(Ok(())) => { session.observe_control_written(frame.sequence); }
                     Ok(Err(error)) => {
+                        session.diagnostic.terminal(Tr::ControlWrite);
                         session.observe_control_write_failed(frame.sequence, false);
                         break format!("control write failed: {error}");
                     }
                     Err(_) => {
+                        session.diagnostic.terminal(Tr::ControlWriteTimeout);
                         session.observe_control_write_failed(frame.sequence, true);
                         break "control write timed out".to_string();
                     }
@@ -2782,6 +2813,17 @@ async fn run_control_writer(
     runtime.remove_session(&session.session_id);
 }
 
+async fn read_control_observed<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    diagnostic: &FunnelTrace,
+) -> Result<EncryptedControlFrame, std::io::Error> {
+    native_lan::read_control_frame(reader)
+        .await
+        .map_err(|error| {
+            diagnostic.terminal(Tr::ControlRead);
+            error
+        })
+}
 async fn run_control_reader(
     app: AppHandle,
     runtime: NativeLanRuntime,
@@ -2795,16 +2837,19 @@ async fn run_control_reader(
                 if changed.is_err() || *cancel_rx.borrow() { break "LAN session cancelled".to_string(); }
                 continue;
             }
-            frame = native_lan::read_control_frame(&mut reader) => {
+            frame = read_control_observed(&mut reader, &session.diagnostic) => {
                 match frame {
                     Ok(frame) => frame,
-                    Err(error) => break format!("LAN control read failed: {error}"),
+                    Err(error) => { break format!("LAN control read failed: {error}"); },
                 }
             }
         };
         let outcome = match process_control_frame(&session, &frame) {
             Ok(outcome) => outcome,
-            Err(error) => break error,
+            Err(error) => {
+                session.diagnostic.terminal(Tr::ControlDecode);
+                break error;
+            }
         };
         match outcome {
             ControlOutcome::PairingPending => {}
@@ -2816,6 +2861,7 @@ async fn run_control_reader(
                     task_event(&session, "paired", 0, 0, 0, None),
                 );
                 if let Err(error) = transfer::on_pair_confirmed(&app, &runtime, &session).await {
+                    session.diagnostic.terminal(Tr::PeerInitialization);
                     break error;
                 }
             }
@@ -2823,10 +2869,14 @@ async fn run_control_reader(
                 if let Err(error) =
                     transfer::handle_authenticated_control(&app, &runtime, &session, message).await
                 {
+                    session.diagnostic.terminal(Tr::AuthenticatedHandler);
                     break error;
                 }
             }
-            ControlOutcome::PeerRejected => break "peer rejected LAN pairing".to_string(),
+            ControlOutcome::PeerRejected => {
+                session.diagnostic.terminal(Tr::PairRejected);
+                break "peer rejected LAN pairing".to_string();
+            }
         }
     };
     eprintln!("{}", safe_failure_log("control-reader-stopped", &reason));
@@ -2972,6 +3022,7 @@ fn interrupt_session(
     {
         return;
     }
+    session.diagnostic.terminal(Tr::TransferFailure);
     let mut event = task_event(session, "interrupted", 0, 0, 0, Some(reason));
     event.failure_kind = Some(kind);
     eprintln!("[fling] LAN interruption: {kind:?}");

@@ -4,6 +4,7 @@ use super::{
     NATIVE_CHUNK_SIZE,
 };
 use crate::native_lan::{self, NativeControlMessage, NativeFileManifest};
+use crate::transport_diagnostics::{CandidateStep as Cs, Outcome as To, Phase as Tp, Reason as Tr};
 use crate::{
     ensure_config,
     pairing_diagnostics::{
@@ -188,11 +189,10 @@ pub(super) fn start_data_channel_router(
     });
 }
 
-pub(super) async fn on_pair_confirmed(
-    app: &AppHandle,
-    runtime: &NativeLanRuntime,
-    session: &Arc<NativeLanSession>,
-) -> Result<(), String> {
+fn initialize_peer(
+    session: &NativeLanSession,
+    install_callbacks: impl FnOnce(&PeerConnection),
+) -> Result<Option<(PeerConnectionFactory, PeerConnection)>, String> {
     if session
         .webrtc_started
         .compare_exchange(
@@ -203,7 +203,7 @@ pub(super) async fn on_pair_confirmed(
         )
         .is_err()
     {
-        return Ok(());
+        return Ok(None);
     }
     let mut config = RtcConfiguration::default();
     config.ice_servers.clear(); // Offline LAN mode never uses STUN/TURN or LiveKit relay.
@@ -221,7 +221,7 @@ pub(super) async fn on_pair_confirmed(
             return Err(format!("create native LAN PeerConnection: {error}"));
         }
     };
-    install_peer_callbacks(app.clone(), runtime.clone(), session.clone(), &peer);
+    install_callbacks(&peer);
     {
         let mut transfer = session
             .transfer
@@ -231,14 +231,40 @@ pub(super) async fn on_pair_confirmed(
             previous.close();
         }
         transfer.remote_description_set = false;
+        session
+            .diagnostic
+            .count(Cs::PendingAtPeerInstall, transfer.pending_remote_ice.len());
+        session.diagnostic.phase(
+            Tp::PeerInstall,
+            To::Ok,
+            Tr::None,
+            transfer.pending_remote_ice.len(),
+        );
         transfer.pending_remote_ice.clear();
     }
+    Ok(Some((factory, peer)))
+}
+
+pub(super) async fn on_pair_confirmed(
+    app: &AppHandle,
+    runtime: &NativeLanRuntime,
+    session: &Arc<NativeLanSession>,
+) -> Result<(), String> {
+    let Some((_factory, peer)) = initialize_peer(session, |peer| {
+        install_peer_callbacks(app.clone(), runtime.clone(), session.clone(), peer)
+    })?
+    else {
+        return Ok(());
+    };
     emit_lan_event(
         app,
         runtime,
         "fling://lan/progress",
         task_event_with_metadata(session, "connecting", 0, 0, 0, None, None),
     );
+    begin_offer(session, &peer).await
+}
+async fn begin_offer(session: &NativeLanSession, peer: &PeerConnection) -> Result<(), String> {
     if session.role == super::PairingRole::Initiator {
         let data_channel = peer
             .create_data_channel(DIRECT_CHANNEL_LABEL, DataChannelInit::default())
@@ -271,6 +297,38 @@ pub(super) async fn on_pair_confirmed(
     Ok(())
 }
 
+fn observe_gathering_state(
+    diagnostic: &crate::pairing_diagnostics::FunnelTrace,
+    state: livekit::webrtc::peer_connection::IceGatheringState,
+) {
+    use livekit::webrtc::peer_connection::IceGatheringState;
+    diagnostic.transition(
+        Tp::IceGathering,
+        match state {
+            IceGatheringState::New => To::New,
+            IceGatheringState::Gathering => To::Gathering,
+            IceGatheringState::Complete => To::Complete,
+        },
+    );
+}
+fn observe_ice_state(
+    diagnostic: &crate::pairing_diagnostics::FunnelTrace,
+    state: IceConnectionState,
+) {
+    diagnostic.transition(
+        Tp::IceConnection,
+        match state {
+            IceConnectionState::New => To::New,
+            IceConnectionState::Checking => To::Checking,
+            IceConnectionState::Connected => To::Connected,
+            IceConnectionState::Completed => To::Completed,
+            IceConnectionState::Failed => To::Failed,
+            IceConnectionState::Disconnected => To::Disconnected,
+            IceConnectionState::Closed => To::Closed,
+            _ => To::Unknown,
+        },
+    );
+}
 fn install_peer_callbacks(
     app: AppHandle,
     runtime: NativeLanRuntime,
@@ -290,6 +348,7 @@ fn install_peer_callbacks(
     let gathering_session = session.clone();
     peer.on_ice_gathering_state_change(Some(Box::new(move |state| {
         use livekit::webrtc::peer_connection::IceGatheringState;
+        observe_gathering_state(&gathering_session.diagnostic, state);
         match state {
             IceGatheringState::New => gathering_session
                 .diagnostic
@@ -302,11 +361,13 @@ fn install_peer_callbacks(
                     .diagnostic
                     .record(FunnelEvent::IceGatheringComplete);
                 gathering_session.diagnostic.flush_candidates();
+                gathering_session.diagnostic.snapshot();
             }
             _ => {}
         }
     })));
     peer.on_ice_candidate(Some(Box::new(move |candidate| {
+        candidate_session.diagnostic.count(Cs::Generated, 1);
         let candidate_line = candidate.candidate();
         let parsed = parse_candidate_summary(&candidate_line);
         let (family, transport, category, rejection) = parsed;
@@ -314,6 +375,14 @@ fn install_peer_callbacks(
             .diagnostic
             .candidate(family, transport, category, rejection);
         if !is_local_host_candidate(&candidate_line) {
+            candidate_session.diagnostic.count(
+                match rejection {
+                    CandidateRejection::NonHost => Cs::FilteredNonHost,
+                    CandidateRejection::NonLocal => Cs::FilteredNonLocal,
+                    _ => Cs::FilteredMalformed,
+                },
+                1,
+            );
             return;
         }
         let payload = IceCandidateInit {
@@ -323,6 +392,9 @@ fn install_peer_callbacks(
             username_fragment: None,
         };
         let Ok(candidate_json) = serde_json::to_string(&payload) else {
+            candidate_session
+                .diagnostic
+                .terminal(Tr::CandidatePayloadMalformed);
             let _ = candidate_session.cancel_tx.send(true);
             return;
         };
@@ -357,6 +429,7 @@ fn install_peer_callbacks(
     let state_runtime = runtime.clone();
     let state_session = session.clone();
     peer.on_ice_connection_state_change(Some(Box::new(move |state| {
+        observe_ice_state(&state_session.diagnostic, state);
         match state {
             IceConnectionState::New => state_session
                 .diagnostic
@@ -409,23 +482,42 @@ fn install_peer_callbacks(
             super::interrupt_session(&app, &runtime, &session, error.to_string(), kind);
         });
     })));
+    observe_gathering_state(&session.diagnostic, peer.ice_gathering_state());
+    observe_ice_state(&session.diagnostic, peer.ice_connection_state());
 }
 
+// Production and native-stack tests use this exact dispatch/handler boundary.
+// UI/manifest events remain in the AppHandle wrapper; this is not a GUI E2E harness.
+async fn route_transport_control(
+    runtime: &NativeLanRuntime,
+    session: &NativeLanSession,
+    message: NativeControlMessage,
+) -> Result<Option<NativeControlMessage>, String> {
+    match message {
+        NativeControlMessage::P2pOffer { sdp } => handle_offer(session, sdp).await?,
+        NativeControlMessage::P2pAnswer { sdp } => handle_answer(session, sdp).await?,
+        NativeControlMessage::P2pIce { candidate } => {
+            if let Some(candidate) = candidate {
+                receive_ice_candidate(runtime, session, candidate).await?;
+            }
+        }
+        message => return Ok(Some(message)),
+    }
+    Ok(None)
+}
 pub(super) async fn handle_authenticated_control(
     app: &AppHandle,
     runtime: &NativeLanRuntime,
     session: &Arc<NativeLanSession>,
     message: NativeControlMessage,
 ) -> Result<(), String> {
+    let Some(message) = route_transport_control(runtime, session, message).await? else {
+        return Ok(());
+    };
     match message {
-        NativeControlMessage::P2pOffer { sdp } => handle_offer(session, sdp).await,
-        NativeControlMessage::P2pAnswer { sdp } => handle_answer(session, sdp).await,
-        NativeControlMessage::P2pIce { candidate } => {
-            if let Some(candidate) = candidate {
-                receive_ice_candidate(runtime, session, candidate).await?;
-            }
-            Ok(())
-        }
+        NativeControlMessage::P2pOffer { .. }
+        | NativeControlMessage::P2pAnswer { .. }
+        | NativeControlMessage::P2pIce { .. } => unreachable!("transport lane already dispatched"),
         NativeControlMessage::FileManifest { manifest } => {
             receive_manifest(app, runtime, session, manifest)
         }
@@ -474,6 +566,7 @@ pub(super) async fn handle_authenticated_control(
             session
                 .completed
                 .store(true, std::sync::atomic::Ordering::Release);
+            session.diagnostic.terminal(Tr::Completed);
             schedule_session_cleanup(runtime.clone(), session.clone());
             Ok(())
         }
@@ -481,6 +574,7 @@ pub(super) async fn handle_authenticated_control(
             if task_id != session.task_id {
                 return Err("task cancellation binding mismatch".to_string());
             }
+            session.diagnostic.terminal(Tr::PeerCancel);
             Err("peer cancelled the transfer".to_string())
         }
         NativeControlMessage::TaskProgress { .. } => Ok(()),
@@ -490,19 +584,104 @@ pub(super) async fn handle_authenticated_control(
     }
 }
 
+// This helper observes the exact Result returned by production handlers; it
+// never serializes the error and never changes the Result or cleanup policy.
+fn observed<T>(
+    session: &NativeLanSession,
+    phase: Tp,
+    reason: Tr,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    match &result {
+        Ok(_) => session.diagnostic.phase(phase, To::Ok, Tr::None, 0),
+        Err(_) => {
+            session.diagnostic.phase(phase, To::Error, reason, 0);
+            session.diagnostic.terminal(reason);
+        }
+    }
+    result
+}
+fn validate_description(session: &NativeLanSession, sdp: &str, answer: bool) -> Result<(), String> {
+    let phase = if answer {
+        Tp::AnswerValidate
+    } else {
+        Tp::OfferValidate
+    };
+    session.diagnostic.phase(phase, To::Start, Tr::None, 0);
+    let expected = if answer {
+        super::PairingRole::Initiator
+    } else {
+        super::PairingRole::Responder
+    };
+    if session.role != expected {
+        return observed(
+            session,
+            phase,
+            Tr::UnexpectedRole,
+            Err("unexpected native LAN description role".to_string()),
+        );
+    }
+    observed(
+        session,
+        phase,
+        Tr::SdpPolicy,
+        ensure_signaling_sdp_is_candidate_free(sdp),
+    )
+}
+async fn apply_description(
+    session: &NativeLanSession,
+    sdp: &str,
+    answer: bool,
+) -> Result<PeerConnection, String> {
+    validate_description(session, sdp, answer)?;
+    let lookup = if answer {
+        Tp::AnswerPeerLookup
+    } else {
+        Tp::OfferPeerLookup
+    };
+    session.diagnostic.phase(lookup, To::Start, Tr::None, 0);
+    let peer = observed(session, lookup, Tr::PeerNotReady, current_peer(session))?;
+    let parse = if answer {
+        Tp::AnswerParse
+    } else {
+        Tp::OfferParse
+    };
+    session.diagnostic.phase(parse, To::Start, Tr::None, 0);
+    let description = observed(
+        session,
+        parse,
+        Tr::SdpParse,
+        SessionDescription::parse(
+            sdp,
+            if answer {
+                SdpType::Answer
+            } else {
+                SdpType::Offer
+            },
+        )
+        .map_err(|error| format!("parse native LAN description: {error}")),
+    )?;
+    let remote = if answer {
+        Tp::AnswerSetRemote
+    } else {
+        Tp::OfferSetRemote
+    };
+    session.diagnostic.phase(remote, To::Start, Tr::None, 0);
+    session
+        .diagnostic
+        .phase(Tp::SetRemoteDescription, To::Start, Tr::None, 0);
+    let applied = peer
+        .set_remote_description(description)
+        .await
+        .map_err(|error| format!("set native LAN remote description: {error}"));
+    let applied = observed(session, Tp::SetRemoteDescription, Tr::SetRemote, applied);
+    observed(session, remote, Tr::SetRemote, applied)?;
+    mark_remote_description_set(session).await?;
+    Ok(peer)
+}
 async fn handle_offer(session: &NativeLanSession, sdp: String) -> Result<(), String> {
     session.diagnostic.record(FunnelEvent::OfferReceived);
-    if session.role != super::PairingRole::Responder {
-        return Err("unexpected native LAN offer role".to_string());
-    }
-    ensure_signaling_sdp_is_candidate_free(&sdp)?;
-    let peer = current_peer(session)?;
-    let offer = SessionDescription::parse(&sdp, SdpType::Offer)
-        .map_err(|error| format!("parse native LAN offer: {error}"))?;
-    peer.set_remote_description(offer)
-        .await
-        .map_err(|error| format!("set native LAN remote offer: {error}"))?;
-    mark_remote_description_set(session).await?;
+    let peer = apply_description(session, &sdp, false).await?;
     let answer = peer
         .create_answer(AnswerOptions::default())
         .await
@@ -525,22 +704,10 @@ async fn handle_offer(session: &NativeLanSession, sdp: String) -> Result<(), Str
     )
     .await
 }
-
 async fn handle_answer(session: &NativeLanSession, sdp: String) -> Result<(), String> {
     session.diagnostic.record(FunnelEvent::AnswerReceived);
-    if session.role != super::PairingRole::Initiator {
-        return Err("unexpected native LAN answer role".to_string());
-    }
-    ensure_signaling_sdp_is_candidate_free(&sdp)?;
-    let peer = current_peer(session)?;
-    let answer = SessionDescription::parse(&sdp, SdpType::Answer)
-        .map_err(|error| format!("parse native LAN answer: {error}"))?;
-    peer.set_remote_description(answer)
-        .await
-        .map_err(|error| format!("set native LAN remote answer: {error}"))?;
-    mark_remote_description_set(session).await
+    apply_description(session, &sdp, true).await.map(|_| ())
 }
-
 fn current_peer(session: &NativeLanSession) -> Result<PeerConnection, String> {
     session
         .transfer
@@ -550,7 +717,6 @@ fn current_peer(session: &NativeLanSession) -> Result<PeerConnection, String> {
         .clone()
         .ok_or_else(|| "native LAN PeerConnection is not ready".to_string())
 }
-
 async fn mark_remote_description_set(session: &NativeLanSession) -> Result<(), String> {
     let candidates = {
         let mut transfer = session
@@ -560,33 +726,80 @@ async fn mark_remote_description_set(session: &NativeLanSession) -> Result<(), S
         transfer.remote_description_set = true;
         std::mem::take(&mut transfer.pending_remote_ice)
     };
-    for candidate in candidates {
-        add_remote_ice(session, &candidate).await?;
+    let total = candidates.len();
+    session.diagnostic.count(Cs::PendingTaken, total);
+    session
+        .diagnostic
+        .phase(Tp::PendingIceApply, To::Start, Tr::None, total);
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        if let Err((reason, error)) = add_remote_ice_classified(session, &candidate).await {
+            session
+                .diagnostic
+                .count(Cs::PendingAbandoned, total - index - 1);
+            session
+                .diagnostic
+                .phase(Tp::PendingIceApply, To::Error, reason, index);
+            return Err(error);
+        }
+        session.diagnostic.count(Cs::PendingApplied, 1);
     }
+    session
+        .diagnostic
+        .phase(Tp::PendingIceApply, To::Ok, Tr::None, total);
     Ok(())
 }
-
+fn rejected<T>(session: &NativeLanSession, reason: Tr, error: String) -> Result<T, String> {
+    session.diagnostic.candidate_rejected(reason);
+    session.diagnostic.terminal(reason);
+    Err(error)
+}
 async fn receive_ice_candidate(
     runtime: &NativeLanRuntime,
     session: &NativeLanSession,
     candidate_json: String,
 ) -> Result<(), String> {
+    session.diagnostic.count(Cs::Received, 1);
     if candidate_json.len() > 4096 {
-        return Err("ICE candidate exceeds the LAN control bound".to_string());
+        return rejected(
+            session,
+            Tr::CandidatePayloadBound,
+            "ICE candidate exceeds the LAN control bound".into(),
+        );
     }
-    let init: IceCandidateInit = serde_json::from_str(&candidate_json)
-        .map_err(|_| "invalid ICE candidate payload".to_string())?;
-    validate_peer_candidate(runtime, session, &init.candidate)?;
+    let init: IceCandidateInit = match serde_json::from_str(&candidate_json) {
+        Ok(init) => init,
+        Err(_) => {
+            return rejected(
+                session,
+                Tr::CandidatePayloadMalformed,
+                "invalid ICE candidate payload".into(),
+            )
+        }
+    };
+    if let Err((reason, error)) = classify_peer_candidate(runtime, session, &init.candidate) {
+        return rejected(session, reason, error);
+    }
     let ready = {
-        let mut transfer = session
-            .transfer
-            .lock()
-            .map_err(|error| format!("LAN transfer state lock: {error}"))?;
+        let mut transfer = match session.transfer.lock() {
+            Ok(transfer) => transfer,
+            Err(error) => {
+                return rejected(
+                    session,
+                    Tr::StateLock,
+                    format!("LAN transfer state lock: {error}"),
+                )
+            }
+        };
         if !transfer.remote_description_set || transfer.pc.is_none() {
             if transfer.pending_remote_ice.len() >= MAX_PENDING_ICE {
-                return Err("too many pending LAN ICE candidates".to_string());
+                return rejected(
+                    session,
+                    Tr::CandidatePendingBound,
+                    "too many pending LAN ICE candidates".into(),
+                );
             }
             transfer.pending_remote_ice.push(candidate_json.clone());
+            session.diagnostic.count(Cs::Pending, 1);
             false
         } else {
             true
@@ -597,41 +810,104 @@ async fn receive_ice_candidate(
     }
     Ok(())
 }
-
-async fn add_remote_ice(session: &NativeLanSession, candidate_json: &str) -> Result<(), String> {
-    let init: IceCandidateInit = serde_json::from_str(candidate_json)
-        .map_err(|_| "invalid ICE candidate payload".to_string())?;
-    let mid = init
-        .sdp_mid
-        .as_deref()
-        .ok_or_else(|| "ICE candidate missing sdpMid".to_string())?;
-    let mline = init
-        .sdp_mline_index
-        .ok_or_else(|| "ICE candidate missing sdpMLineIndex".to_string())?;
-    let candidate = IceCandidate::parse(mid, mline, &init.candidate)
-        .map_err(|error| format!("parse LAN ICE candidate: {error}"))?;
-    current_peer(session)?
-        .add_ice_candidate(candidate)
-        .await
-        .map_err(|error| format!("add LAN ICE candidate: {error}"))
+fn rejected_classified<T>(
+    session: &NativeLanSession,
+    reason: Tr,
+    error: String,
+) -> Result<T, (Tr, String)> {
+    session.diagnostic.candidate_rejected(reason);
+    session.diagnostic.terminal(reason);
+    Err((reason, error))
 }
-
-fn validate_peer_candidate(
+async fn add_remote_ice(session: &NativeLanSession, candidate_json: &str) -> Result<(), String> {
+    add_remote_ice_classified(session, candidate_json)
+        .await
+        .map_err(|(_, error)| error)
+}
+async fn add_remote_ice_classified(
+    session: &NativeLanSession,
+    candidate_json: &str,
+) -> Result<(), (Tr, String)> {
+    let init: IceCandidateInit = match serde_json::from_str(candidate_json) {
+        Ok(init) => init,
+        Err(_) => {
+            return rejected_classified(
+                session,
+                Tr::CandidatePayloadMalformed,
+                "invalid ICE candidate payload".into(),
+            )
+        }
+    };
+    let Some(mid) = init.sdp_mid.as_deref() else {
+        return rejected_classified(
+            session,
+            Tr::CandidateMissingMid,
+            "ICE candidate missing sdpMid".into(),
+        );
+    };
+    let Some(mline) = init.sdp_mline_index else {
+        return rejected_classified(
+            session,
+            Tr::CandidateMissingMline,
+            "ICE candidate missing sdpMLineIndex".into(),
+        );
+    };
+    let candidate = match IceCandidate::parse(mid, mline, &init.candidate) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            return rejected_classified(
+                session,
+                Tr::CandidateParse,
+                format!("parse LAN ICE candidate: {error}"),
+            )
+        }
+    };
+    let peer = match current_peer(session) {
+        Ok(peer) => peer,
+        Err(error) => return rejected_classified(session, Tr::PeerNotReady, error),
+    };
+    match peer.add_ice_candidate(candidate).await {
+        Ok(()) => {
+            session.diagnostic.count(Cs::Added, 1);
+            Ok(())
+        }
+        Err(error) => rejected_classified(
+            session,
+            Tr::CandidateAdd,
+            format!("add LAN ICE candidate: {error}"),
+        ),
+    }
+}
+fn classify_peer_candidate(
     runtime: &NativeLanRuntime,
     session: &NativeLanSession,
     candidate: &str,
-) -> Result<(), String> {
-    let ip = candidate_host_ip(candidate)
-        .ok_or_else(|| "LAN ICE candidate is not a numeric host candidate".to_string())?;
+) -> Result<(), (Tr, String)> {
+    let fields = candidate.split_whitespace().collect::<Vec<_>>();
+    let malformed = || "LAN ICE candidate is not a numeric host candidate".to_string();
+    if fields.len() < 8 || !fields[0].starts_with("candidate:") || fields[6] != "typ" {
+        return Err((Tr::CandidateMalformedLine, malformed()));
+    }
+    if fields[7] != "host" {
+        return Err((Tr::CandidateNonHost, malformed()));
+    }
+    let ip: IpAddr = fields[4]
+        .parse()
+        .map_err(|_| (Tr::CandidateNonNumeric, malformed()))?;
     if !is_local_network_address(ip, runtime.ipv6_listener_ready()) && !is_loopback_for_tests(ip) {
-        return Err("non-local ICE candidate rejected in LAN-only mode".to_string());
+        return Err((
+            Tr::CandidateNonLocal,
+            "non-local ICE candidate rejected in LAN-only mode".into(),
+        ));
     }
     if !runtime.peer_matches_endpoint(&session.peer_device_id, ip) && !is_loopback_for_tests(ip) {
-        return Err("ICE candidate does not match the discovered peer endpoint".to_string());
+        return Err((
+            Tr::CandidatePeerMismatch,
+            "ICE candidate does not match the discovered peer endpoint".into(),
+        ));
     }
     Ok(())
 }
-
 fn candidate_host_ip(candidate: &str) -> Option<IpAddr> {
     let fields = candidate.split_whitespace().collect::<Vec<_>>();
     if fields.len() < 8
@@ -684,13 +960,14 @@ fn parse_candidate_summary(
     };
     let rejection = if category != CandidateCategory::Host {
         CandidateRejection::NonHost
-    } else if !candidate_host_ip(candidate)
-        .map(|ip| is_local_network_address(ip, true) || is_loopback_for_tests(ip))
-        .unwrap_or(false)
-    {
-        CandidateRejection::NonLocal
     } else {
-        CandidateRejection::None
+        match candidate_host_ip(candidate) {
+            None => CandidateRejection::Malformed,
+            Some(ip) if is_local_network_address(ip, true) || is_loopback_for_tests(ip) => {
+                CandidateRejection::None
+            }
+            Some(_) => CandidateRejection::NonLocal,
+        }
     };
     (family, transport, category, rejection)
 }
@@ -966,6 +1243,54 @@ async fn finalize_zero_byte_receive(
     Ok(())
 }
 
+fn observe_channel_state(
+    diagnostic: &crate::pairing_diagnostics::FunnelTrace,
+    state: DataChannelState,
+    initial: bool,
+) {
+    diagnostic.transition(
+        if initial {
+            Tp::DataChannelInitial
+        } else {
+            Tp::DataChannelTransition
+        },
+        match state {
+            DataChannelState::Connecting => To::Connecting,
+            DataChannelState::Open => To::Open,
+            DataChannelState::Closing => To::Closing,
+            DataChannelState::Closed => To::Closed,
+        },
+    );
+}
+async fn wait_channel_open(
+    diagnostic: &crate::pairing_diagnostics::FunnelTrace,
+    state_rx: &mut watch::Receiver<DataChannelState>,
+    duration: Duration,
+) -> Result<(), String> {
+    let open_result = timeout(duration, async {
+        loop {
+            match *state_rx.borrow() {
+                DataChannelState::Open => return Ok(()),
+                DataChannelState::Closing | DataChannelState::Closed => {
+                    diagnostic.terminal(Tr::DataChannelClosed);
+                    return Err("LAN DataChannel closed before opening".to_string());
+                }
+                DataChannelState::Connecting => {}
+            }
+            state_rx.changed().await.map_err(|_| {
+                diagnostic.terminal(Tr::DataChannelObserver);
+                "LAN DataChannel state observer closed".to_string()
+            })?;
+        }
+    })
+    .await
+    .map_err(|_| {
+        diagnostic.record(FunnelEvent::DataChannelError);
+        diagnostic.terminal(Tr::DataChannelTimeout);
+        "LAN DataChannel open timed out".to_string()
+    })?;
+    open_result
+}
 async fn install_data_channel(
     app: AppHandle,
     runtime: NativeLanRuntime,
@@ -977,6 +1302,7 @@ async fn install_data_channel(
     let overflow_channel = channel.clone();
     let overflow_cancel = session.cancel_tx.clone();
     let arrival_diag = session.diagnostic.clone();
+    let overflow_diag = session.diagnostic.clone();
     let receiver_role = session.role == super::PairingRole::Responder;
     let first_arrival = std::sync::atomic::AtomicBool::new(false);
     channel.on_message(Some(Box::new(move |message| {
@@ -989,11 +1315,15 @@ async fn install_data_channel(
             vec![0]
         };
         if message_tx.try_send(frame).is_err() {
+            overflow_diag.terminal(Tr::ReceiveOverflow);
+            overflow_diag.cleanup(Tr::ReceiveOverflow);
             let _ = overflow_cancel.send(true);
+            overflow_diag.local_close_requested();
             overflow_channel.close();
         }
     })));
     let initial_state = channel.state();
+    observe_channel_state(&session.diagnostic, initial_state, true);
     match initial_state {
         DataChannelState::Open => session.diagnostic.record(FunnelEvent::DataChannelOpen),
         DataChannelState::Closed => session.diagnostic.record(FunnelEvent::DataChannelClose),
@@ -1004,6 +1334,7 @@ async fn install_data_channel(
     eprintln!("[fling] LAN DataChannel installed: {:?}", channel.state());
     let state_diag = session.diagnostic.clone();
     channel.on_state_change(Some(Box::new(move |state| {
+        observe_channel_state(&state_diag, state, false);
         match state {
             DataChannelState::Open => state_diag.record(FunnelEvent::DataChannelOpen),
             DataChannelState::Closed => state_diag.record(FunnelEvent::DataChannelClose),
@@ -1033,27 +1364,7 @@ async fn install_data_channel(
         .await;
     });
 
-    let open_result = timeout(CHANNEL_OPEN_TIMEOUT, async {
-        loop {
-            match *state_rx.borrow() {
-                DataChannelState::Open => return Ok(()),
-                DataChannelState::Closing | DataChannelState::Closed => {
-                    return Err("LAN DataChannel closed before opening".to_string())
-                }
-                DataChannelState::Connecting => {}
-            }
-            state_rx
-                .changed()
-                .await
-                .map_err(|_| "LAN DataChannel state observer closed".to_string())?;
-        }
-    })
-    .await
-    .map_err(|_| {
-        session.diagnostic.record(FunnelEvent::DataChannelError);
-        "LAN DataChannel open timed out".to_string()
-    })?;
-    open_result?;
+    wait_channel_open(&session.diagnostic, &mut state_rx, CHANNEL_OPEN_TIMEOUT).await?;
     if *session.cancel_tx.borrow() {
         return Err("LAN session cancelled".to_string());
     }
@@ -1694,6 +2005,7 @@ async fn run_sender(
     session
         .completed
         .store(true, std::sync::atomic::Ordering::Release);
+    session.diagnostic.terminal(Tr::Completed);
     emit_lan_event(
         &app,
         &runtime,
@@ -1893,16 +2205,30 @@ async fn send_authenticated_control(
         NativeControlMessage::FileManifest { .. } => Some(FunnelEvent::ManifestQueued),
         _ => None,
     };
-    enqueue_ordered_control(&session.control_tx, &session.control_send_lock, || {
+    let is_ice = matches!(
+        &message,
+        NativeControlMessage::P2pIce { candidate: Some(_) }
+    );
+    let result = enqueue_ordered_control(&session.control_tx, &session.control_send_lock, || {
         let frame = encrypt_authenticated_control(session, &message)?;
         session.observe_outgoing_control(&message, &frame);
+        if matches!(
+            &message,
+            NativeControlMessage::P2pIce { candidate: Some(_) }
+        ) {
+            session.diagnostic.count(Cs::Queued, 1);
+        }
         // This closure runs after bounded queue reservation; no await can intervene before permit.send.
         if let Some(event) = queued_event {
             session.diagnostic.record(event);
         }
         Ok((frame, ()))
     })
-    .await
+    .await;
+    if is_ice && result.is_err() {
+        session.diagnostic.count(Cs::QueueFailed, 1);
+    }
+    result
 }
 fn send_authenticated_control_nowait(
     session: &NativeLanSession,
@@ -1949,6 +2275,7 @@ fn fail_session(
         super::interrupt_session(app, runtime, session, reason, kind);
         return;
     }
+    session.diagnostic.terminal(Tr::TransferFailure);
     if !session.claim_terminal() {
         runtime.remove_session(&session.session_id);
         return;
@@ -2002,16 +2329,26 @@ fn fail_session(
 fn schedule_session_cleanup(runtime: NativeLanRuntime, session: Arc<NativeLanSession>) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_secs(1)).await;
+        session.diagnostic.cleanup(Tr::Completed);
         runtime.remove_session(&session.session_id);
     });
 }
 
 pub(super) fn close(session: &NativeLanSession) {
+    session.diagnostic.cleanup(
+        if session.completed.load(std::sync::atomic::Ordering::Acquire) {
+            Tr::Completed
+        } else {
+            Tr::SessionRemoval
+        },
+    );
     if let Ok(mut transfer) = session.transfer.lock() {
         if let Some(channel) = transfer.data_channel.take() {
+            session.diagnostic.local_close_requested();
             channel.close();
         }
         if let Some(peer) = transfer.pc.take() {
+            session.diagnostic.local_close_requested();
             peer.close();
         }
         if let Some(incoming) = transfer.incoming.take() {
@@ -2020,6 +2357,7 @@ pub(super) fn close(session: &NativeLanSession) {
             }
         }
     }
+    session.diagnostic.snapshot();
 }
 
 #[cfg(test)]
@@ -2129,3 +2467,7 @@ mod contract_tests {
         assert!(claim_transfer_nonce(&mut seen, nonce).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "transport_regression_tests.rs"]
+mod transport_regression_tests;

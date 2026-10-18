@@ -856,4 +856,179 @@ mod tests {
         assert_eq!(entry["data"]["name"], "[redacted]");
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn transport_every_enum_event_manual_export_is_private_and_bounded() {
+        use crate::pairing_diagnostics::{
+            new_pair_trace, FunnelTrace, PairRole, SourceFingerprint,
+        };
+        use crate::transport_diagnostics::*;
+        let markers = [
+            "192.168.246.19",
+            "fd12:3456:789a::42",
+            "49157",
+            "aa:bb:cc:dd:ee:ff",
+            "candidate:CANDIDATE_MARKER 1 udp 9 192.168.246.19 49157 typ host",
+            "v=0\r\na=SDP_MARKER",
+            "SHORT_CODE_MARKER",
+            "INPUT_MARKER",
+            "KEY_MARKER",
+            "SESSION_ID_MARKER",
+            "TASK_ID_MARKER",
+            "TRANSFER_ID_MARKER",
+            "DEVICE_ID_MARKER",
+            "SERVICE_ID_MARKER",
+            "CONTENT_MARKER",
+            "C:\\private\\FILE_NAME_MARKER.txt",
+            "OS_ERROR_MARKER",
+        ];
+        let fingerprint = SourceFingerprint::from_fullname(&markers.join("/"));
+        assert!(!serde_json::to_string(&fingerprint)
+            .unwrap()
+            .contains("MARKER"));
+        let trace = new_pair_trace(PairRole::Sender, None);
+        let d = FunnelTrace::new(trace.clone());
+        for value in [
+            Phase::AnswerValidate,
+            Phase::AnswerPeerLookup,
+            Phase::AnswerParse,
+            Phase::AnswerSetRemote,
+            Phase::SetRemoteDescription,
+            Phase::OfferValidate,
+            Phase::OfferPeerLookup,
+            Phase::OfferParse,
+            Phase::OfferSetRemote,
+            Phase::PendingIceApply,
+            Phase::CandidateSummary,
+            Phase::IceConnection,
+            Phase::IceGathering,
+            Phase::DataChannelInitial,
+            Phase::DataChannelTransition,
+            Phase::LocalCloseRequested,
+            Phase::FirstTerminal,
+            Phase::Cleanup,
+            Phase::PeerInstall,
+        ] {
+            d.phase(value, Outcome::Start, Reason::None, 0);
+        }
+        for value in [
+            Outcome::Start,
+            Outcome::Ok,
+            Outcome::Error,
+            Outcome::Snapshot,
+            Outcome::New,
+            Outcome::Checking,
+            Outcome::Connected,
+            Outcome::Completed,
+            Outcome::Failed,
+            Outcome::Disconnected,
+            Outcome::Closed,
+            Outcome::Unknown,
+            Outcome::Gathering,
+            Outcome::Complete,
+            Outcome::Connecting,
+            Outcome::Open,
+            Outcome::Closing,
+        ] {
+            d.phase(Phase::AnswerParse, value, Reason::None, 0);
+        }
+        for value in [
+            Reason::None,
+            Reason::NotReported,
+            Reason::UnexpectedRole,
+            Reason::SdpPolicy,
+            Reason::PeerNotReady,
+            Reason::StateLock,
+            Reason::SdpParse,
+            Reason::SetRemote,
+            Reason::CandidatePayloadBound,
+            Reason::CandidatePayloadMalformed,
+            Reason::CandidateMalformedLine,
+            Reason::CandidateNonHost,
+            Reason::CandidateNonNumeric,
+            Reason::CandidateNonLocal,
+            Reason::CandidatePeerMismatch,
+            Reason::CandidatePendingBound,
+            Reason::CandidateMissingMid,
+            Reason::CandidateMissingMline,
+            Reason::CandidateParse,
+            Reason::CandidateAdd,
+            Reason::ControlRead,
+            Reason::ControlDecode,
+            Reason::ControlWrite,
+            Reason::ControlWriteTimeout,
+            Reason::PeerInitialization,
+            Reason::AuthenticatedHandler,
+            Reason::IceFailed,
+            Reason::IceDisconnected,
+            Reason::IceClosed,
+            Reason::DataChannelClosed,
+            Reason::DataChannelTimeout,
+            Reason::DataChannelObserver,
+            Reason::ReceiveOverflow,
+            Reason::TransferFailure,
+            Reason::LocalCancel,
+            Reason::PeerCancel,
+            Reason::PairRejected,
+            Reason::Completed,
+            Reason::SessionRemoval,
+            Reason::RuntimeClear,
+        ] {
+            d.phase(Phase::AnswerSetRemote, Outcome::Error, value, 0);
+        }
+        for step in [
+            CandidateStep::Generated,
+            CandidateStep::FilteredNonHost,
+            CandidateStep::FilteredNonLocal,
+            CandidateStep::FilteredMalformed,
+            CandidateStep::Queued,
+            CandidateStep::Written,
+            CandidateStep::WriteFailed,
+            CandidateStep::QueueFailed,
+            CandidateStep::Received,
+            CandidateStep::Pending,
+            CandidateStep::Added,
+            CandidateStep::Rejected,
+            CandidateStep::PendingTaken,
+            CandidateStep::PendingApplied,
+            CandidateStep::PendingAbandoned,
+            CandidateStep::PendingAtPeerInstall,
+        ] {
+            d.count(step, usize::MAX);
+            d.count(step, 1);
+        }
+        d.candidate_rejected(Reason::CandidatePeerMismatch);
+        d.snapshot();
+        d.transition(Phase::DataChannelInitial, Outcome::Connecting);
+        d.transition(Phase::DataChannelTransition, Outcome::Open);
+        d.transition(Phase::DataChannelTransition, Outcome::Closed);
+        d.cleanup(Reason::SessionRemoval);
+        d.local_close_requested();
+        d.transition(Phase::IceConnection, Outcome::Closed);
+        let rows = trace.captured_entries();
+        assert!(rows.len() < 256);
+        let root = temp();
+        let path = root.join("discovery-diagnostics").join("discovery.log");
+        for row in rows.iter().cloned() {
+            append_with_context(&path, Event::Pairing(row), 0, 0).unwrap();
+        }
+        let text = export_text(&root).unwrap();
+        assert_eq!(text.lines().count(), rows.len());
+        for marker in markers {
+            assert!(
+                !text.contains(marker),
+                "private marker escaped manual export"
+            );
+        }
+        for row in rows {
+            let value = serde_json::to_value(row).unwrap();
+            assert_eq!(value["attempt"], trace.id());
+            if value["stage"] == "transport" {
+                assert!(value.get("transport").is_some());
+            } else {
+                assert_eq!(value["stage"], "ice_candidate_summary");
+            }
+        }
+        assert!(!text.contains("remote_or_transport"));
+        fs::remove_dir_all(root).unwrap();
+    }
 }

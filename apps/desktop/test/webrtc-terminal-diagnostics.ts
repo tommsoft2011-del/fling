@@ -1,0 +1,30 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+const src = (name: string) => readFileSync(new URL(`../src-tauri/src/${name}.rs`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+const transfer = src('native_lan_transfer');
+const runtime = src('native_lan_runtime');
+const diag = src('pairing_diagnostics');
+const schema = src('transport_diagnostics');
+const workflow = readFileSync(new URL('../../../.github/workflows/release.yml', import.meta.url), 'utf8');
+function section(text: string, start: string, end: string) {
+  const a = text.indexOf(start), b = text.indexOf(end, a + start.length);
+  assert.ok(a >= 0 && b > a, `missing production section: ${start}`);
+  return text.slice(a, b);
+}
+assert.match(section(transfer, 'pub(super) async fn on_pair_confirmed(', 'async fn begin_offer('), /initialize_peer\(session/);
+assert.match(section(transfer, 'pub(super) async fn on_pair_confirmed(', 'async fn begin_offer('), /begin_offer\(session, &peer\)\.await/);
+assert.match(section(transfer, 'pub(super) async fn handle_authenticated_control(', 'fn observed<'), /route_transport_control\(runtime, session, message\)\.await/);
+const router = section(transfer, 'async fn route_transport_control(', 'pub(super) async fn handle_authenticated_control(');
+for (const fn of ['handle_offer', 'handle_answer', 'receive_ice_candidate']) assert.ok(router.includes(fn));
+assert.match(section(runtime, 'async fn run_control_reader(', 'enum ControlOutcome'), /read_control_observed\(&mut reader, &session\.diagnostic\)/);
+assert.match(section(transfer, 'async fn install_data_channel(', 'async fn receive_worker('), /wait_channel_open\(&session\.diagnostic/);
+for (const event of ['AnswerReceived', 'DataChannelClose']) assert.ok(diag.includes(event));
+assert.match(diag, /DataChannelClose \| IceConnectionClosed => PairState::Closed/);
+assert.match(diag, /DataChannelClose => PairReason::NotReported/);
+assert.match(diag, /state\.transport\.first_terminal\.is_some\(\)/);
+assert.match(diag, /local_close_requested/);
+assert.match(schema, /saturating_add/);
+assert.doesNotMatch(schema, /pub \w+: (?:String|&str|Vec<u8>)/);
+assert.match(workflow, /refs\/heads\/test\/pairing-confirm-observability-/);
+assert.match(workflow, /if: startsWith\(github\.ref, 'refs\/tags\/v'\)/);
+console.log('WebRTC production-handler wiring/privacy/workflow static contract passed. Not GUI/router E2E proof.');

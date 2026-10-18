@@ -26,6 +26,7 @@ mod discovery_diagnostics;
 mod discovery_round;
 mod embedded_config;
 mod pairing_diagnostics;
+mod transport_diagnostics;
 
 #[allow(dead_code)]
 mod native_lan;
