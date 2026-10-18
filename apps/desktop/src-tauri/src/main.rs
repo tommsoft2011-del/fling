@@ -1807,16 +1807,25 @@ async fn pairing_report_ui(
     ui_attempt: Option<u32>,
     attempt: Option<u64>,
 ) -> Result<(), String> {
-    let button = match phase.as_str() {
-        "button-clicked" if ui_attempt.is_some() && attempt.is_none() => true,
-        "prompt-received" if attempt.is_some() && ui_attempt.is_none() => false,
+    let (button, prompt, funnel_event) = match phase.as_str() {
+        "button-clicked" if ui_attempt.is_some() && attempt.is_none() => (true, false, None),
+        "prompt-received" if attempt.is_some() && ui_attempt.is_none() => (false, true, None),
+        "modal-mounted" if attempt.is_some() && ui_attempt.is_none() => (false, false, Some(pairing_diagnostics::FunnelEvent::UiModalMounted)),
+        "modal-visible" if attempt.is_some() && ui_attempt.is_none() => (false, false, Some(pairing_diagnostics::FunnelEvent::UiModalVisible)),
+        "decision-confirmed" if attempt.is_some() && ui_attempt.is_none() => (false, false, Some(pairing_diagnostics::FunnelEvent::UiDecisionConfirmed)),
+        "decision-rejected" if attempt.is_some() && ui_attempt.is_none() => (false, false, Some(pairing_diagnostics::FunnelEvent::UiDecisionRejected)),
+        "decision-cancelled" if attempt.is_some() && ui_attempt.is_none() => (false, false, Some(pairing_diagnostics::FunnelEvent::UiDecisionCancelled)),
         _ => return Err("无效的配对界面诊断类别".to_string()),
     };
     tauri::async_runtime::spawn_blocking(move || {
         if button {
             pairing_diagnostics::record_ui_button(ui_attempt.unwrap());
-        } else if !pairing_diagnostics::record_ui_prompt(attempt.unwrap()) {
+        } else if prompt && !pairing_diagnostics::record_ui_prompt(attempt.unwrap()) {
             return Err("配对诊断尝试记录已过期".to_string());
+        } else if let Some(event) = funnel_event {
+            if !pairing_diagnostics::record_funnel_ui(attempt.unwrap(), event) {
+                return Err("配对诊断尝试记录已过期".to_string());
+            }
         }
         Ok(())
     })

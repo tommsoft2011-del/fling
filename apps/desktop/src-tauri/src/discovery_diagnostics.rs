@@ -537,6 +537,192 @@ mod tests {
     }
 
     #[test]
+    fn post_prompt_all_events_are_bounded_correlated_and_private_in_json_and_manual_export() {
+        use crate::pairing_diagnostics::{
+            new_pair_trace, CandidateCategory, CandidateDiagnostic, CandidateFamily,
+            CandidateRejection, CandidateTransport, FunnelEvent, FunnelTrace, PairReason, PairRole,
+            PairStage, PairState, SourceFingerprint,
+        };
+        let events = [
+            FunnelEvent::DecisionLocalSubmittedApproved,
+            FunnelEvent::DecisionLocalSubmittedRejected,
+            FunnelEvent::DecisionLocalUnavailable,
+            FunnelEvent::UiModalMounted,
+            FunnelEvent::UiModalVisible,
+            FunnelEvent::UiDecisionConfirmed,
+            FunnelEvent::UiDecisionRejected,
+            FunnelEvent::UiDecisionCancelled,
+            FunnelEvent::DecisionLocalApprovedMatch,
+            FunnelEvent::DecisionLocalApprovedMismatch,
+            FunnelEvent::DecisionLocalRejected,
+            FunnelEvent::PeerDecisionConfirmed,
+            FunnelEvent::PeerDecisionRejected,
+            FunnelEvent::PeerDecisionInvalid,
+            FunnelEvent::AuthConfirmed,
+            FunnelEvent::PeerConnectionStart,
+            FunnelEvent::PeerConnectionOk,
+            FunnelEvent::PeerConnectionError,
+            FunnelEvent::OfferGenerated,
+            FunnelEvent::OfferError,
+            FunnelEvent::OfferQueued,
+            FunnelEvent::OfferSent,
+            FunnelEvent::OfferWriteStart,
+            FunnelEvent::OfferWriteError,
+            FunnelEvent::OfferWriteTimeout,
+            FunnelEvent::OfferReceived,
+            FunnelEvent::AnswerGenerated,
+            FunnelEvent::AnswerError,
+            FunnelEvent::AnswerQueued,
+            FunnelEvent::AnswerSent,
+            FunnelEvent::AnswerWriteStart,
+            FunnelEvent::AnswerWriteError,
+            FunnelEvent::AnswerWriteTimeout,
+            FunnelEvent::AnswerReceived,
+            FunnelEvent::IceGatheringNew,
+            FunnelEvent::IceGatheringGathering,
+            FunnelEvent::IceGatheringComplete,
+            FunnelEvent::IceConnectionNew,
+            FunnelEvent::IceConnectionChecking,
+            FunnelEvent::IceConnectionConnected,
+            FunnelEvent::IceConnectionCompleted,
+            FunnelEvent::IceConnectionFailed,
+            FunnelEvent::IceConnectionDisconnected,
+            FunnelEvent::IceConnectionClosed,
+            FunnelEvent::IceConnectionUnknown,
+            FunnelEvent::DataChannelCreated,
+            FunnelEvent::DataChannelReceived,
+            FunnelEvent::DataChannelOpen,
+            FunnelEvent::DataChannelClose,
+            FunnelEvent::DataChannelError,
+            FunnelEvent::ManifestQueued,
+            FunnelEvent::ManifestSent,
+            FunnelEvent::ManifestWriteStart,
+            FunnelEvent::ManifestWriteError,
+            FunnelEvent::ManifestWriteTimeout,
+            FunnelEvent::ManifestReceived,
+            FunnelEvent::ManifestAccepted,
+            FunnelEvent::ManifestDenied,
+            FunnelEvent::ManifestPeerAccepted,
+            FunnelEvent::FirstFrameSendAttempt,
+            FunnelEvent::FirstFrameNativeAccepted,
+            FunnelEvent::FirstFrameSendError,
+            FunnelEvent::FirstFrameReceiverArrival,
+            FunnelEvent::FirstFrameAppendOk,
+            FunnelEvent::FirstFrameAppendError,
+        ];
+        let root = temp();
+        let path = root.join("discovery-diagnostics").join("discovery.log");
+        let sentinels = [
+            "192.168.246.19",
+            "fd12:3456:789a::42",
+            "49157",
+            "aa:bb:cc:dd:ee:ff",
+            "candidate:CANDIDATE_SENTINEL 1 udp 2122260223 192.168.246.19 49157 typ host",
+            "v=0\r\na=SDP_SENTINEL",
+            "SHORT_CODE_SENTINEL",
+            "KEY_SECRET_SENTINEL",
+            "SESSION_ID_SENTINEL",
+            "TASK_ID_SENTINEL",
+            "TRANSFER_ID_SENTINEL",
+            "DEVICE_ID_SENTINEL",
+            "SERVICE_ID_SENTINEL",
+            "PAYLOAD_SENTINEL",
+            "C:\\private\\FILE_NAME_SENTINEL.txt",
+        ];
+        let mut expected = 0;
+        for role in [PairRole::Sender, PairRole::Receiver] {
+            let trace = new_pair_trace(role, None);
+            let diagnostic = std::sync::Arc::new(FunnelTrace::new(trace.clone()));
+            // Runtime-only raw values can enter provenance hashing, not the post-prompt schema.
+            let candidate = CandidateDiagnostic::new(
+                1,
+                "192.168.246.19:49157".parse().unwrap(),
+                true,
+                vec![SourceFingerprint::from_fullname(&sentinels.join("/"))],
+            );
+            trace.record_candidate(
+                PairStage::Endpoints,
+                PairState::Ok,
+                PairReason::None,
+                &candidate,
+                None,
+                None,
+            );
+            let handles = (0..4)
+                .map(|_| {
+                    let diagnostic = diagnostic.clone();
+                    std::thread::spawn(move || {
+                        for _ in 0..250 {
+                            for event in events {
+                                diagnostic.record(event);
+                            }
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            for _ in 0..1000 {
+                diagnostic.candidate(
+                    CandidateFamily::Ipv4,
+                    CandidateTransport::Udp,
+                    CandidateCategory::Host,
+                    CandidateRejection::None,
+                );
+            }
+            diagnostic.flush_candidates();
+            diagnostic.flush_candidates();
+            let entries = trace.captured_entries();
+            assert_eq!(entries.len(), events.len() + 2);
+            let json = serde_json::to_value(&entries).unwrap();
+            for entry in json.as_array().unwrap() {
+                assert_eq!(entry["attempt"], trace.id());
+                for key in entry.as_object().unwrap().keys() {
+                    assert!(
+                        [
+                            "attempt",
+                            "role",
+                            "uiAttempt",
+                            "attemptElapsedMs",
+                            "stage",
+                            "state",
+                            "reason",
+                            "endpointCount",
+                            "candidate",
+                            "localAddressClass",
+                            "reachability",
+                            "evidence",
+                            "funnelEvent",
+                            "codeMatch",
+                            "candidateCounts",
+                            "approved"
+                        ]
+                        .contains(&key.as_str()),
+                        "unexpected key {key}"
+                    );
+                }
+            }
+            for raw in &sentinels {
+                assert!(!json.to_string().contains(raw));
+            }
+            expected += entries.len();
+            for entry in entries {
+                append_with_context(&path, Event::Pairing(entry), 0, 0).unwrap();
+            }
+        }
+        let exported = export_text(&root).unwrap();
+        assert_eq!(exported.lines().count(), expected);
+        for raw in &sentinels {
+            assert!(
+                !exported.contains(raw),
+                "private sentinel escaped manual export"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rotation_is_bounded_and_export_is_allowlisted() {
         let root = temp();
         let dir = root.join("discovery-diagnostics");

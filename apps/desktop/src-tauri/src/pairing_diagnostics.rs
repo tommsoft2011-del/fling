@@ -2,7 +2,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, SocketAddr};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Mutex, OnceLock,
@@ -121,6 +121,24 @@ pub enum PairStage {
     HelloValidation,
     ResponseSend,
     UiPrompt,
+    PostPrompt,
+    DecisionLocal,
+    PeerDecisionReceived,
+    AuthConfirmed,
+    PeerConnection,
+    Offer,
+    Answer,
+    IceGathering,
+    IceConnection,
+    DataChannel,
+    Manifest,
+    FirstFrame,
+    UiModalMounted,
+    UiModalVisible,
+    UiDecisionConfirmed,
+    UiDecisionRejected,
+    UiDecisionCancelled,
+    IceCandidateSummary,
 }
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -154,6 +172,12 @@ pub enum PairReason {
     KeyAgreementRejected,
     SessionInstall,
     PromptEmitFailed,
+    DecisionRejected,
+    DecisionInvalid,
+    CodeMismatch,
+    ControlWriteFailed,
+    ControlWriteTimeout,
+    LocalOperationFailed,
 }
 
 #[derive(Clone, Debug)]
@@ -164,6 +188,7 @@ pub struct PairTrace {
     started: Instant,
     #[cfg(test)]
     captured: std::sync::Arc<Mutex<Vec<PairEntry>>>,
+    funnel_events: std::sync::Arc<Mutex<HashSet<FunnelEvent>>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -186,6 +211,405 @@ pub struct PairEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     reachability: Option<&'static str>,
     evidence: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    funnel_event: Option<FunnelEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code_match: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_counts: Option<CandidateCounts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approved: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FunnelEvent {
+    DecisionLocalSubmittedApproved,
+    DecisionLocalSubmittedRejected,
+    DecisionLocalUnavailable,
+    UiModalMounted,
+    UiModalVisible,
+    UiDecisionConfirmed,
+    UiDecisionRejected,
+    UiDecisionCancelled,
+    DecisionLocalApprovedMatch,
+    DecisionLocalApprovedMismatch,
+    DecisionLocalRejected,
+    PeerDecisionConfirmed,
+    PeerDecisionRejected,
+    PeerDecisionInvalid,
+    AuthConfirmed,
+    PeerConnectionStart,
+    PeerConnectionOk,
+    PeerConnectionError,
+    OfferGenerated,
+    OfferError,
+    OfferQueued,
+    OfferSent,
+    OfferWriteStart,
+    OfferWriteError,
+    OfferWriteTimeout,
+    OfferReceived,
+    AnswerGenerated,
+    AnswerError,
+    AnswerQueued,
+    AnswerSent,
+    AnswerWriteStart,
+    AnswerWriteError,
+    AnswerWriteTimeout,
+    AnswerReceived,
+    IceGatheringNew,
+    IceGatheringGathering,
+    IceGatheringComplete,
+    IceConnectionNew,
+    IceConnectionChecking,
+    IceConnectionConnected,
+    IceConnectionCompleted,
+    IceConnectionFailed,
+    IceConnectionDisconnected,
+    IceConnectionClosed,
+    IceConnectionUnknown,
+    DataChannelCreated,
+    DataChannelReceived,
+    DataChannelOpen,
+    DataChannelClose,
+    DataChannelError,
+    ManifestQueued,
+    ManifestSent,
+    ManifestWriteStart,
+    ManifestWriteError,
+    ManifestWriteTimeout,
+    ManifestReceived,
+    ManifestAccepted,
+    ManifestDenied,
+    ManifestPeerAccepted,
+    FirstFrameSendAttempt,
+    FirstFrameNativeAccepted,
+    FirstFrameSendError,
+    FirstFrameReceiverArrival,
+    FirstFrameAppendOk,
+    FirstFrameAppendError,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateFamily {
+    Ipv4,
+    Ipv6,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateTransport {
+    Udp,
+    Tcp,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateCategory {
+    Host,
+    Other,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateRejection {
+    None,
+    NonHost,
+    NonLocal,
+    Malformed,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateCounts {
+    ipv4: u32,
+    ipv6: u32,
+    unknown_family: u32,
+    udp: u32,
+    tcp: u32,
+    unknown_transport: u32,
+    host: u32,
+    other: u32,
+    unknown_category: u32,
+    accepted: u32,
+    non_host: u32,
+    non_local: u32,
+    malformed: u32,
+}
+#[derive(Default)]
+struct FunnelState {
+    candidates: HashMap<
+        (
+            CandidateFamily,
+            CandidateTransport,
+            CandidateCategory,
+            CandidateRejection,
+        ),
+        u32,
+    >,
+    candidates_flushed: bool,
+}
+#[derive(Clone)]
+pub struct FunnelTrace {
+    trace: PairTrace,
+    state: std::sync::Arc<Mutex<FunnelState>>,
+}
+impl FunnelTrace {
+    pub fn new(trace: PairTrace) -> Self {
+        Self {
+            trace,
+            state: std::sync::Arc::new(Mutex::new(FunnelState::default())),
+        }
+    }
+    pub fn record(&self, event: FunnelEvent) {
+        if !self
+            .trace
+            .funnel_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(event)
+        {
+            return;
+        }
+        let (stage, pair_state, reason, approved, code_match) = funnel_mapping(event);
+        let entry = PairEntry {
+            attempt: self.trace.attempt,
+            role: self.trace.role,
+            ui_attempt: self.trace.ui_attempt,
+            attempt_elapsed_ms: self
+                .trace
+                .started
+                .elapsed()
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+            stage,
+            state: pair_state,
+            reason,
+            endpoint_count: None,
+            candidate: None,
+            local_address_class: None,
+            reachability: None,
+            evidence: match event {
+                FunnelEvent::UiModalMounted | FunnelEvent::UiModalVisible => {
+                    "application_dom_state_not_physical_screen_proof"
+                }
+                FunnelEvent::UiDecisionConfirmed
+                | FunnelEvent::UiDecisionRejected
+                | FunnelEvent::UiDecisionCancelled => {
+                    "application_button_handler_not_native_decision_or_auth_proof"
+                }
+                FunnelEvent::OfferSent | FunnelEvent::AnswerSent | FunnelEvent::ManifestSent => {
+                    "control_write_returned_ok_not_peer_receipt_or_nic_proof"
+                }
+                FunnelEvent::FirstFrameNativeAccepted => {
+                    "native_send_returned_ok_not_receiver_or_nic_proof"
+                }
+                FunnelEvent::AuthConfirmed => {
+                    "both_authenticated_pair_decisions_not_transport_proof"
+                }
+                _ => "post_prompt_application_observation_not_nic_proof",
+            },
+            funnel_event: Some(event),
+            code_match,
+            candidate_counts: None,
+            approved,
+        };
+        self.trace.emit(entry);
+    }
+    pub fn candidate(
+        &self,
+        family: CandidateFamily,
+        transport: CandidateTransport,
+        category: CandidateCategory,
+        rejection: CandidateRejection,
+    ) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.candidates_flushed {
+            *state
+                .candidates
+                .entry((family, transport, category, rejection))
+                .or_insert(0);
+            *state
+                .candidates
+                .get_mut(&(family, transport, category, rejection))
+                .unwrap() = state
+                .candidates
+                .get(&(family, transport, category, rejection))
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+        }
+    }
+    pub fn flush_candidates(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.candidates_flushed {
+            return;
+        }
+        state.candidates_flushed = true;
+        let mut c = CandidateCounts {
+            ipv4: 0,
+            ipv6: 0,
+            unknown_family: 0,
+            udp: 0,
+            tcp: 0,
+            unknown_transport: 0,
+            host: 0,
+            other: 0,
+            unknown_category: 0,
+            accepted: 0,
+            non_host: 0,
+            non_local: 0,
+            malformed: 0,
+        };
+        for ((f, t, k, r), n) in state.candidates.drain() {
+            match f {
+                CandidateFamily::Ipv4 => c.ipv4 = c.ipv4.saturating_add(n),
+                CandidateFamily::Ipv6 => c.ipv6 = c.ipv6.saturating_add(n),
+                CandidateFamily::Unknown => c.unknown_family = c.unknown_family.saturating_add(n),
+            };
+            match t {
+                CandidateTransport::Udp => c.udp = c.udp.saturating_add(n),
+                CandidateTransport::Tcp => c.tcp = c.tcp.saturating_add(n),
+                CandidateTransport::Unknown => {
+                    c.unknown_transport = c.unknown_transport.saturating_add(n)
+                }
+            };
+            match k {
+                CandidateCategory::Host => c.host = c.host.saturating_add(n),
+                CandidateCategory::Other => c.other = c.other.saturating_add(n),
+                CandidateCategory::Unknown => {
+                    c.unknown_category = c.unknown_category.saturating_add(n)
+                }
+            };
+            match r {
+                CandidateRejection::None => c.accepted = c.accepted.saturating_add(n),
+                CandidateRejection::NonHost => c.non_host = c.non_host.saturating_add(n),
+                CandidateRejection::NonLocal => c.non_local = c.non_local.saturating_add(n),
+                CandidateRejection::Malformed => c.malformed = c.malformed.saturating_add(n),
+            };
+        }
+        self.trace.emit(PairEntry {
+            attempt: self.trace.attempt,
+            role: self.trace.role,
+            ui_attempt: self.trace.ui_attempt,
+            attempt_elapsed_ms: self
+                .trace
+                .started
+                .elapsed()
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+            stage: PairStage::IceCandidateSummary,
+            state: PairState::Ok,
+            reason: PairReason::None,
+            endpoint_count: None,
+            candidate: None,
+            local_address_class: None,
+            reachability: None,
+            evidence: "local_ice_gathering_counts_not_selected_pair_or_route_proof",
+            funnel_event: None,
+            code_match: None,
+            candidate_counts: Some(c),
+            approved: None,
+        });
+    }
+}
+fn funnel_mapping(
+    e: FunnelEvent,
+) -> (PairStage, PairState, PairReason, Option<bool>, Option<bool>) {
+    use FunnelEvent::*;
+    let stage = match e {
+        DecisionLocalSubmittedApproved
+        | DecisionLocalSubmittedRejected
+        | DecisionLocalUnavailable
+        | DecisionLocalApprovedMatch
+        | DecisionLocalApprovedMismatch
+        | DecisionLocalRejected => PairStage::DecisionLocal,
+        PeerDecisionConfirmed | PeerDecisionRejected | PeerDecisionInvalid => {
+            PairStage::PeerDecisionReceived
+        }
+        AuthConfirmed => PairStage::AuthConfirmed,
+        PeerConnectionStart | PeerConnectionOk | PeerConnectionError => PairStage::PeerConnection,
+        OfferGenerated | OfferError | OfferQueued | OfferSent | OfferReceived | OfferWriteStart
+        | OfferWriteError | OfferWriteTimeout => PairStage::Offer,
+        AnswerGenerated | AnswerError | AnswerQueued | AnswerSent | AnswerReceived
+        | AnswerWriteStart | AnswerWriteError | AnswerWriteTimeout => PairStage::Answer,
+        IceGatheringNew | IceGatheringGathering | IceGatheringComplete => PairStage::IceGathering,
+        IceConnectionNew
+        | IceConnectionChecking
+        | IceConnectionConnected
+        | IceConnectionCompleted
+        | IceConnectionFailed
+        | IceConnectionDisconnected
+        | IceConnectionClosed
+        | IceConnectionUnknown => PairStage::IceConnection,
+        DataChannelCreated | DataChannelReceived | DataChannelOpen | DataChannelClose
+        | DataChannelError => PairStage::DataChannel,
+        ManifestWriteStart | ManifestWriteError | ManifestWriteTimeout | ManifestQueued
+        | ManifestSent | ManifestReceived | ManifestAccepted | ManifestDenied
+        | ManifestPeerAccepted => PairStage::Manifest,
+        FirstFrameSendAttempt
+        | FirstFrameNativeAccepted
+        | FirstFrameSendError
+        | FirstFrameReceiverArrival
+        | FirstFrameAppendOk
+        | FirstFrameAppendError => PairStage::FirstFrame,
+        UiModalMounted => PairStage::UiModalMounted,
+        UiModalVisible => PairStage::UiModalVisible,
+        UiDecisionConfirmed => PairStage::UiDecisionConfirmed,
+        UiDecisionRejected => PairStage::UiDecisionRejected,
+        UiDecisionCancelled => PairStage::UiDecisionCancelled,
+    };
+    let state = match e {
+        DecisionLocalSubmittedApproved
+        | DecisionLocalSubmittedRejected
+        | PeerConnectionStart
+        | OfferWriteStart
+        | AnswerWriteStart
+        | ManifestWriteStart
+        | FirstFrameSendAttempt => PairState::Start,
+        OfferWriteTimeout | AnswerWriteTimeout | ManifestWriteTimeout => PairState::Timeout,
+        OfferWriteError | AnswerWriteError | ManifestWriteError | OfferError | AnswerError => {
+            PairState::Error
+        }
+        DecisionLocalUnavailable
+        | DecisionLocalRejected
+        | PeerDecisionRejected
+        | PeerDecisionInvalid
+        | PeerConnectionError
+        | IceConnectionFailed
+        | DataChannelError
+        | ManifestDenied
+        | FirstFrameSendError
+        | FirstFrameAppendError => PairState::Error,
+        DecisionLocalApprovedMismatch => PairState::Rejected,
+        _ => PairState::Ok,
+    };
+    let reason = match e {
+        OfferWriteTimeout | AnswerWriteTimeout | ManifestWriteTimeout => {
+            PairReason::ControlWriteTimeout
+        }
+        OfferWriteError | AnswerWriteError | ManifestWriteError => PairReason::ControlWriteFailed,
+        OfferError | AnswerError => PairReason::LocalOperationFailed,
+        DecisionLocalApprovedMismatch => PairReason::CodeMismatch,
+        DecisionLocalRejected | PeerDecisionRejected | ManifestDenied => {
+            PairReason::DecisionRejected
+        }
+        PeerDecisionInvalid => PairReason::DecisionInvalid,
+        _ => PairReason::None,
+    };
+    let approved = match e {
+        DecisionLocalSubmittedApproved
+        | DecisionLocalApprovedMatch
+        | DecisionLocalApprovedMismatch => Some(true),
+        DecisionLocalSubmittedRejected | DecisionLocalRejected => Some(false),
+        _ => None,
+    };
+    let code_match = match e {
+        DecisionLocalApprovedMatch => Some(true),
+        DecisionLocalApprovedMismatch => Some(false),
+        _ => None,
+    };
+    (stage, state, reason, approved, code_match)
 }
 
 impl PairTrace {
@@ -212,6 +636,10 @@ impl PairTrace {
             local_address_class: None,
             reachability: None,
             evidence: "application_stage_not_nic_or_user_ack",
+            funnel_event: None,
+            code_match: None,
+            candidate_counts: None,
+            approved: None,
         };
         // A pairing attempt is not a discovery round. Its independent local sequence
         // and monotonic clock are explicit, without any session/task/device identity.
@@ -266,6 +694,10 @@ impl PairTrace {
                 })
             },
             evidence: "application_stage_not_nic_or_user_ack",
+            funnel_event: None,
+            code_match: None,
+            candidate_counts: None,
+            approved: None,
         }
     }
 
@@ -297,6 +729,7 @@ pub fn new_pair_trace(role: PairRole, ui_attempt: Option<u32>) -> PairTrace {
         started: Instant::now(),
         #[cfg(test)]
         captured: Default::default(),
+        funnel_events: Default::default(),
     };
     let mut registry = TRACES
         .get_or_init(|| Mutex::new(VecDeque::new()))
@@ -319,6 +752,32 @@ pub fn record_ui_button(ui_attempt: u32) {
         0,
         crate::discovery_diagnostics::Event::PairingUiButton { ui_attempt },
     );
+}
+
+pub fn record_funnel_ui(attempt: u64, event: FunnelEvent) -> bool {
+    if !matches!(
+        event,
+        FunnelEvent::UiModalMounted
+            | FunnelEvent::UiModalVisible
+            | FunnelEvent::UiDecisionConfirmed
+            | FunnelEvent::UiDecisionRejected
+            | FunnelEvent::UiDecisionCancelled
+    ) {
+        return false;
+    }
+    let trace = TRACES
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|t| t.attempt == attempt)
+        .cloned();
+    if let Some(trace) = trace {
+        FunnelTrace::new(trace).record(event);
+        true
+    } else {
+        false
+    }
 }
 
 pub fn record_ui_prompt(attempt: u64) -> bool {
@@ -399,6 +858,10 @@ mod tests {
             local_address_class: None,
             reachability: None,
             evidence: "application_stage_not_nic_or_user_ack",
+            funnel_event: None,
+            code_match: None,
+            candidate_counts: None,
+            approved: None,
         };
         let value = serde_json::to_value(entry).unwrap();
         assert_eq!(value["uiAttempt"], 12);
@@ -421,10 +884,115 @@ mod tests {
                     ui_attempt: None,
                     started: Instant::now(),
                     captured: Default::default(),
+                    funnel_events: Default::default(),
                 },
             );
         }
         assert!(registry.len() <= MAX_TRACES);
         assert!(registry.iter().all(|trace| trace.attempt > 0));
+    }
+    #[test]
+    fn funnel_mapping_and_dedup_are_allowlisted() {
+        use FunnelEvent::*;
+        let t = new_pair_trace(PairRole::Sender, Some(5));
+        let f = FunnelTrace::new(t.clone());
+        for e in [
+            DecisionLocalSubmittedApproved,
+            DecisionLocalSubmittedRejected,
+            DecisionLocalUnavailable,
+            DecisionLocalApprovedMatch,
+            DecisionLocalApprovedMismatch,
+            DecisionLocalRejected,
+            PeerDecisionConfirmed,
+            AuthConfirmed,
+        ] {
+            f.record(e);
+            f.record(e);
+        }
+        let rows = t.captured_entries();
+        assert_eq!(rows.len(), 8);
+        assert_eq!(rows[0].stage, PairStage::DecisionLocal);
+        assert_eq!(rows[0].state, PairState::Start);
+        assert_eq!(rows[0].approved, Some(true));
+        assert_eq!(rows[0].code_match, None);
+        assert_eq!(rows[1].approved, Some(false));
+        assert_eq!(rows[3].code_match, Some(true));
+        assert_eq!(rows[4].code_match, Some(false));
+        assert_eq!(rows[6].stage, PairStage::PeerDecisionReceived);
+        assert_eq!(rows[7].stage, PairStage::AuthConfirmed);
+        let json = serde_json::to_string(&rows).unwrap();
+        for raw in [
+            "192.168.1.9",
+            "49157",
+            "SDP_SENTINEL",
+            "PAYLOAD_SENTINEL",
+            "DEVICE_ID_SENTINEL",
+        ] {
+            assert!(!json.contains(raw));
+        }
+    }
+    #[test]
+    fn ui_funnel_recording_is_allowlisted_and_deduplicated_across_handles() {
+        let t = new_pair_trace(PairRole::Receiver, None);
+        let id = t.id();
+        assert!(record_funnel_ui(id, FunnelEvent::UiModalMounted));
+        assert!(record_funnel_ui(id, FunnelEvent::UiModalMounted));
+        assert!(!record_funnel_ui(id, FunnelEvent::AuthConfirmed));
+        assert_eq!(t.captured_entries().len(), 1);
+        assert_eq!(t.captured_entries()[0].stage, PairStage::UiModalMounted);
+    }
+    #[test]
+    fn session_context_clones_keep_attempt_and_zero_candidates_are_explicit() {
+        for role in [PairRole::Sender, PairRole::Receiver] {
+            let trace = new_pair_trace(role, None);
+            let original = FunnelTrace::new(trace.clone());
+            let callback = original.clone();
+            drop(original);
+            callback.record(FunnelEvent::IceGatheringComplete);
+            callback.flush_candidates();
+            callback.flush_candidates();
+            let rows = trace.captured_entries();
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().all(|row| row.attempt == trace.id()));
+            let counts = serde_json::to_value(rows[1].candidate_counts.as_ref().unwrap()).unwrap();
+            assert!(counts.as_object().unwrap().values().all(|v| v == 0));
+        }
+    }
+
+    #[test]
+    fn candidate_aggregation_flushes_once_and_emits_counts_only() {
+        use FunnelEvent::*;
+        let trace = new_pair_trace(PairRole::Receiver, None);
+        let f = FunnelTrace::new(trace.clone());
+        f.candidate(
+            CandidateFamily::Ipv4,
+            CandidateTransport::Udp,
+            CandidateCategory::Host,
+            CandidateRejection::None,
+        );
+        f.candidate(
+            CandidateFamily::Ipv4,
+            CandidateTransport::Udp,
+            CandidateCategory::Host,
+            CandidateRejection::None,
+        );
+        f.candidate(
+            CandidateFamily::Unknown,
+            CandidateTransport::Unknown,
+            CandidateCategory::Unknown,
+            CandidateRejection::Malformed,
+        );
+        f.flush_candidates();
+        f.flush_candidates();
+        let rows = trace.captured_entries();
+        assert_eq!(rows.len(), 1);
+        let c = rows[0].candidate_counts.as_ref().unwrap();
+        assert_eq!(c.ipv4, 2);
+        assert_eq!(c.accepted, 2);
+        assert_eq!(c.malformed, 1);
+        let value = serde_json::to_string(&rows).unwrap();
+        assert!(!value.contains("candidateId"));
+        assert!(!value.contains("address"));
+        let _ = DecisionLocalUnavailable;
     }
 }

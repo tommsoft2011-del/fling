@@ -4,7 +4,13 @@ use super::{
     NATIVE_CHUNK_SIZE,
 };
 use crate::native_lan::{self, NativeControlMessage, NativeFileManifest};
-use crate::{ensure_config, ReceivedFileStore};
+use crate::{
+    ensure_config,
+    pairing_diagnostics::{
+        CandidateCategory, CandidateFamily, CandidateRejection, CandidateTransport, FunnelEvent,
+    },
+    ReceivedFileStore,
+};
 use livekit::webrtc::{
     data_channel::{DataChannel, DataChannelInit, DataChannelState},
     ice_candidate::IceCandidate,
@@ -204,9 +210,17 @@ pub(super) async fn on_pair_confirmed(
     config.continual_gathering_policy = ContinualGatheringPolicy::GatherOnce;
     config.ice_transport_type = IceTransportsType::All; // host candidates only: no ICE servers are configured.
     let factory = PeerConnectionFactory::default();
-    let peer = factory
-        .create_peer_connection(config)
-        .map_err(|error| format!("create native LAN PeerConnection: {error}"))?;
+    session.diagnostic.record(FunnelEvent::PeerConnectionStart);
+    let peer = match factory.create_peer_connection(config) {
+        Ok(peer) => {
+            session.diagnostic.record(FunnelEvent::PeerConnectionOk);
+            peer
+        }
+        Err(error) => {
+            session.diagnostic.record(FunnelEvent::PeerConnectionError);
+            return Err(format!("create native LAN PeerConnection: {error}"));
+        }
+    };
     install_peer_callbacks(app.clone(), runtime.clone(), session.clone(), &peer);
     {
         let mut transfer = session
@@ -228,7 +242,11 @@ pub(super) async fn on_pair_confirmed(
     if session.role == super::PairingRole::Initiator {
         let data_channel = peer
             .create_data_channel(DIRECT_CHANNEL_LABEL, DataChannelInit::default())
-            .map_err(|error| format!("create native LAN DataChannel: {error}"))?;
+            .map_err(|error| {
+                session.diagnostic.record(FunnelEvent::DataChannelError);
+                format!("create native LAN DataChannel: {error}")
+            })?;
+        session.diagnostic.record(FunnelEvent::DataChannelCreated);
         session
             .data_channel_tx
             .send(data_channel)
@@ -236,10 +254,17 @@ pub(super) async fn on_pair_confirmed(
         let offer = peer
             .create_offer(OfferOptions::default())
             .await
-            .map_err(|error| format!("create native LAN offer: {error}"))?;
+            .map_err(|error| {
+                session.diagnostic.record(FunnelEvent::OfferError);
+                format!("create native LAN offer: {error}")
+            })?;
+        session.diagnostic.record(FunnelEvent::OfferGenerated);
         peer.set_local_description(offer.clone())
             .await
-            .map_err(|error| format!("set native LAN local offer: {error}"))?;
+            .map_err(|error| {
+                session.diagnostic.record(FunnelEvent::OfferError);
+                format!("set native LAN local offer: {error}")
+            })?;
         let sdp = signaling_sdp(&offer.to_string());
         send_authenticated_control(session, NativeControlMessage::P2pOffer { sdp }).await?;
     }
@@ -253,15 +278,41 @@ fn install_peer_callbacks(
     peer: &PeerConnection,
 ) {
     let dc_tx = session.data_channel_tx.clone();
+    let dc_diag = session.diagnostic.clone();
     peer.on_data_channel(Some(Box::new(move |channel| {
+        dc_diag.record(FunnelEvent::DataChannelReceived);
         let _ = dc_tx.send(channel);
     })));
 
     let candidate_session = session.clone();
     let candidate_app = app.clone();
     let candidate_runtime = runtime.clone();
+    let gathering_session = session.clone();
+    peer.on_ice_gathering_state_change(Some(Box::new(move |state| {
+        use livekit::webrtc::peer_connection::IceGatheringState;
+        match state {
+            IceGatheringState::New => gathering_session
+                .diagnostic
+                .record(FunnelEvent::IceGatheringNew),
+            IceGatheringState::Gathering => gathering_session
+                .diagnostic
+                .record(FunnelEvent::IceGatheringGathering),
+            IceGatheringState::Complete => {
+                gathering_session
+                    .diagnostic
+                    .record(FunnelEvent::IceGatheringComplete);
+                gathering_session.diagnostic.flush_candidates();
+            }
+            _ => {}
+        }
+    })));
     peer.on_ice_candidate(Some(Box::new(move |candidate| {
         let candidate_line = candidate.candidate();
+        let parsed = parse_candidate_summary(&candidate_line);
+        let (family, transport, category, rejection) = parsed;
+        candidate_session
+            .diagnostic
+            .candidate(family, transport, category, rejection);
         if !is_local_host_candidate(&candidate_line) {
             return;
         }
@@ -306,6 +357,32 @@ fn install_peer_callbacks(
     let state_runtime = runtime.clone();
     let state_session = session.clone();
     peer.on_ice_connection_state_change(Some(Box::new(move |state| {
+        match state {
+            IceConnectionState::New => state_session
+                .diagnostic
+                .record(FunnelEvent::IceConnectionNew),
+            IceConnectionState::Checking => state_session
+                .diagnostic
+                .record(FunnelEvent::IceConnectionChecking),
+            IceConnectionState::Connected => state_session
+                .diagnostic
+                .record(FunnelEvent::IceConnectionConnected),
+            IceConnectionState::Completed => state_session
+                .diagnostic
+                .record(FunnelEvent::IceConnectionCompleted),
+            IceConnectionState::Failed => state_session
+                .diagnostic
+                .record(FunnelEvent::IceConnectionFailed),
+            IceConnectionState::Disconnected => state_session
+                .diagnostic
+                .record(FunnelEvent::IceConnectionDisconnected),
+            IceConnectionState::Closed => state_session
+                .diagnostic
+                .record(FunnelEvent::IceConnectionClosed),
+            _ => state_session
+                .diagnostic
+                .record(FunnelEvent::IceConnectionUnknown),
+        }
         if state_session
             .completed
             .load(std::sync::atomic::Ordering::Acquire)
@@ -366,6 +443,7 @@ pub(super) async fn handle_authenticated_control(
             {
                 return Err("recipient did not accept the native FLNG frame contract".to_string());
             }
+            session.diagnostic.record(FunnelEvent::ManifestPeerAccepted);
             start_sender(app.clone(), runtime.clone(), session.clone()).await
         }
         NativeControlMessage::FileChunkAck {
@@ -413,6 +491,7 @@ pub(super) async fn handle_authenticated_control(
 }
 
 async fn handle_offer(session: &NativeLanSession, sdp: String) -> Result<(), String> {
+    session.diagnostic.record(FunnelEvent::OfferReceived);
     if session.role != super::PairingRole::Responder {
         return Err("unexpected native LAN offer role".to_string());
     }
@@ -427,10 +506,17 @@ async fn handle_offer(session: &NativeLanSession, sdp: String) -> Result<(), Str
     let answer = peer
         .create_answer(AnswerOptions::default())
         .await
-        .map_err(|error| format!("create native LAN answer: {error}"))?;
+        .map_err(|error| {
+            session.diagnostic.record(FunnelEvent::AnswerError);
+            format!("create native LAN answer: {error}")
+        })?;
+    session.diagnostic.record(FunnelEvent::AnswerGenerated);
     peer.set_local_description(answer.clone())
         .await
-        .map_err(|error| format!("set native LAN local answer: {error}"))?;
+        .map_err(|error| {
+            session.diagnostic.record(FunnelEvent::AnswerError);
+            format!("set native LAN local answer: {error}")
+        })?;
     send_authenticated_control(
         session,
         NativeControlMessage::P2pAnswer {
@@ -441,6 +527,7 @@ async fn handle_offer(session: &NativeLanSession, sdp: String) -> Result<(), Str
 }
 
 async fn handle_answer(session: &NativeLanSession, sdp: String) -> Result<(), String> {
+    session.diagnostic.record(FunnelEvent::AnswerReceived);
     if session.role != super::PairingRole::Initiator {
         return Err("unexpected native LAN answer role".to_string());
     }
@@ -557,6 +644,57 @@ fn candidate_host_ip(candidate: &str) -> Option<IpAddr> {
     fields[4].parse().ok()
 }
 
+fn parse_candidate_summary(
+    candidate: &str,
+) -> (
+    CandidateFamily,
+    CandidateTransport,
+    CandidateCategory,
+    CandidateRejection,
+) {
+    let fields = candidate.split_whitespace().collect::<Vec<_>>();
+    let family = fields
+        .get(4)
+        .and_then(|v| v.parse::<IpAddr>().ok())
+        .map(|ip| {
+            if ip.is_ipv4() {
+                CandidateFamily::Ipv4
+            } else {
+                CandidateFamily::Ipv6
+            }
+        })
+        .unwrap_or(CandidateFamily::Unknown);
+    if fields.len() < 8 || !fields[0].starts_with("candidate:") || fields[6] != "typ" {
+        return (
+            family,
+            CandidateTransport::Unknown,
+            CandidateCategory::Unknown,
+            CandidateRejection::Malformed,
+        );
+    }
+    let transport = match fields[2].to_ascii_lowercase().as_str() {
+        "udp" => CandidateTransport::Udp,
+        "tcp" => CandidateTransport::Tcp,
+        _ => CandidateTransport::Unknown,
+    };
+    let category = if fields[7] == "host" {
+        CandidateCategory::Host
+    } else {
+        CandidateCategory::Other
+    };
+    let rejection = if category != CandidateCategory::Host {
+        CandidateRejection::NonHost
+    } else if !candidate_host_ip(candidate)
+        .map(|ip| is_local_network_address(ip, true) || is_loopback_for_tests(ip))
+        .unwrap_or(false)
+    {
+        CandidateRejection::NonLocal
+    } else {
+        CandidateRejection::None
+    };
+    (family, transport, category, rejection)
+}
+
 fn is_local_host_candidate(candidate: &str) -> bool {
     let Some(ip) = candidate_host_ip(candidate) else {
         return false;
@@ -603,6 +741,7 @@ fn receive_manifest(
     if session.role != super::PairingRole::Responder {
         return Err("unexpected file manifest role".to_string());
     }
+    session.diagnostic.record(FunnelEvent::ManifestReceived);
     validate_manifest(session, &manifest)?;
     let event = IncomingManifestEvent {
         session_id: session.session_id.clone(),
@@ -702,6 +841,7 @@ pub(super) async fn decide_manifest(
             .ok_or_else(|| "incoming file consent is no longer available".to_string())?
     };
     if !accepted {
+        session.diagnostic.record(FunnelEvent::ManifestDenied);
         send_authenticated_control(
             session,
             NativeControlMessage::TaskCancel {
@@ -726,6 +866,7 @@ pub(super) async fn decide_manifest(
         );
         return Ok(());
     }
+    session.diagnostic.record(FunnelEvent::ManifestAccepted);
     let cfg = ensure_config(app)?.1;
     let store = app.state::<ReceivedFileStore>().inner().clone();
     let store_session_id = store.begin(
@@ -835,7 +976,13 @@ async fn install_data_channel(
     let message_tx = frame_tx.clone();
     let overflow_channel = channel.clone();
     let overflow_cancel = session.cancel_tx.clone();
+    let arrival_diag = session.diagnostic.clone();
+    let receiver_role = session.role == super::PairingRole::Responder;
+    let first_arrival = std::sync::atomic::AtomicBool::new(false);
     channel.on_message(Some(Box::new(move |message| {
+        if receiver_role && !first_arrival.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            arrival_diag.record(FunnelEvent::FirstFrameReceiverArrival);
+        }
         let frame = if message.binary && message.data.len() <= 128 * 1024 + 30 {
             message.data.to_vec()
         } else {
@@ -846,10 +993,22 @@ async fn install_data_channel(
             overflow_channel.close();
         }
     })));
-    let (state_tx, mut state_rx) = watch::channel(channel.state());
+    let initial_state = channel.state();
+    match initial_state {
+        DataChannelState::Open => session.diagnostic.record(FunnelEvent::DataChannelOpen),
+        DataChannelState::Closed => session.diagnostic.record(FunnelEvent::DataChannelClose),
+        _ => {}
+    }
+    let (state_tx, mut state_rx) = watch::channel(initial_state);
     let worker_state_rx = state_rx.clone();
     eprintln!("[fling] LAN DataChannel installed: {:?}", channel.state());
+    let state_diag = session.diagnostic.clone();
     channel.on_state_change(Some(Box::new(move |state| {
+        match state {
+            DataChannelState::Open => state_diag.record(FunnelEvent::DataChannelOpen),
+            DataChannelState::Closed => state_diag.record(FunnelEvent::DataChannelClose),
+            _ => {}
+        }
         eprintln!("[fling] LAN DataChannel state: {state:?}");
         let _ = state_tx.send(state);
     })));
@@ -890,7 +1049,10 @@ async fn install_data_channel(
         }
     })
     .await
-    .map_err(|_| "LAN DataChannel open timed out".to_string())?;
+    .map_err(|_| {
+        session.diagnostic.record(FunnelEvent::DataChannelError);
+        "LAN DataChannel open timed out".to_string()
+    })?;
     open_result?;
     if *session.cancel_tx.borrow() {
         return Err("LAN session cancelled".to_string());
@@ -1078,10 +1240,21 @@ async fn receive_one_frame(
                 {
                     return Err("FLNG payload length does not match manifest".to_string());
                 }
-                incoming.store.append(
+                if let Err(error) = incoming.store.append(
                     &incoming.store_session_id,
                     &frame.payload[offset..offset + expected],
-                )?;
+                ) {
+                    if frame.seq == 0 {
+                        session
+                            .diagnostic
+                            .record(FunnelEvent::FirstFrameAppendError);
+                    }
+                    return Err(error);
+                }
+                // A frame may batch chunks: only report success once the entire first frame appended.
+                if frame.seq == 0 && index + 1 == count {
+                    session.diagnostic.record(FunnelEvent::FirstFrameAppendOk);
+                }
                 offset += expected;
                 incoming.received_bytes += expected as u64;
                 incoming.next_seq += 1;
@@ -1426,9 +1599,23 @@ async fn run_sender(
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        channel
-            .send(&frame, true)
-            .map_err(|error| format!("send FLNG frame: {error}"))?;
+        if seq == 0 {
+            session
+                .diagnostic
+                .record(FunnelEvent::FirstFrameSendAttempt);
+        }
+        if let Err(error) = channel.send(&frame, true) {
+            session.diagnostic.record(FunnelEvent::DataChannelError);
+            if seq == 0 {
+                session.diagnostic.record(FunnelEvent::FirstFrameSendError);
+            }
+            return Err(format!("send FLNG frame: {error}"));
+        }
+        if seq == 0 {
+            session
+                .diagnostic
+                .record(FunnelEvent::FirstFrameNativeAccepted);
+        }
         sent_bytes = sent_bytes.max(chunk_offset.saturating_add(expected as u64));
         seq += 1;
         if sent_bytes.saturating_sub(last_progress_bytes) >= PROGRESS_MIN_BYTES
@@ -1700,8 +1887,19 @@ async fn send_authenticated_control(
     session: &NativeLanSession,
     message: NativeControlMessage,
 ) -> Result<(), String> {
+    let queued_event = match &message {
+        NativeControlMessage::P2pOffer { .. } => Some(FunnelEvent::OfferQueued),
+        NativeControlMessage::P2pAnswer { .. } => Some(FunnelEvent::AnswerQueued),
+        NativeControlMessage::FileManifest { .. } => Some(FunnelEvent::ManifestQueued),
+        _ => None,
+    };
     enqueue_ordered_control(&session.control_tx, &session.control_send_lock, || {
         let frame = encrypt_authenticated_control(session, &message)?;
+        session.observe_outgoing_control(&message, &frame);
+        // This closure runs after bounded queue reservation; no await can intervene before permit.send.
+        if let Some(event) = queued_event {
+            session.diagnostic.record(event);
+        }
         Ok((frame, ()))
     })
     .await
@@ -1826,6 +2024,41 @@ pub(super) fn close(session: &NativeLanSession) {
 
 #[cfg(test)]
 mod contract_tests {
+    #[test]
+    fn diagnostic_candidate_classifier_is_allowlisted_and_matches_original_filter() {
+        use crate::pairing_diagnostics::{new_pair_trace, FunnelTrace, PairRole};
+        for role in [PairRole::Sender, PairRole::Receiver] {
+            let trace = new_pair_trace(role, None);
+            let diagnostic = FunnelTrace::new(trace.clone());
+            for (candidate, transport, category, rejection) in [
+                ("candidate:CANDIDATE_SENTINEL 1 udp 2122260223 192.168.246.19 49157 typ host", CandidateTransport::Udp, CandidateCategory::Host, CandidateRejection::None),
+                ("candidate:CANDIDATE_SENTINEL 1 tcp 2122260223 fd12:3456:789a::42 49157 typ host tcptype passive", CandidateTransport::Tcp, CandidateCategory::Host, CandidateRejection::None),
+                ("candidate:CANDIDATE_SENTINEL 1 udp 2122260223 203.0.113.42 49157 typ srflx", CandidateTransport::Udp, CandidateCategory::Other, CandidateRejection::NonHost),
+                ("candidate:CANDIDATE_SENTINEL 1 udp 2122260223 203.0.113.42 49157 typ host", CandidateTransport::Udp, CandidateCategory::Host, CandidateRejection::NonLocal),
+                ("SDP_SENTINEL INVALID_CANDIDATE", CandidateTransport::Unknown, CandidateCategory::Unknown, CandidateRejection::Malformed),
+            ] {
+                let (family, got_transport, got_category, got_rejection) = parse_candidate_summary(candidate);
+                assert_eq!(got_transport, transport);
+                assert_eq!(got_category, category);
+                assert_eq!(got_rejection, rejection);
+                assert_eq!(is_local_host_candidate(candidate), rejection == CandidateRejection::None);
+                diagnostic.candidate(family, got_transport, got_category, got_rejection);
+            }
+            diagnostic.flush_candidates();
+            let encoded = serde_json::to_string(&trace.captured_entries()).unwrap();
+            for sentinel in [
+                "CANDIDATE_SENTINEL",
+                "192.168.246.19",
+                "49157",
+                "fd12:3456:789a::42",
+                "203.0.113.42",
+                "SDP_SENTINEL",
+            ] {
+                assert!(!encoded.contains(sentinel));
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

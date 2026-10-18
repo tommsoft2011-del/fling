@@ -15,6 +15,8 @@ class Element {
   type = '';
   tabIndex = 0;
   preventedFocusScroll = false;
+  isConnected = true;
+  clientRectCount = 1;
   lastActivation: Promise<void> | void = undefined;
   onclick: (() => Promise<void> | void) | null = null;
   onchange: (() => void) | null = null;
@@ -30,6 +32,7 @@ class Element {
   replaceChildren(...children: Element[]): void { this.text = ''; this.children = children; }
   append(...children: Element[]): void { this.children.push(...children); }
   setAttribute(name: string, value: string): void { this.attributes.set(name, value); }
+  getClientRects(): { length: number } { return { length: this.clientRectCount }; }
   focus(options?: { preventScroll?: boolean }): void { this.preventedFocusScroll = options?.preventScroll ?? false; dom.activeElement = this; }
   click(): void { this.lastActivation = this.onclick?.(); }
 }
@@ -50,7 +53,12 @@ const dom = {
   getElementById: (id: string) => elements.get(id) ?? null,
   createElement: (tag: string) => new Element(tag),
 };
+const animationFrames: FrameRequestCallback[] = [];
 Object.assign(globalThis, { document: dom });
+Object.assign(globalThis, {
+  requestAnimationFrame: (callback: FrameRequestCallback) => { animationFrames.push(callback); return animationFrames.length; },
+  window: { getComputedStyle: (element: Element) => ({ display: element.hidden ? 'none' : 'block', visibility: 'visible', opacity: '1' }) },
+});
 get('lanPickSource').textContent = '在本机选择文件';
 const events = new Map<string, (event: { payload: any }) => void>();
 const calls: { command: string; args: any }[] = [];
@@ -474,11 +482,26 @@ events.get('fling://lan/pairing')!({ payload: {
   peerDeviceLabel: 'B', verificationCode: '12345678', role: 'responder', diagnosticAttempt: 3456,
 } });
 assert.equal(get('lanPairModal').hidden, false);
-const pairReports = calls.filter((call) => call.command === 'pairing_report_ui');
-assert.deepEqual(pairReports.at(-1)!.args, { phase: 'prompt-received', uiAttempt: null, attempt: 3456 });
+const pairingCalls = () => calls.filter((call) => call.command === 'pairing_report_ui');
+const promptIndex = pairingCalls().findIndex((call) => call.args.phase === 'prompt-received');
+assert.ok(promptIndex >= 0);
+assert.equal(pairingCalls().some((call) => call.args.phase === 'modal-mounted' || call.args.phase === 'modal-visible'), false,
+  'prompt receipt alone must not claim that the modal was mounted or visible');
+animationFrames.shift()!(0);
+const pairReports = pairingCalls();
+assert.deepEqual(pairReports.slice(promptIndex, promptIndex + 3).map((call) => call.args.phase),
+  ['prompt-received', 'modal-mounted', 'modal-visible']);
+assert.deepEqual(pairReports.at(-1)!.args, { phase: 'modal-visible', uiAttempt: null, attempt: 3456 });
+assert.doesNotMatch(JSON.stringify(pairReports), /not-a-diagnostic-id|not-a-diagnostic-task|peer-b|12345678|B/);
+get('lanPairAccept').click();
+assert.ok(pairingCalls().some((call) => call.args.phase === 'decision-confirmed'));
 for (const { args } of pairReports) {
   assert.deepEqual(Object.keys(args).sort(), ['attempt', 'phase', 'uiAttempt']);
   assert.doesNotMatch(JSON.stringify(args), /opaque-source|not-a-diagnostic|12345678|verificationCode|sessionId|taskId|peerId/);
+}
+for (const { args } of pairingCalls()) {
+  assert.deepEqual(Object.keys(args).sort(), ['attempt', 'phase', 'uiAttempt']);
+  assert.doesNotMatch(JSON.stringify(args), /not-a-diagnostic-id|not-a-diagnostic-task|peer-b|12345678|verificationCode|sessionId|taskId|peerId/);
 }
 const uiAttempts = calls.filter((call) => call.command === 'native_lan_start_send').map((call) => call.args.uiAttempt);
 assert.ok(uiAttempts.every((attempt, index) => Number.isInteger(attempt) && attempt > 0 && (!index || attempt > uiAttempts[index - 1])));

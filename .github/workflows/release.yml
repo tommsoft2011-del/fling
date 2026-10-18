@@ -13,6 +13,8 @@ on:
 
 jobs:
   build:
+    # Diagnostic branches build only the desktop Windows EXE, never CLI packages.
+    if: ${{ !startsWith(github.ref, 'refs/heads/test/pairing-confirm-observability-') }}
     strategy:
       fail-fast: false
       matrix:
@@ -57,10 +59,7 @@ jobs:
   desktop:
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-          - os: windows-latest
+      matrix: ${{ fromJSON(startsWith(github.ref, 'refs/heads/test/pairing-confirm-observability-') && '{"include":[{"os":"windows-latest"}]}' || '{"include":[{"os":"ubuntu-latest"},{"os":"windows-latest"}]}') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -106,10 +105,23 @@ jobs:
         working-directory: apps/desktop
         run: bun run build
 
+      - name: Test native diagnostic and privacy contracts (isolated diagnostic branch)
+        if: startsWith(github.ref, 'refs/heads/test/pairing-confirm-observability-')
+        working-directory: apps/desktop/src-tauri
+        run: cargo test --locked
+      - name: Test frontend diagnostic contracts (isolated diagnostic branch)
+        if: startsWith(github.ref, 'refs/heads/test/pairing-confirm-observability-')
+        working-directory: apps/desktop
+        run: |
+          bun test/lan-ipc-contract.ts
+          bun test/lan-picker-ui.ts
+          bun test/lan-confirm-observability.ts
+          bun test/pairing-ui-observability.ts
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         with:
           projectPath: apps/desktop
+          args: ${{ startsWith(github.ref, 'refs/heads/test/pairing-confirm-observability-') && '--no-bundle' || '' }}
 
       - name: Prepare portable exe (Windows)
         if: runner.os == 'Windows'
@@ -119,6 +131,13 @@ jobs:
           cp apps/desktop/src-tauri/target/release/fling-desktop.exe \
              "apps/desktop/src-tauri/target/release/Fling-portable-x64.exe"
 
+      - name: Checksum diagnostic-only EXE
+        if: startsWith(github.ref, 'refs/heads/test/pairing-confirm-observability-')
+        shell: bash
+        run: |
+          cd apps/desktop/src-tauri/target/release
+          sha256sum Fling-portable-x64.exe > Fling-portable-x64.exe.sha256
+          printf 'diagnostic-only, not a fix\ncommit=%s\n' "$GITHUB_SHA" > diagnostic-build.txt
       - name: Upload bundles
         uses: actions/upload-artifact@v4
         with:
@@ -129,6 +148,8 @@ jobs:
             apps/desktop/src-tauri/target/release/bundle/appimage/*.AppImage
             apps/desktop/src-tauri/target/release/bundle/deb/*.deb
             apps/desktop/src-tauri/target/release/Fling-portable-x64.exe
+            apps/desktop/src-tauri/target/release/Fling-portable-x64.exe.sha256
+            apps/desktop/src-tauri/target/release/diagnostic-build.txt
           if-no-files-found: error
 
   release:

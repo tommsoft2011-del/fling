@@ -268,8 +268,22 @@ function renderTasks(): void {
   byId<HTMLElement>('lanHistorySection').hidden = historyCount === 0;
 }
 
-function reportPairingUi(phase: 'button-clicked' | 'prompt-received', uiAttempt: number | null, attempt: number | null): void {
+function reportPairingUi(phase: 'button-clicked' | 'prompt-received' | 'modal-mounted' | 'modal-visible' | 'decision-confirmed' | 'decision-rejected' | 'decision-cancelled', uiAttempt: number | null, attempt: number | null): void {
   void invoke('pairing_report_ui', { phase, uiAttempt, attempt }).catch(() => {});
+}
+
+function reportPairModalMountedAndVisible(attempt: number): void {
+  // This proves only application DOM state, not native-window or physical-screen visibility.
+  requestAnimationFrame(() => {
+    const modal = byId<HTMLDivElement>('lanPairModal');
+    if (selectedPair?.diagnosticAttempt !== attempt || !modal.isConnected) return;
+    reportPairingUi('modal-mounted', null, attempt);
+    if (modal.hidden) return;
+    const style = window.getComputedStyle(modal);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse'
+      || style.opacity === '0' || modal.getClientRects().length === 0) return;
+    reportPairingUi('modal-visible', null, attempt);
+  });
 }
 
 function showPair(request: PairRequest): void {
@@ -298,6 +312,7 @@ function showPair(request: PairRequest): void {
   byId<HTMLInputElement>('lanPeerCode').focus();
   if (Number.isSafeInteger(request.diagnosticAttempt) && request.diagnosticAttempt! > 0) {
     reportPairingUi('prompt-received', null, request.diagnosticAttempt!);
+    reportPairModalMountedAndVisible(request.diagnosticAttempt!);
   }
 }
 
@@ -522,6 +537,9 @@ export async function initLanPage(): Promise<LanIdentity> {
   byId<HTMLButtonElement>('lanPairAccept').onclick = async () => {
     if (!selectedPair) return;
     const request = selectedPair;
+    if (Number.isSafeInteger(request.diagnosticAttempt) && request.diagnosticAttempt! > 0) {
+      reportPairingUi('decision-confirmed', null, request.diagnosticAttempt!);
+    }
     const peerCode = byId<HTMLInputElement>('lanPeerCode').value.replace(/\s/g, '');
     const mismatch = peerCode !== request.verificationCode;
     if (mismatch) recordPairingFailure(request, '配对失败：短码不一致，已取消配对');
@@ -551,6 +569,9 @@ export async function initLanPage(): Promise<LanIdentity> {
   byId<HTMLButtonElement>('lanPairReject').onclick = async () => {
     if (!selectedPair) return;
     const request = selectedPair;
+    if (Number.isSafeInteger(request.diagnosticAttempt) && request.diagnosticAttempt! > 0) {
+      reportPairingUi('decision-rejected', null, request.diagnosticAttempt!);
+    }
     recordPairingFailure(request, '配对失败：已拒绝本次配对');
     try {
       await invoke('native_lan_pair_decision', {

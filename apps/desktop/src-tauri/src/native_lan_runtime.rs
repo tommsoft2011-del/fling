@@ -3,8 +3,8 @@ use crate::native_lan::{
     PairingRole, PendingLocalPair, SessionReplayGuard,
 };
 use crate::pairing_diagnostics::{
-    new_pair_trace, CandidateDiagnostic, PairReason, PairRole, PairStage, PairState, PairTrace,
-    SourceFingerprint,
+    new_pair_trace, CandidateDiagnostic, FunnelEvent, FunnelTrace, PairReason, PairRole, PairStage,
+    PairState, PairTrace, SourceFingerprint,
 };
 use crate::{ensure_config, DiscoveryCmd, DiscoveryState};
 #[path = "native_lan_transfer.rs"]
@@ -129,6 +129,9 @@ enum LocalAuthState {
 }
 
 struct NativeLanSession {
+    // Process-local diagnostic context only; never correlate using session/task IDs.
+    diagnostic: FunnelTrace,
+    diagnostic_control_writes: Mutex<BTreeMap<u64, FunnelEvent>>,
     session_id: String,
     task_id: String,
     role: PairingRole,
@@ -215,6 +218,70 @@ pub(crate) struct NativeLanIpcCounters {
 }
 
 impl NativeLanSession {
+    fn observe_outgoing_control(
+        &self,
+        message: &NativeControlMessage,
+        frame: &EncryptedControlFrame,
+    ) {
+        let event = match message {
+            NativeControlMessage::P2pOffer { .. } => FunnelEvent::OfferSent,
+            NativeControlMessage::P2pAnswer { .. } => FunnelEvent::AnswerSent,
+            NativeControlMessage::FileManifest { .. } => FunnelEvent::ManifestSent,
+            _ => return,
+        };
+        if let Ok(mut writes) = self.diagnostic_control_writes.lock() {
+            // Diagnostic failure must never affect control ordering or transport.
+            if writes.len() < 8 {
+                writes.insert(frame.sequence, event);
+            }
+        }
+    }
+
+    fn observe_control_write_start(&self, sequence: u64) {
+        let event = self
+            .diagnostic_control_writes
+            .lock()
+            .ok()
+            .and_then(|writes| writes.get(&sequence).copied());
+        if let Some(event) = event {
+            self.diagnostic.record(match event {
+                FunnelEvent::OfferSent => FunnelEvent::OfferWriteStart,
+                FunnelEvent::AnswerSent => FunnelEvent::AnswerWriteStart,
+                FunnelEvent::ManifestSent => FunnelEvent::ManifestWriteStart,
+                _ => return,
+            });
+        }
+    }
+
+    fn observe_control_write_failed(&self, sequence: u64, timed_out: bool) {
+        let event = self
+            .diagnostic_control_writes
+            .lock()
+            .ok()
+            .and_then(|mut writes| writes.remove(&sequence));
+        if let Some(event) = event {
+            self.diagnostic.record(match (event, timed_out) {
+                (FunnelEvent::OfferSent, false) => FunnelEvent::OfferWriteError,
+                (FunnelEvent::OfferSent, true) => FunnelEvent::OfferWriteTimeout,
+                (FunnelEvent::AnswerSent, false) => FunnelEvent::AnswerWriteError,
+                (FunnelEvent::AnswerSent, true) => FunnelEvent::AnswerWriteTimeout,
+                (FunnelEvent::ManifestSent, false) => FunnelEvent::ManifestWriteError,
+                (FunnelEvent::ManifestSent, true) => FunnelEvent::ManifestWriteTimeout,
+                _ => return,
+            });
+        }
+    }
+
+    fn observe_control_written(&self, sequence: u64) {
+        let event = self
+            .diagnostic_control_writes
+            .lock()
+            .ok()
+            .and_then(|mut writes| writes.remove(&sequence));
+        if let Some(event) = event {
+            self.diagnostic.record(event);
+        }
+    }
     fn claim_terminal(&self) -> bool {
         self.terminal_claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1068,6 +1135,11 @@ pub(crate) async fn native_lan_pair_decision(
     .map(|value| value.len())
     .unwrap_or_default();
     runtime.count_ipc("native_lan_pair_decision", request_bytes.saturating_add(4));
+    session.diagnostic.record(if approved {
+        FunnelEvent::DecisionLocalSubmittedApproved
+    } else {
+        FunnelEvent::DecisionLocalSubmittedRejected
+    });
     let decision = enqueue_ordered_control(&session.control_tx, &session.control_send_lock, || {
         let mut auth = session
             .auth
@@ -1076,13 +1148,16 @@ pub(crate) async fn native_lan_pair_decision(
         let LocalAuthState::Pending(pending) = &mut *auth else {
             return Err("pairing decision is no longer available".to_string());
         };
-        let frame = pending.decide_locally(approved, &peer_code)?;
+        let frame = decide_locally_observed(&session, pending, approved, &peer_code)?;
         Ok((frame, pending.decision()))
     })
     .await;
     let decision = match decision {
         Ok(decision) => decision,
         Err(error) => {
+            session
+                .diagnostic
+                .record(FunnelEvent::DecisionLocalUnavailable);
             if error.contains("code") || error.contains("verification") {
                 let _ = session.claim_terminal();
             }
@@ -1118,6 +1193,23 @@ pub(crate) async fn native_lan_pair_decision(
     Ok(())
 }
 
+fn decide_locally_observed(
+    session: &NativeLanSession,
+    pending: &mut PendingLocalPair,
+    approved: bool,
+    peer_code: &str,
+) -> Result<EncryptedControlFrame, String> {
+    let frame = pending.decide_locally(approved, peer_code)?;
+    session.diagnostic.record(if !approved {
+        FunnelEvent::DecisionLocalRejected
+    } else if pending.decision() == PairingDecision::Rejected {
+        FunnelEvent::DecisionLocalApprovedMismatch
+    } else {
+        FunnelEvent::DecisionLocalApprovedMatch
+    });
+    Ok(frame)
+}
+
 fn authenticate_local_session(session: &NativeLanSession) -> Result<(), String> {
     let mut auth = session
         .auth
@@ -1131,6 +1223,7 @@ fn authenticate_local_session(session: &NativeLanSession) -> Result<(), String> 
         }
     };
     *auth = LocalAuthState::Authenticated(pending.into_authenticated()?);
+    session.diagnostic.record(FunnelEvent::AuthConfirmed);
     Ok(())
 }
 
@@ -1826,6 +1919,8 @@ mod tests {
     fn terminal_claim_suppresses_cleanup_after_pairing_failure_but_allows_disconnect() {
         let (tx, _rx) = watch::channel(false);
         let session = NativeLanSession {
+            diagnostic: FunnelTrace::new(new_pair_trace(PairRole::Sender, None)),
+            diagnostic_control_writes: Mutex::new(BTreeMap::new()),
             session_id: "session".into(),
             task_id: "task".into(),
             role: PairingRole::Initiator,
@@ -1851,6 +1946,8 @@ mod tests {
 
         let (tx, _rx) = watch::channel(false);
         let disconnected = NativeLanSession {
+            diagnostic: FunnelTrace::new(new_pair_trace(PairRole::Receiver, None)),
+            diagnostic_control_writes: Mutex::new(BTreeMap::new()),
             session_id: "session-2".into(),
             task_id: "task-2".into(),
             role: PairingRole::Responder,
@@ -1872,6 +1969,222 @@ mod tests {
             cancel_tx: tx,
         };
         assert!(disconnected.claim_terminal()); // genuine disconnect remains claimable
+    }
+
+    fn observed_session(
+        pending: PendingLocalPair,
+        role: PairingRole,
+        trace: PairTrace,
+    ) -> NativeLanSession {
+        NativeLanSession {
+            diagnostic: FunnelTrace::new(trace),
+            diagnostic_control_writes: Mutex::new(BTreeMap::new()),
+            session_id: pending.session_id().unwrap().into(),
+            task_id: pending.task_id().unwrap().into(),
+            role,
+            peer_device_id: "DEVICE_ID_SENTINEL".into(),
+            peer_device_label: "unused".into(),
+            auth: Mutex::new(LocalAuthState::Pending(pending)),
+            source: Mutex::new(None),
+            webrtc_started: AtomicBool::new(false),
+            manifest_sent: AtomicBool::new(false),
+            ack_next_seq: AtomicU32::new(0),
+            ack_notify: Notify::new(),
+            durable_complete: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
+            terminal_claimed: AtomicBool::new(false),
+            data_channel_tx: async_mpsc::unbounded_channel().0,
+            transfer: Mutex::new(TransferState::default()),
+            control_tx: async_mpsc::channel(1).0,
+            control_send_lock: AsyncMutex::new(()),
+            cancel_tx: watch::channel(false).0,
+        }
+    }
+
+    fn observed_pair() -> (
+        NativeLanSession,
+        NativeLanSession,
+        PairTrace,
+        PairTrace,
+        String,
+    ) {
+        let (ak, ah) = native_lan::start_pairing(
+            "aabbccddeeff00112233445566778899",
+            "DEVICE_A_SENTINEL",
+            "A",
+            "DEVICE_B_SENTINEL",
+        )
+        .unwrap();
+        let (bk, bh) =
+            native_lan::respond_to_pairing(&ah, "DEVICE_B_SENTINEL", "B", "DEVICE_A_SENTINEL")
+                .unwrap();
+        let a = PendingLocalPair::new(native_lan::establish_local_session(ak, &ah, &bh).unwrap());
+        let b = PendingLocalPair::new(native_lan::establish_local_session(bk, &bh, &ah).unwrap());
+        let code = a.verification_code().unwrap().to_string();
+        let at = new_pair_trace(PairRole::Sender, Some(1));
+        let bt = new_pair_trace(PairRole::Receiver, None);
+        (
+            observed_session(a, PairingRole::Initiator, at.clone()),
+            observed_session(b, PairingRole::Responder, bt.clone()),
+            at,
+            bt,
+            code,
+        )
+    }
+
+    fn observed_decide(
+        session: &NativeLanSession,
+        approved: bool,
+        code: &str,
+    ) -> EncryptedControlFrame {
+        let mut auth = session.auth.lock().unwrap();
+        let LocalAuthState::Pending(pending) = &mut *auth else {
+            panic!("expected pending")
+        };
+        decide_locally_observed(session, pending, approved, code).unwrap()
+    }
+
+    #[test]
+    fn post_prompt_both_roles_correlate_real_decisions_peer_auth_and_control_write() {
+        for receiver_first in [false, true] {
+            let (a, b, at, bt, code) = observed_pair();
+            let (first, second) = if receiver_first { (&b, &a) } else { (&a, &b) };
+            let first_frame = observed_decide(first, true, &code);
+            assert!(matches!(
+                process_control_frame(second, &first_frame).unwrap(),
+                ControlOutcome::PairingPending
+            ));
+            let second_frame = observed_decide(second, true, &code);
+            authenticate_local_session(second).unwrap();
+            assert!(matches!(
+                process_control_frame(first, &second_frame).unwrap(),
+                ControlOutcome::PairingConfirmed
+            ));
+            for (session, trace) in [(&a, &at), (&b, &bt)] {
+                let events = trace.captured_entries();
+                let json = serde_json::to_value(&events).unwrap();
+                let entries = json.as_array().unwrap();
+                assert!(entries.iter().all(|entry| entry["attempt"] == trace.id()));
+                for expected in ["decision_local", "peer_decision_received", "auth_confirmed"] {
+                    assert!(
+                        entries.iter().any(|entry| entry["stage"] == expected),
+                        "missing {expected}: {json}"
+                    );
+                }
+                let encoded = json.to_string();
+                for forbidden in [
+                    &code,
+                    &session.session_id,
+                    &session.task_id,
+                    "DEVICE_A_SENTINEL",
+                    "DEVICE_B_SENTINEL",
+                ] {
+                    assert!(!encoded.contains(forbidden));
+                }
+                // Actual writer success is distinct from encryption/queueing.
+                let message = NativeControlMessage::P2pOffer {
+                    sdp: "SDP_SENTINEL 192.168.246.19 49157".into(),
+                };
+                let frame = {
+                    let mut auth = session.auth.lock().unwrap();
+                    let LocalAuthState::Authenticated(auth) = &mut *auth else {
+                        panic!("expected auth")
+                    };
+                    auth.encrypt_control(&message).unwrap()
+                };
+                let before = trace.captured_entries().len();
+                session.observe_outgoing_control(&message, &frame);
+                assert_eq!(trace.captured_entries().len(), before);
+                session.observe_control_written(frame.sequence);
+                session.observe_control_written(frame.sequence);
+                assert_eq!(trace.captured_entries().len(), before + 1);
+                let encoded = serde_json::to_string(&trace.captured_entries()).unwrap();
+                assert!(!encoded.contains("SDP_SENTINEL"));
+                assert!(!encoded.contains("192.168.246.19"));
+            }
+        }
+    }
+
+    #[test]
+    fn post_prompt_control_write_failure_and_timeout_remain_correlated_and_payload_free() {
+        for receiver_first in [false, true] {
+            let (a, b, at, bt, code) = observed_pair();
+            let (session, trace) = if receiver_first { (&b, &bt) } else { (&a, &at) };
+            let mut frame = observed_decide(session, true, &code);
+            let initial = trace.captured_entries().len();
+            for message in [
+                NativeControlMessage::P2pOffer {
+                    sdp: "SDP_SENTINEL".into(),
+                },
+                NativeControlMessage::P2pAnswer {
+                    sdp: "SDP_SENTINEL".into(),
+                },
+            ] {
+                for timed_out in [false, true] {
+                    frame.sequence += 1;
+                    session.observe_outgoing_control(&message, &frame);
+                    session.observe_control_write_start(frame.sequence);
+                    session.observe_control_write_failed(frame.sequence, timed_out);
+                    session.observe_control_write_failed(frame.sequence, timed_out);
+                    session.observe_control_written(frame.sequence);
+                }
+            }
+            let rows = serde_json::to_value(trace.captured_entries()).unwrap();
+            let entries = &rows.as_array().unwrap()[initial..];
+            assert_eq!(entries.len(), 6); // two deduplicated starts, two errors, two timeouts
+            assert_eq!(
+                entries.iter().filter(|e| e["state"] == "timeout").count(),
+                2
+            );
+            assert_eq!(entries.iter().filter(|e| e["state"] == "error").count(), 2);
+            assert!(entries.iter().all(|e| e["attempt"] == trace.id()));
+            assert!(!rows.to_string().contains("SDP_SENTINEL"));
+            assert!(!rows.to_string().contains(&code));
+            assert!(session.diagnostic_control_writes.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn post_prompt_decline_mismatch_and_invalid_peer_are_distinct_without_auth() {
+        for receiver_first in [false, true] {
+            for approved in [false, true] {
+                let (a, b, at, bt, _) = observed_pair();
+                let (local, remote, trace, remote_trace) = if receiver_first {
+                    (&b, &a, &bt, &at)
+                } else {
+                    (&a, &b, &at, &bt)
+                };
+                let frame = observed_decide(local, approved, "CODE_SENTINEL");
+                assert!(matches!(
+                    process_control_frame(remote, &frame).unwrap(),
+                    ControlOutcome::PeerRejected
+                ));
+                let encoded = serde_json::to_value(trace.captured_entries()).unwrap();
+                let decision = &encoded[0];
+                assert_eq!(decision["stage"], "decision_local");
+                assert_eq!(decision["approved"], approved);
+                if approved {
+                    assert_eq!(decision["codeMatch"], false);
+                }
+                let peer = serde_json::to_string(&remote_trace.captured_entries()).unwrap();
+                assert!(peer.contains("peer_decision_received"));
+                assert!(!peer.contains("auth_confirmed"));
+                assert!(!peer.contains("CODE_SENTINEL"));
+            }
+            let (a, b, at, bt, code) = observed_pair();
+            let (local, remote, trace) = if receiver_first {
+                (&b, &a, &at)
+            } else {
+                (&a, &b, &bt)
+            };
+            let mut frame = observed_decide(local, true, &code);
+            frame.ct = "INVALID_CIPHERTEXT_SENTINEL".into();
+            assert!(process_control_frame(remote, &frame).is_err());
+            let encoded = serde_json::to_string(&trace.captured_entries()).unwrap();
+            assert!(encoded.contains("peer_decision"));
+            assert!(!encoded.contains("auth_confirmed"));
+            assert!(!encoded.contains("INVALID_CIPHERTEXT_SENTINEL"));
+        }
     }
 
     #[test]
@@ -2332,6 +2645,8 @@ async fn install_control_session(
     let (data_channel_tx, data_channel_rx) = async_mpsc::unbounded_channel();
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let session = Arc::new(NativeLanSession {
+        diagnostic: FunnelTrace::new(trace.clone()),
+        diagnostic_control_writes: Mutex::new(BTreeMap::new()),
         session_id: session_id.clone(),
         task_id: task_id.clone(),
         role,
@@ -2438,6 +2753,7 @@ async fn run_control_writer(
             }
             frame = control_rx.recv() => {
                 let Some(frame) = frame else { break "control queue closed".to_string(); };
+                session.observe_control_write_start(frame.sequence);
                 let result = tokio::select! {
                     changed = cancel_rx.changed() => {
                         if changed.is_err() || *cancel_rx.borrow() { break "session cancelled during write".to_string(); }
@@ -2446,9 +2762,15 @@ async fn run_control_writer(
                     result = tokio::time::timeout(Duration::from_secs(15), native_lan::write_control_frame(&mut writer, &frame)) => result,
                 };
                 match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => break format!("control write failed: {error}"),
-                    Err(_) => break "control write timed out".to_string(),
+                    Ok(Ok(())) => { session.observe_control_written(frame.sequence); }
+                    Ok(Err(error)) => {
+                        session.observe_control_write_failed(frame.sequence, false);
+                        break format!("control write failed: {error}");
+                    }
+                    Err(_) => {
+                        session.observe_control_write_failed(frame.sequence, true);
+                        break "control write timed out".to_string();
+                    }
                 }
             }
         }
@@ -2556,7 +2878,20 @@ fn process_control_frame(
         .map_err(|error| format!("LAN auth state lock: {error}"))?;
     match &mut *auth {
         LocalAuthState::Pending(pending) => {
-            let decision = pending.accept_peer_frame(frame)?;
+            let decision = match pending.accept_peer_frame(frame) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    session.diagnostic.record(FunnelEvent::PeerDecisionInvalid);
+                    return Err(error);
+                }
+            };
+            session
+                .diagnostic
+                .record(if decision == PairingDecision::Rejected {
+                    FunnelEvent::PeerDecisionRejected
+                } else {
+                    FunnelEvent::PeerDecisionConfirmed
+                });
             match decision {
                 PairingDecision::Confirmed => {
                     let pending = match std::mem::replace(&mut *auth, LocalAuthState::Closed) {
@@ -2564,6 +2899,7 @@ fn process_control_frame(
                         _ => unreachable!(),
                     };
                     *auth = LocalAuthState::Authenticated(pending.into_authenticated()?);
+                    session.diagnostic.record(FunnelEvent::AuthConfirmed);
                     Ok(ControlOutcome::PairingConfirmed)
                 }
                 PairingDecision::Rejected => Ok(ControlOutcome::PeerRejected),
