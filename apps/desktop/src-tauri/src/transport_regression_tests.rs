@@ -7,6 +7,7 @@ use super::super::{
 };
 use super::*;
 use crate::pairing_diagnostics::{FunnelTrace, PairTrace};
+use std::net::SocketAddr;
 
 fn authenticated_pair() -> (
     NativeLanSession,
@@ -601,4 +602,263 @@ fn simultaneous_terminal_observers_never_overwrite_first_reason() {
         .find(|r| r["transport"]["phase"] == "cleanup")
         .unwrap();
     assert_eq!(&cleanup["transport"]["firstTerminal"], first);
+}
+
+#[test]
+fn resolved_endpoint_projection_and_exact_candidate_policy_are_not_nic_ownership_proof() {
+    use super::super::{candidate_matches_discovered_endpoints, eligible_lan_endpoints};
+    let a: IpAddr = "192.168.246.19".parse().unwrap();
+    let b: IpAddr = "192.168.247.23".parse().unwrap();
+    let same_subnet_other: IpAddr = "192.168.246.20".parse().unwrap();
+    let info = mdns_sd::ServiceInfo::new(
+        "_fling._tcp.local.",
+        "SERVICE_ID_MARKER",
+        "HOST_MARKER.local.",
+        "192.168.246.19",
+        49157,
+        None,
+    )
+    .unwrap()
+    .enable_addr_auto();
+    let endpoints = eligible_lan_endpoints(info.get_addresses(), info.get_port(), false);
+    assert!(candidate_matches_discovered_endpoints(
+        endpoints.iter().map(SocketAddr::ip),
+        a
+    ));
+    assert!(!candidate_matches_discovered_endpoints(
+        endpoints.iter().map(SocketAddr::ip),
+        b
+    ));
+    assert!(!candidate_matches_discovered_endpoints(
+        endpoints.iter().map(SocketAddr::ip),
+        same_subnet_other
+    ));
+    assert!(candidate_matches_discovered_endpoints([a, b], b));
+    assert!(!candidate_matches_discovered_endpoints([], b));
+    // Fixture B may model another NIC, but this cannot prove the incident's B belongs to the peer.
+    let mapped = IpAddr::V6("::ffff:192.168.246.19".parse().unwrap());
+    assert!(candidate_matches_discovered_endpoints([a], mapped));
+    assert!(candidate_matches_discovered_endpoints([mapped], a));
+}
+#[test]
+fn all_current_fullnames_are_aggregated_but_foreign_peers_and_removed_addresses_are_not() {
+    let runtime = NativeLanRuntime::new();
+    let a: SocketAddr = "192.168.246.19:49157".parse().unwrap();
+    let b: SocketAddr = "192.168.247.23:49157".parse().unwrap();
+    runtime.upsert_peer(
+        "SERVICE_ID_MARKER_A",
+        "DEVICE_ID_MARKER",
+        "NAME_MARKER",
+        vec![a],
+    );
+    runtime.upsert_peer(
+        "SERVICE_ID_MARKER_FOREIGN",
+        "FOREIGN_DEVICE_ID_MARKER",
+        "NAME_MARKER",
+        vec![b],
+    );
+    assert!(!runtime.peer_matches_endpoint("DEVICE_ID_MARKER", b.ip()));
+    runtime.upsert_peer(
+        "SERVICE_ID_MARKER_B",
+        "DEVICE_ID_MARKER",
+        "NAME_MARKER",
+        vec![b],
+    );
+    assert!(runtime.peer_matches_endpoint("DEVICE_ID_MARKER", b.ip()));
+    runtime.remove_peer("SERVICE_ID_MARKER_B");
+    assert!(!runtime.peer_matches_endpoint("DEVICE_ID_MARKER", b.ip()));
+    runtime.upsert_peer(
+        "SERVICE_ID_MARKER_A",
+        "DEVICE_ID_MARKER",
+        "NAME_MARKER",
+        vec![],
+    );
+    assert!(!runtime.peer_matches_endpoint("DEVICE_ID_MARKER", a.ip()));
+}
+#[test]
+fn rejected_candidate_family_and_lan_class_are_allowlisted_and_never_contain_input() {
+    use crate::transport_diagnostics::{CandidateAddressFamily as F, CandidateLanClass as A};
+    for (address, family, class) in [
+        ("192.168.246.19", F::Ipv4, A::PrivateIpv4),
+        ("169.254.246.19", F::Ipv4, A::LinkLocalIpv4),
+        ("fd12:3456:789a::42", F::Ipv6, A::UlaIpv6),
+        ("fe80::42", F::Ipv6, A::LinkLocalIpv6),
+        ("::ffff:192.168.246.19", F::Ipv6, A::Ipv4MappedIpv6),
+        ("127.0.0.1", F::Ipv4, A::Loopback),
+        ("0.0.0.0", F::Ipv4, A::Unspecified),
+        ("224.0.0.1", F::Ipv4, A::Multicast),
+        ("203.0.113.42", F::Ipv4, A::Other),
+        ("HOST_MARKER", F::Unknown, A::Unknown),
+    ] {
+        let input = format!("candidate:CANDIDATE_MARKER 1 udp 9 {address} 49157 typ host SHORT_CODE_MARKER KEY_MARKER SESSION_ID_MARKER C:/PATH_MARKER");
+        let context = rejected_candidate_context(&input, Some(false));
+        assert_eq!(context.family, family);
+        assert_eq!(context.lan_class, class);
+        assert_eq!(context.endpoint_matched, Some(false));
+        let json = serde_json::to_string(&context).unwrap();
+        for marker in [address, "49157", "MARKER", "candidate:"] {
+            assert!(!json.contains(marker));
+        }
+    }
+}
+#[test]
+fn classification_order_remains_host_then_lan_then_exact_endpoint_match() {
+    let runtime = NativeLanRuntime::new();
+    let (a, b, at, _, _ar, _br) = authenticated_pair();
+    runtime.upsert_peer(
+        "SERVICE_ID_MARKER",
+        &a.peer_device_id,
+        "NAME_MARKER",
+        vec!["192.168.246.19:49157".parse().unwrap()],
+    );
+    for (line, reason) in [
+        (
+            "candidate:MARKER 1 udp 9 203.0.113.42 49157 typ srflx",
+            Tr::CandidateNonHost,
+        ),
+        (
+            "candidate:MARKER 1 udp 9 203.0.113.42 49157 typ host",
+            Tr::CandidateNonLocal,
+        ),
+        (
+            "candidate:MARKER 1 udp 9 192.168.247.23 49157 typ host",
+            Tr::CandidatePeerMismatch,
+        ),
+    ] {
+        assert_eq!(
+            classify_peer_candidate(&runtime, &a, line).unwrap_err().0,
+            reason
+        );
+    }
+    assert!(classify_peer_candidate(
+        &runtime,
+        &a,
+        "candidate:MARKER 1 udp 9 192.168.246.19 49157 typ host"
+    )
+    .is_ok());
+    a.diagnostic.snapshot();
+    let value = entries(&at);
+    // First rejection is non-host, before endpoint lookup; do not invent a false match result.
+    let last = value.as_array().unwrap().last().unwrap();
+    assert!(last["transport"]["firstRejectedCandidate"]
+        .get("endpointMatched")
+        .is_none());
+    close(&a);
+    close(&b);
+}
+#[test]
+fn first_rejected_candidate_context_is_fixed_and_never_emits_per_candidate_logs() {
+    let trace = crate::pairing_diagnostics::new_pair_trace(
+        crate::pairing_diagnostics::PairRole::Sender,
+        None,
+    );
+    let diagnostic = FunnelTrace::new(trace.clone());
+    let first = rejected_candidate_context(
+        "candidate:MARKER 1 udp 9 192.168.246.19 49157 typ host",
+        Some(false),
+    );
+    let later = rejected_candidate_context(
+        "candidate:OTHER_MARKER 1 udp 9 fd12:3456:789a::42 49157 typ host",
+        Some(true),
+    );
+    let before = trace.captured_entries().len();
+    diagnostic.rejected_candidate_context(first);
+    for _ in 0..10000 {
+        diagnostic.rejected_candidate_context(later);
+    }
+    assert_eq!(trace.captured_entries().len(), before);
+    diagnostic.snapshot();
+    assert_eq!(trace.captured_entries().len(), before + 1);
+    let value = entries(&trace);
+    assert_eq!(
+        value.as_array().unwrap().last().unwrap()["transport"]["firstRejectedCandidate"],
+        serde_json::to_value(first).unwrap()
+    );
+}
+#[tokio::test]
+async fn authenticated_answer_ok_then_unadvertised_host_preserves_real_terminal_cleanup_path() {
+    let (mut a, b, at, _, mut ar, mut br) = authenticated_pair();
+    let (dc_tx, mut dc_rx) = async_mpsc::unbounded_channel();
+    a.data_channel_tx = dc_tx;
+    let (_af, ap) = initialize_peer(&a, |_| {}).unwrap().unwrap();
+    let (_bf, _bp) = initialize_peer(&b, |_| {}).unwrap().unwrap();
+    let runtime = NativeLanRuntime::new();
+    runtime.upsert_peer(
+        "SERVICE_ID_MARKER",
+        &a.peer_device_id,
+        "NAME_MARKER",
+        vec!["192.168.246.19:49157".parse().unwrap()],
+    );
+    begin_offer(&a, &ap).await.unwrap();
+    let channel = dc_rx.recv().await.unwrap();
+    let ControlOutcome::Message(offer) =
+        process_control_frame(&b, &ar.recv().await.unwrap()).unwrap()
+    else {
+        panic!("offer")
+    };
+    route_transport_control(&runtime, &b, offer).await.unwrap();
+    let ControlOutcome::Message(answer) =
+        process_control_frame(&a, &br.recv().await.unwrap()).unwrap()
+    else {
+        panic!("answer")
+    };
+    route_transport_control(&runtime, &a, answer).await.unwrap();
+    assert!(has(&at, "answer_set_remote", "ok", "none"));
+    let a = Arc::new(a);
+    runtime.insert_session(a.clone()).unwrap();
+    let mismatch = NativeControlMessage::P2pIce {
+        candidate: Some(ice_payload(
+            "candidate:CANDIDATE_MARKER 1 udp 9 192.168.247.23 49157 typ host",
+        )),
+    };
+    send_authenticated_control(&b, mismatch).await.unwrap();
+    let frame = br.recv().await.unwrap();
+    let ControlOutcome::Message(message) = process_control_frame(&a, &frame).unwrap() else {
+        panic!("authenticated ICE")
+    };
+    assert!(route_transport_control(&runtime, &a, message)
+        .await
+        .is_err());
+    assert!(has(
+        &at,
+        "first_terminal",
+        "error",
+        "candidate_peer_mismatch"
+    ));
+    runtime.remove_session(&a.session_id);
+    assert!(has(&at, "cleanup", "start", "session_removal"));
+    let value = entries(&at);
+    let summary = value
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["transport"]["firstRejectedCandidate"].is_object())
+        .unwrap();
+    let context = &summary["transport"]["firstRejectedCandidate"];
+    assert_eq!(
+        context,
+        &serde_json::json!({"family":"ipv4","lanClass":"private_ipv4","endpointMatched":false})
+    );
+    assert_eq!(summary["transport"]["candidateSteps"]["added"], 0);
+    assert_eq!(summary["transport"]["candidateSteps"]["rejected"], 1);
+    assert_eq!(
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["transport"]["phase"] == "first_terminal")
+            .count(),
+        1
+    );
+    for marker in [
+        "192.168.246.19",
+        "192.168.247.23",
+        "49157",
+        "CANDIDATE_MARKER",
+        "SERVICE_ID_MARKER",
+    ] {
+        assert!(!value.to_string().contains(marker));
+    }
+    close(&b);
+    channel.close();
 }

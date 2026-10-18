@@ -1031,4 +1031,90 @@ mod tests {
         assert!(!text.contains("remote_or_transport"));
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn rejected_candidate_every_family_class_and_match_value_manual_export_is_private() {
+        use crate::pairing_diagnostics::{new_pair_trace, FunnelTrace, PairRole};
+        use crate::transport_diagnostics::{
+            CandidateAddressFamily as F, CandidateLanClass as A, RejectedCandidate,
+        };
+        let markers = [
+            "192.168.246.19",
+            "fd12:3456:789a::42",
+            "49157",
+            "aa:bb:cc:dd:ee:ff",
+            "candidate:CANDIDATE_MARKER",
+            "v=0\r\na=SDP_MARKER",
+            "SHORT_CODE_MARKER",
+            "INPUT_MARKER",
+            "KEY_MARKER",
+            "SESSION_ID_MARKER",
+            "TASK_ID_MARKER",
+            "TRANSFER_ID_MARKER",
+            "DEVICE_ID_MARKER",
+            "SERVICE_ID_MARKER",
+            "CONTENT_MARKER",
+            "C:\\private\\FILE_NAME_MARKER.txt",
+            "OS_ERROR_MARKER",
+        ];
+        let root = temp();
+        let path = root.join("discovery-diagnostics").join("discovery.log");
+        let cases = [
+            (F::Ipv4, A::PrivateIpv4, Some(false)),
+            (F::Ipv4, A::LinkLocalIpv4, Some(false)),
+            (F::Ipv6, A::UlaIpv6, Some(false)),
+            (F::Ipv6, A::LinkLocalIpv6, None),
+            (F::Ipv6, A::Ipv4MappedIpv6, None),
+            (F::Ipv4, A::Loopback, None),
+            (F::Ipv4, A::Unspecified, None),
+            (F::Ipv6, A::Multicast, None),
+            (F::Ipv6, A::Other, None),
+            (F::Unknown, A::Unknown, None),
+            (F::Ipv4, A::PrivateIpv4, Some(true)),
+        ];
+        for (family, lan_class, endpoint_matched) in cases {
+            let trace = new_pair_trace(PairRole::Sender, None);
+            let diagnostic = FunnelTrace::new(trace.clone());
+            diagnostic.rejected_candidate_context(RejectedCandidate {
+                family,
+                lan_class,
+                endpoint_matched,
+            });
+            diagnostic.snapshot();
+            let rows = trace.captured_entries();
+            assert_eq!(rows.len(), 1);
+            for row in rows {
+                let value = serde_json::to_value(&row).unwrap();
+                assert_eq!(value["attempt"], trace.id());
+                let context = value["transport"]["firstRejectedCandidate"]
+                    .as_object()
+                    .unwrap();
+                assert_eq!(
+                    context.len(),
+                    if endpoint_matched.is_some() { 3 } else { 2 }
+                );
+                assert_eq!(context["family"], serde_json::to_value(family).unwrap());
+                assert_eq!(
+                    context["lanClass"],
+                    serde_json::to_value(lan_class).unwrap()
+                );
+                if let Some(matched) = endpoint_matched {
+                    assert_eq!(context["endpointMatched"], matched);
+                } else {
+                    assert!(!context.contains_key("endpointMatched"));
+                }
+                append_with_context(&path, Event::Pairing(row), 0, 0).unwrap();
+            }
+        }
+        let text = export_text(&root).unwrap();
+        assert_eq!(text.lines().count(), cases.len());
+        for marker in markers {
+            assert!(
+                !text.contains(marker),
+                "private marker escaped candidate classification export"
+            );
+        }
+        assert!(!text.contains("candidate:"));
+        assert!(text.len() < 16384);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

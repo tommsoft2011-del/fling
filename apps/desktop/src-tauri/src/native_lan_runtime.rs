@@ -428,21 +428,13 @@ impl NativeLanRuntime {
             .peers_by_fullname
             .lock()
             .map(|peers| {
-                peers.values().any(|peer| {
-                    peer.device_id == device_id
-                        && peer.endpoints.iter().any(|endpoint| {
-                            endpoint.ip() == remote
-                                || match (endpoint.ip(), remote) {
-                                    (IpAddr::V4(v4), IpAddr::V6(v6)) => {
-                                        v6.to_ipv4_mapped() == Some(v4)
-                                    }
-                                    (IpAddr::V6(v6), IpAddr::V4(v4)) => {
-                                        v6.to_ipv4_mapped() == Some(v4)
-                                    }
-                                    _ => false,
-                                }
-                        })
-                })
+                candidate_matches_discovered_endpoints(
+                    peers
+                        .values()
+                        .filter(|peer| peer.device_id == device_id)
+                        .flat_map(|peer| peer.endpoints.iter().map(SocketAddr::ip)),
+                    remote,
+                )
             })
             .unwrap_or(false)
     }
@@ -573,6 +565,20 @@ impl NativeLanRuntime {
     }
 }
 
+// Pure extraction of the existing exact/mapped-IP policy; no subnet or private-range fallback.
+fn candidate_matches_discovered_endpoints(
+    discovered: impl IntoIterator<Item = IpAddr>,
+    remote: IpAddr,
+) -> bool {
+    discovered.into_iter().any(|ip| {
+        ip == remote
+            || match (ip, remote) {
+                (IpAddr::V4(v4), IpAddr::V6(v6)) => v6.to_ipv4_mapped() == Some(v4),
+                (IpAddr::V6(v6), IpAddr::V4(v4)) => v6.to_ipv4_mapped() == Some(v4),
+                _ => false,
+            }
+    })
+}
 pub(crate) fn eligible_lan_endpoints(
     addresses: &HashSet<IpAddr>,
     port: u16,

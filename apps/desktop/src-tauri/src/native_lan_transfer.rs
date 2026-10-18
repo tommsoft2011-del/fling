@@ -883,30 +883,80 @@ fn classify_peer_candidate(
     session: &NativeLanSession,
     candidate: &str,
 ) -> Result<(), (Tr, String)> {
-    let fields = candidate.split_whitespace().collect::<Vec<_>>();
-    let malformed = || "LAN ICE candidate is not a numeric host candidate".to_string();
-    if fields.len() < 8 || !fields[0].starts_with("candidate:") || fields[6] != "typ" {
-        return Err((Tr::CandidateMalformedLine, malformed()));
+    let mut endpoint_matched = None;
+    let result = (|| {
+        let fields = candidate.split_whitespace().collect::<Vec<_>>();
+        let malformed = || "LAN ICE candidate is not a numeric host candidate".to_string();
+        if fields.len() < 8 || !fields[0].starts_with("candidate:") || fields[6] != "typ" {
+            return Err((Tr::CandidateMalformedLine, malformed()));
+        }
+        if fields[7] != "host" {
+            return Err((Tr::CandidateNonHost, malformed()));
+        }
+        let ip: IpAddr = fields[4]
+            .parse()
+            .map_err(|_| (Tr::CandidateNonNumeric, malformed()))?;
+        if !is_local_network_address(ip, runtime.ipv6_listener_ready())
+            && !is_loopback_for_tests(ip)
+        {
+            return Err((
+                Tr::CandidateNonLocal,
+                "non-local ICE candidate rejected in LAN-only mode".into(),
+            ));
+        }
+        let matched = runtime.peer_matches_endpoint(&session.peer_device_id, ip);
+        endpoint_matched = Some(matched);
+        if !matched && !is_loopback_for_tests(ip) {
+            return Err((
+                Tr::CandidatePeerMismatch,
+                "ICE candidate does not match the discovered peer endpoint".into(),
+            ));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        session
+            .diagnostic
+            .rejected_candidate_context(rejected_candidate_context(candidate, endpoint_matched));
     }
-    if fields[7] != "host" {
-        return Err((Tr::CandidateNonHost, malformed()));
+    result
+}
+fn rejected_candidate_context(
+    candidate: &str,
+    endpoint_matched: Option<bool>,
+) -> crate::transport_diagnostics::RejectedCandidate {
+    use crate::transport_diagnostics::{
+        CandidateAddressFamily as F, CandidateLanClass as A, RejectedCandidate,
+    };
+    let ip = candidate
+        .split_whitespace()
+        .nth(4)
+        .and_then(|value| value.parse::<IpAddr>().ok());
+    let family = match ip {
+        Some(IpAddr::V4(_)) => F::Ipv4,
+        Some(IpAddr::V6(_)) => F::Ipv6,
+        None => F::Unknown,
+    };
+    let lan_class = match ip {
+        Some(IpAddr::V4(ip)) if ip.is_unspecified() => A::Unspecified,
+        Some(IpAddr::V4(ip)) if ip.is_loopback() => A::Loopback,
+        Some(IpAddr::V4(ip)) if ip.is_private() => A::PrivateIpv4,
+        Some(IpAddr::V4(ip)) if ip.is_link_local() => A::LinkLocalIpv4,
+        Some(IpAddr::V4(ip)) if ip.is_multicast() => A::Multicast,
+        Some(IpAddr::V6(ip)) if ip.is_unspecified() => A::Unspecified,
+        Some(IpAddr::V6(ip)) if ip.is_loopback() => A::Loopback,
+        Some(IpAddr::V6(ip)) if ip.to_ipv4_mapped().is_some() => A::Ipv4MappedIpv6,
+        Some(IpAddr::V6(ip)) if (ip.segments()[0] & 0xfe00) == 0xfc00 => A::UlaIpv6,
+        Some(IpAddr::V6(ip)) if (ip.segments()[0] & 0xffc0) == 0xfe80 => A::LinkLocalIpv6,
+        Some(IpAddr::V6(ip)) if ip.is_multicast() => A::Multicast,
+        Some(_) => A::Other,
+        None => A::Unknown,
+    };
+    RejectedCandidate {
+        family,
+        lan_class,
+        endpoint_matched,
     }
-    let ip: IpAddr = fields[4]
-        .parse()
-        .map_err(|_| (Tr::CandidateNonNumeric, malformed()))?;
-    if !is_local_network_address(ip, runtime.ipv6_listener_ready()) && !is_loopback_for_tests(ip) {
-        return Err((
-            Tr::CandidateNonLocal,
-            "non-local ICE candidate rejected in LAN-only mode".into(),
-        ));
-    }
-    if !runtime.peer_matches_endpoint(&session.peer_device_id, ip) && !is_loopback_for_tests(ip) {
-        return Err((
-            Tr::CandidatePeerMismatch,
-            "ICE candidate does not match the discovered peer endpoint".into(),
-        ));
-    }
-    Ok(())
 }
 fn candidate_host_ip(candidate: &str) -> Option<IpAddr> {
     let fields = candidate.split_whitespace().collect::<Vec<_>>();

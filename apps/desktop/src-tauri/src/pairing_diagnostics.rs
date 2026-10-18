@@ -454,6 +454,18 @@ impl FunnelTrace {
         let n = state.transport.rejections.entry(reason).or_default();
         *n = n.saturating_add(1);
     }
+    pub fn rejected_candidate_context(
+        &self,
+        observation: crate::transport_diagnostics::RejectedCandidate,
+    ) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .transport
+            .first_rejected_candidate
+            .get_or_insert(observation);
+        // No per-candidate event. One immutable slot appears in existing terminal snapshots.
+    }
     pub fn terminal(&self, reason: crate::transport_diagnostics::Reason) -> bool {
         use crate::transport_diagnostics::{Detail, Outcome, Phase};
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -519,6 +531,7 @@ impl FunnelTrace {
         let mut detail = Detail::new(Phase::CandidateSummary, Outcome::Snapshot, Reason::None, 0);
         detail.candidate_steps = Some(state.transport.steps.clone());
         detail.candidate_rejections = Some(state.transport.rejections.clone());
+        detail.first_rejected_candidate = state.transport.first_rejected_candidate;
         self.detail(detail);
     }
     pub fn transition(

@@ -117,6 +117,37 @@ pub enum CloseOrigin {
     Unknown,
 }
 // No remote-or-transport classification: this API supplies no evidence for it.
+/// First rejected incoming candidate only. No raw address or caller-defined text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateAddressFamily {
+    Ipv4,
+    Ipv6,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateLanClass {
+    PrivateIpv4,
+    LinkLocalIpv4,
+    UlaIpv6,
+    LinkLocalIpv6,
+    Ipv4MappedIpv6,
+    Loopback,
+    Unspecified,
+    Multicast,
+    Other,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RejectedCandidate {
+    pub family: CandidateAddressFamily,
+    pub lan_class: CandidateLanClass,
+    // None means an earlier gate rejected before the original endpoint lookup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_matched: Option<bool>,
+}
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Detail {
@@ -136,6 +167,8 @@ pub struct Detail {
     pub candidate_steps: Option<BTreeMap<CandidateStep, u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate_rejections: Option<BTreeMap<Reason, u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_rejected_candidate: Option<RejectedCandidate>,
 }
 impl Detail {
     pub fn new(phase: Phase, outcome: Outcome, reason: Reason, count: usize) -> Self {
@@ -150,6 +183,7 @@ impl Detail {
             first_terminal: None,
             candidate_steps: None,
             candidate_rejections: None,
+            first_rejected_candidate: None,
         }
     }
 }
@@ -160,6 +194,7 @@ pub struct State {
     pub steps: BTreeMap<CandidateStep, u32>,
     pub rejections: BTreeMap<Reason, u32>,
     pub transitions: BTreeMap<Phase, Outcome>,
+    pub first_rejected_candidate: Option<RejectedCandidate>,
 }
 impl State {
     pub fn count(&mut self, step: CandidateStep, n: usize) {
@@ -198,6 +233,7 @@ impl Default for State {
             .collect(),
             rejections: BTreeMap::new(),
             transitions: BTreeMap::new(),
+            first_rejected_candidate: None,
         }
     }
 }
