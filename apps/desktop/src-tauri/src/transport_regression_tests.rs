@@ -169,7 +169,11 @@ async fn answer_policy_parse_and_pre_initialization_are_separate_failures() {
         )
         .await
         .is_err());
-        assert!(has(&at, phase, "error", reason));
+        assert!(
+            has(&at, phase, "error", reason),
+            "expected {phase}/{reason}; observations={}",
+            entries(&at)
+        );
         let json = entries(&at).to_string();
         assert!(!json.contains("SDP_MARKER") && !json.contains("RAW_MARKER"));
         close(&a);
@@ -429,6 +433,8 @@ async fn production_reader_eof_then_registry_cleanup_preserves_single_first_reas
 
 #[tokio::test]
 async fn pending_bound_and_add_metadata_failures_are_uniquely_classified() {
+    #[cfg(target_os = "windows")]
+    std::env::set_var("RUST_BACKTRACE", "full");
     let runtime = NativeLanRuntime::new();
     let (a, b, at, _, _ar, _br) = authenticated_pair();
     a.transfer.lock().unwrap().pending_remote_ice = vec![ice_payload(LOCAL); MAX_PENDING_ICE];
