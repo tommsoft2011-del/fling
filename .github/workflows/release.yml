@@ -112,7 +112,9 @@ jobs:
       - name: Test frontend diagnostic contracts (isolated diagnostic branch)
         if: startsWith(github.ref, 'refs/heads/test/pairing-confirm-observability-')
         working-directory: apps/desktop
+        shell: bash
         run: |
+          set -euo pipefail
           bun test/lan-ipc-contract.ts
           bun test/lan-picker-ui.ts
           bun test/lan-confirm-observability.ts
