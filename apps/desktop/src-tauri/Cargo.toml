@@ -1,6 +1,6 @@
 [package]
 name = "fling-desktop"
-version = "0.6.10"
+version = "0.6.11"
 description = "Fling — fling text and files between your devices"
 authors = ["tommsoft2011-del"]
 edition = "2021"
@@ -28,7 +28,7 @@ hostname = "0.4"
 rand = "0.9"
 open = "5"
 sha2 = "0.10"
-livekit = "0.9.5"
+livekit = { version = "0.9.5", features = ["rustls-tls-native-roots"] }
 pbkdf2 = "0.12"
 hkdf = "0.12"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
