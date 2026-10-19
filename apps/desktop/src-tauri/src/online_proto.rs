@@ -55,7 +55,7 @@ pub struct OfferItem {
 /// All Fling wire messages. The `kind` tag values must match the TypeScript
 /// `FlingMessage` union in `packages/core/src/protocol.ts` exactly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
+#[serde(tag = "kind", rename_all = "camelCase")]
 pub enum FlingMessage {
     #[serde(rename = "hello")]
     Hello { device: String },
