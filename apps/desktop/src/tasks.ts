@@ -790,35 +790,34 @@ export class SendTask {
               ? (await this.preparedManifest.promise) ?? undefined
               : undefined;
             if (this.preparedManifest?.index === i) this.preparedManifest = null;
-            const manifest = await this.room!.sendFile(
-              file,
-              onFileProgress,
-              src.kind,
-              prepared,
-              0,
-              this.currentFileStartupDeadlineAt,
-            );
-            st.sha256 = manifest.sha256;
-            st.mimeType = manifest.mimeType;
-
-            // sendFile now confirms every direct window itself. If it had to
-            // abandon the path, the remaining bytes are already being
-            // repaired through LiveKit; use the relay's no-progress timeout
-            // instead of applying the old five-second direct deadline to
-            // that repair stream.
+            // sendFile (Rust online_send_file) blocks until the receiver's
+            // complete ACK arrives (SHA verified + file renamed). A successful
+            // return means the file is confirmed — no need to wait for the
+            // legacy peerDoneBytes which Rust never updates (no task-progress
+            // messages in the v0.6.7+ Rust path).
+            let confirmed = true;
+            try {
+              const manifest = await this.room!.sendFile(
+                file,
+                onFileProgress,
+                src.kind,
+                prepared,
+                0,
+                this.currentFileStartupDeadlineAt,
+              );
+              st.sha256 = manifest.sha256;
+              st.mimeType = manifest.mimeType;
+              // Mark peer progress as complete so UI and waitForPeerProgress
+              // see the confirmation.
+              this.peerDoneBytes = Math.max(this.peerDoneBytes, peerTarget);
+              this.peerSavedBytes = Math.max(this.peerSavedBytes, peerTarget);
+            } catch (e) {
+              confirmed = false;
+              throw e;
+            }
+            // Legacy waitForPeerProgress removed: Rust already confirmed via
+            // complete ACK. Keep the variable for the replay logic below.
             const directPathStillActive = directFileTransfer && this.room?.directActive === true;
-
-            // Do not start the next file after only filling a local buffer.
-            // This is required for both direct and relay modes: after a direct
-            // fallback, relay publish() can finish long before the receiver
-            // has drained the reliable LiveKit queue.
-            let confirmed = receiverSaved || await this.waitForPeerProgress(
-              peerTarget,
-              directPathStillActive
-                ? DIRECT_PEER_PROGRESS_TIMEOUT_MS
-                : RELAY_PEER_PROGRESS_SILENCE_TIMEOUT_MS,
-              !directPathStillActive,
-            );
             if (directFileTransfer && !confirmed) {
               const reason = `file progress stalled at ${this.peerDoneBytes}/${peerTarget}`;
               const previousTarget = peerTarget - st.totalBytes;
@@ -1514,6 +1513,7 @@ export class RecvTask {
         onText: (t) => this.onTextPart(t),
         onFileManifest: (m) => this.onManifest(m),
         onFileProgress: (id, r, t) => this.onProgress(id, r, t),
+        onTransferDone: (transferId) => this.onTransferDone(transferId),
         onFileRoute: (route, id) => {
           const item = this.manifestToItem.get(id);
           if (item) item.transport = mergeTransport(item.transport, route);
@@ -1652,6 +1652,25 @@ export class RecvTask {
     this.trackSpeed();
     this.notify();
     this.reportProgress();
+  }
+
+  /** Rust transfer-done: file already persisted by Rust (SHA verified).
+   * Mark the item done so UI leaves 0%. */
+  private onTransferDone(transferId: string): void {
+    const item = this.manifestToItem.get(transferId);
+    if (!item) {
+      log('xfer', 'transfer-done for unknown item', { taskId: this.taskId, transferId: transferId.slice(0, 8) });
+      return;
+    }
+    item.doneBytes = item.totalBytes;
+    item.status = 'done';
+    log('xfer', 'transfer-done marked', { taskId: this.taskId, name: item.name, size: item.totalBytes });
+    this.notify();
+    this.reportProgress(true);
+    // Check if all items done, then finish.
+    if (this.items.every((it) => it.status === 'done')) {
+      void this.finish(true);
+    }
   }
 
   private lastProgressReport = 0;

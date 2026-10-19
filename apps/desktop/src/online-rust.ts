@@ -84,6 +84,16 @@ export class RustFlingRoom {
             ev.total_bytes as number,
           );
           break;
+        case 'file-manifest':
+          // Receiver-side: Rust got a manifest, frontend needs to create
+          // the transferId -> item mapping for progress display.
+          events.onFileManifest?.({
+            id: ev.transfer_id as string,
+            name: ev.name as string,
+            size: ev.size as number,
+            kind: ev.kind as string,
+          } as never);
+          break;
         case 'p2p':
           this.directActive = ev.state === 'open';
           if (ev.state === 'open') {
@@ -92,12 +102,19 @@ export class RustFlingRoom {
           break;
         case 'transfer-done':
           if (ev.ok) {
-            // The Rust receiver already persisted the file; the desktop
-            // task marks it done from the transfer-done event.
-            events.onTaskProgress?.(
-              ev.transfer_id as string,
-              0, 0, '', 0,
-            );
+            // The Rust receiver already persisted the file (SHA verified,
+            // renamed). Notify the task layer via onFileProgress with full
+            // bytes, then let it mark done. We don't have total_bytes in
+            // TransferDone, so use a dedicated handler if available.
+            const tid = ev.transfer_id as string;
+            // Try the file-complete path first (receiver side).
+            if ((events as any).onTransferDone) {
+              (events as any).onTransferDone(tid);
+            } else {
+              // Fallback: mark progress as complete via onFileProgress.
+              // The task layer will resolve total from its item mapping.
+              events.onFileProgress?.(tid, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
+            }
           } else {
             events.onFileError?.(ev.transfer_id as string, (ev.error as string) ?? 'transfer failed');
           }
