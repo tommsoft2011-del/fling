@@ -29,6 +29,15 @@ enum OnlineUiEvent {
     /// A text message arrived.
     #[serde(rename = "text")]
     Text { from: String, id: String, text: String },
+    /// A file manifest arrived (receiver side). Frontend uses this to
+    /// create the transferId -> item mapping for progress display.
+    #[serde(rename = "file-manifest")]
+    FileManifest {
+        transfer_id: String,
+        name: String,
+        size: u64,
+        file_kind: String,
+    },
     /// Peer presence changed.
     #[serde(rename = "peer")]
     Peer { identity: String, joined: bool },
@@ -243,6 +252,22 @@ impl OnlineSession {
         manifest: crate::online_proto::FileManifest,
     ) -> Result<(), String> {
         let id = manifest.id.clone();
+        // Notify the frontend so it can create the transferId -> item mapping
+        // for progress display. The manifest kind is an enum; convert to string.
+        let kind_str = match &manifest.kind {
+            crate::online_proto::FileKind::File => "file",
+            crate::online_proto::FileKind::ClipboardImage => "clipboard-image",
+        };
+        emit(
+            &self.app,
+            &self.id,
+            OnlineUiEvent::FileManifest {
+                transfer_id: id.clone(),
+                name: manifest.name.clone(),
+                size: manifest.size,
+                file_kind: kind_str.to_string(),
+            },
+        );
         let receiver = Arc::new(OnlineReceiver::new(manifest, &self.download_dir)?);
         self.receivers.lock().await.insert(id.clone(), receiver);
         self.receiver_last_ack.lock().await.insert(id.clone(), 0);
@@ -576,12 +601,11 @@ impl OnlineSession {
         };
 
         // 4. Report.
+        // NOTE: Do NOT send FlingMessage::TaskDone here — that's a task-level
+        // message for the whole task (all files), sent by the frontend.
+        // We only emit the per-file TransferDone UI event.
         match &result {
             Ok(()) => {
-                let _ = self
-                    .room
-                    .send(&FlingMessage::TaskDone { task_id: transfer_id.clone() })
-                    .await;
                 emit(
                     &self.app,
                     &self.id,
