@@ -1218,13 +1218,34 @@ export class SendTask {
       keyMaterial: 'inbox:' + peerDeviceId,
       keyContext: KEY_CTX.inbox,
     };
-    const sendOnce = async () => {
+    // v0.6.9+: 优先尝试局域网直连投递 offer（不经过 LiveKit），失败则回退
+    const sendViaLan = async (): Promise<boolean> => {
+      try {
+        const ok = await invoke<boolean>('native_lan_try_direct_offer', {
+          peerId: peerDeviceId,
+          offerJson: JSON.stringify(offer),
+        });
+        return ok;
+      } catch {
+        return false;
+      }
+    };
+    const sendViaLiveKit = async () => {
       const r = await connectFlingRoom(spec, {});
       try {
         await r.sendOffer(offer);
         await delay(1200);
       } finally {
         await r.close().catch(() => {});
+      }
+    };
+    const sendOnce = async () => {
+      // 先试局域网，2-3 秒无响应则用 LiveKit
+      const lanOk = await sendViaLan();
+      if (!lanOk) {
+        await sendViaLiveKit();
+      } else {
+        await delay(1200);
       }
     };
     await sendOnce();
@@ -2081,6 +2102,12 @@ class TransferManager {
     });
     await invoke('discovery_set_browsing', { on: true });
     await invoke('discovery_set_discoverable', { on: settings.discoverable });
+    // v0.6.9+: 启动 LAN 运行时（用于局域网直连信令优先）
+    try {
+      await invoke('native_lan_start_mode');
+    } catch {
+      // LAN 不可用时忽略，信令回退到 LiveKit
+    }
   }
 
   async setDiscoverable(on: boolean): Promise<void> {

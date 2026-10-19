@@ -7,16 +7,7 @@
   </head>
   <body>
     <div id="app">
-      <!-- 明确选择在线或仅局域网；LAN 路径不启动在线初始化。 -->
-      <div class="screen active" id="modeScreen">
-        <div class="center mode-card">
-          <h1><span class="logo">Fling</span></h1>
-          <p class="sub">选择工作模式</p>
-          <button class="primary mode-button" id="chooseOnline">在线模式</button>
-          <button class="ghostbtn mode-button" id="chooseLan">仅局域网测试（可断网）</button>
-          <p class="hint">仅局域网模式不会连接云端。配对前请核对两台设备显示的短码。</p>
-        </div>
-      </div>
+      <!-- 主界面（v0.6.9+：移除模式选择，直接进入主界面） -->
 
       <!-- 首次设置：服务器配置 -->
       <div class="screen" id="setupScreen">
@@ -32,67 +23,6 @@
       </div>
 
       <!-- Rust-owned, offline-capable LAN test console -->
-      <div class="screen" id="lanScreen">
-        <header class="lan-head">
-          <div>
-            <h1>仅局域网测试</h1>
-            <div class="hint" id="lanDeviceLine">正在启动本机局域网服务…</div>
-          </div>
-          <button class="ghostbtn" id="lanExit">退出测试模式</button>
-        </header>
-        <aside class="lan-feedback" aria-label="当前任务状态">
-          <div id="lanStatus" class="lan-status" role="status" aria-live="polite" aria-atomic="true">尚未开始传输</div>
-        </aside>
-        <main class="lan-content">
-          <section class="card">
-            <div class="row lan-discovery-row">
-              <div class="card-t">附近设备</div>
-              <button class="ghostbtn" id="lanRefreshPeers" type="button" aria-describedby="lanRefreshStatus">重新搜索附近设备</button>
-            </div>
-            <div class="hint">只显示本地网络中发现的设备；此模式不会自动回退到云端。</div>
-            <div id="lanPeerStatus" class="lan-status" role="status" aria-live="polite">正在发现设备…</div>
-            <div id="lanRefreshStatus" class="hint" role="status" aria-live="polite" aria-atomic="true">找不到对方时可重新搜索附近设备，无需重启应用。</div>
-            <select id="lanPeerSelect" class="textinput" aria-label="选择目标设备">
-              <option value="">等待附近设备…</option>
-            </select>
-          </section>
-          <section class="card">
-            <div class="card-t">发送文件</div>
-            <div class="row lan-source-row">
-              <button class="ghostbtn" id="lanPickSource">在本机选择文件</button>
-              <span id="lanSourceInfo" class="hint" role="status" aria-live="polite">尚未选择文件</span>
-            </div>
-            <button class="primary" id="lanSend" aria-describedby="lanSendReason" disabled>请求发送</button>
-            <div id="lanSendReason" class="hint lan-send-reason" role="status" aria-live="polite">请选择附近设备和文件</div>
-          </section>
-          <section class="card">
-            <div class="card-t">当前传输</div>
-            <div id="lanTasks"><div class="empty">暂无局域网任务</div></div>
-          </section>
-          <section class="card" id="lanHistorySection" hidden>
-            <div class="card-t">历史记录</div>
-            <div id="lanHistory"></div>
-          </section>
-          <details class="card" id="lanDiagnostics">
-            <summary id="lanDiagnosticsToggle">诊断信息</summary>
-            <div class="card-t">本地发现与配对日志</div>
-            <div id="lanLogDisclosure" class="hint">日志仅在本机生成，包含本机和对端电脑名称、构建与系统版本、搜索与配对阶段、数量、本地尝试序号、耗时和失败类别，设有大小上限；不记录 IP/MAC、文件信息、短码、密钥、内容或原始会话/传输 ID，不会自动上传。</div>
-            <div id="lanLogEvidenceNote" class="hint">日志只反映应用层观察和处理，不能证明报文实际进出网卡；该层证据仍需抓包。缓存记录不等于本轮收到新的网络响应。</div>
-            <div id="lanDiscoveryPhases" class="hint">尚无本轮阶段统计；有效服务、LAN 可用设备、成功提交的界面事件与实际可选条目数会分别记录。</div>
-            <div class="row lan-source-row">
-              <button class="ghostbtn" id="lanExportDiscoveryLog" type="button" aria-describedby="lanLogDisclosure lanLogEvidenceNote lanExportStatus">导出诊断日志</button>
-              <span id="lanExportStatus" class="hint" role="status" aria-live="polite" aria-atomic="true">手动选择保存位置后导出。</span>
-            </div>
-            <div class="card-t">WebView IPC 计数</div>
-            <div class="hint">只统计类型与字节数；文件帧和逐帧 ACK 不经过此 IPC。</div>
-            <div class="row lan-counter-row">
-              <button class="ghostbtn" id="lanRefreshCounters">刷新计数</button>
-              <span id="lanCounterSummary" class="hint">尚无统计</span>
-            </div>
-            <pre id="lanCounters">尚无统计</pre>
-          </details>
-        </main>
-      </div>
 
       <!-- 主界面 -->
       <div class="screen" id="mainScreen">

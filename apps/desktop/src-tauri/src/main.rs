@@ -2411,6 +2411,7 @@ fn main() {
             native_lan_runtime::native_lan_manifest_decision,
             native_lan_runtime::native_lan_cancel,
             native_lan_runtime::native_lan_ipc_counters,
+            native_lan_runtime::native_lan_try_direct_offer,
             write_image_clipboard,
             read_file_bytes,
             file_size,

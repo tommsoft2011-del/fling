@@ -3079,3 +3079,54 @@ fn emit_lan_event<T: Serialize + Clone>(
     runtime.count_ipc(&format!("event:{event}"), bytes);
     let _ = app.emit(event, payload);
 }
+
+/// v0.6.9+: 尝试通过局域网直连投递 offer（不经过 LiveKit）。
+/// 成功返回 true；peer 不在局域网或连接失败返回 false（调用方回退到 LiveKit）。
+#[tauri::command]
+pub(crate) async fn native_lan_try_direct_offer(
+    runtime: State<'_, NativeLanRuntime>,
+    peer_id: String,
+    offer_json: String,
+) -> Result<bool, String> {
+    let runtime = runtime.inner().clone();
+    if !runtime.is_enabled() {
+        return Ok(false);
+    }
+    let endpoints = match runtime.endpoints_for_peer(&peer_id) {
+        Ok(eps) => eps,
+        Err(_) => return Ok(false),
+    };
+    // 取第一个可用的 TCP 端点（mDNS 发现的地址）
+    let addr = endpoints.into_iter().find_map(|ep| {
+        Some(ep.endpoint)
+    });
+    let addr = match addr {
+        Some(a) => a,
+        None => return Ok(false),
+    };
+    // 2 秒超时尝试直连
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await;
+    let mut stream = match result {
+        Ok(Ok(s)) => s,
+        _ => return Ok(false),
+    };
+    // 发送 offer（长度前缀 + JSON）
+    use tokio::io::AsyncWriteExt;
+    let payload = offer_json.as_bytes();
+    let len = (payload.len() as u32).to_be_bytes();
+    let write_result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        async {
+            stream.write_all(&len).await?;
+            stream.write_all(payload).await?;
+            stream.flush().await?;
+            Ok::<(), std::io::Error>(())
+        },
+    )
+    .await;
+    Ok(write_result.is_ok() && write_result.unwrap().is_ok())
+}
