@@ -50,6 +50,8 @@ export interface FlingRoomEvents {
   /** All bytes arrived; receiver is assembling, hashing, or persisting the file. */
   onFileFinalizing?(id: string, size: number): void;
   onFileError?(id: string, error: string): void;
+  /** Rust transfer completed (file persisted by Rust). Transfer ID is the manifest ID. */
+  onTransferDone?(transferId: string): void;
   // v2 transfer-tool signaling. Optional so existing v1 callers (CLI)
   // keep working without changes.
   onOffer?(offer: OfferMessage, from: string): void;
