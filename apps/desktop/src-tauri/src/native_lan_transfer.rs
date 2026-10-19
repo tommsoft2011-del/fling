@@ -34,10 +34,17 @@ use tokio::time::timeout;
 
 const DIRECT_CHANNEL_LABEL: &str = "fling-file";
 const ACK_INTERVAL_CHUNKS: u32 = 8;
-const SENDER_WINDOW_CHUNKS: u32 = 16;
+// 8 MiB in-flight window with 32 KiB chunks (was 16 chunks / 512 KiB).
+const SENDER_WINDOW_CHUNKS: u32 = 256;
+// Max chunks coalesced into one FLNG batch frame (4 x 32 KiB = 128 KiB payload ceiling).
+const BATCH_CHUNKS_PER_FRAME: u32 = 4;
 const MAX_BUFFERED_BYTES: u64 = 256 * 1024;
 const MAX_ACK_RECOVERY_RETRIES: u8 = 3;
-const RECEIVE_QUEUE_FRAMES: usize = 8;
+// 64 frames x 128 KiB batch frames = up to 8 MiB of shock absorption between the
+// WebRTC network thread and the disk writer. Raised from 8 because the faster
+// sender (8 MiB window, coalesced frames, event-driven backpressure) can burst
+// faster than a single disk write drains; a full queue aborts the session.
+const RECEIVE_QUEUE_FRAMES: usize = 64;
 const ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const PROGRESS_MIN_BYTES: u64 = 1024 * 1024;
@@ -1681,15 +1688,18 @@ async fn receive_one_frame(
             if chunk_size != incoming.manifest.chunk_size || count == 0 {
                 return Err("FLNG frame chunk geometry does not match manifest".to_string());
             }
+            // Validate the whole batch first, then commit it with a single disk
+            // write (was: one write per 32 KiB chunk).
             let mut offset = 0usize;
+            let mut frame_bytes = 0u64;
             for index in 0..count {
-                if incoming.next_seq >= incoming.manifest.total_chunks {
+                if incoming.next_seq.saturating_add(index) >= incoming.manifest.total_chunks {
                     return Err("FLNG frame exceeds declared chunk count".to_string());
                 }
                 let remaining = incoming
                     .manifest
                     .size
-                    .checked_sub(incoming.received_bytes)
+                    .checked_sub(incoming.received_bytes + frame_bytes)
                     .ok_or_else(|| "received byte counter overflow".to_string())?;
                 let expected = remaining.min(u64::from(chunk_size)) as usize;
                 if expected == 0
@@ -1697,31 +1707,35 @@ async fn receive_one_frame(
                 {
                     return Err("FLNG payload length does not match manifest".to_string());
                 }
-                if let Err(error) = incoming.store.append(
-                    &incoming.store_session_id,
-                    &frame.payload[offset..offset + expected],
-                ) {
-                    if frame.seq == 0 {
-                        session
-                            .diagnostic
-                            .record(FunnelEvent::FirstFrameAppendError);
-                    }
-                    return Err(error);
-                }
-                // A frame may batch chunks: only report success once the entire first frame appended.
-                if frame.seq == 0 && index + 1 == count {
-                    session.diagnostic.record(FunnelEvent::FirstFrameAppendOk);
-                }
-                offset += expected;
-                incoming.received_bytes += expected as u64;
-                incoming.next_seq += 1;
-                if index + 1 < count && incoming.received_bytes >= incoming.manifest.size {
+                if index + 1 < count
+                    && incoming.received_bytes + frame_bytes + expected as u64
+                        >= incoming.manifest.size
+                {
                     return Err("FLNG batch exceeds declared file size".to_string());
                 }
+                offset += expected;
+                frame_bytes += expected as u64;
             }
             if offset != frame.payload.len() {
                 return Err("FLNG frame contains trailing payload bytes".to_string());
             }
+            if let Err(error) = incoming.store.append(
+                &incoming.store_session_id,
+                &frame.payload[..offset],
+            ) {
+                if frame.seq == 0 {
+                    session
+                        .diagnostic
+                        .record(FunnelEvent::FirstFrameAppendError);
+                }
+                return Err(error);
+            }
+            // A frame may batch chunks: only report success once the entire first frame appended.
+            if frame.seq == 0 {
+                session.diagnostic.record(FunnelEvent::FirstFrameAppendOk);
+            }
+            incoming.received_bytes += frame_bytes;
+            incoming.next_seq += count;
             let is_complete = incoming.next_seq == incoming.manifest.total_chunks
                 && incoming.received_bytes == incoming.manifest.size;
             if incoming.next_seq == incoming.manifest.total_chunks
@@ -1975,6 +1989,15 @@ async fn run_sender(
     let mut recovery_retries = 0u8;
     let mut last_progress_bytes = 0u64;
     let mut last_progress_at = Instant::now();
+    // Event-driven backpressure: the sender waits on this watch channel instead of
+    // polling buffered_amount() on a fixed sleep. The native stack fires
+    // on_buffered_amount_change whenever the SCTP buffer drains; the wait loop
+    // re-checks buffered_amount() itself, so spurious wakeups are harmless.
+    // (A 200 ms timeout inside the wait loop is only a safety net.)
+    let (drain_tx, mut drain_rx) = watch::channel(());
+    channel.on_buffered_amount_change(Some(Box::new(move |_sent_bytes: u64| {
+        let _ = drain_tx.send(());
+    })));
     while seq < source.total_chunks {
         let acked = session
             .ack_next_seq
@@ -2019,62 +2042,88 @@ async fn run_sender(
             }
             continue;
         }
-        let mut payload = vec![0u8; NATIVE_CHUNK_SIZE as usize];
-        let chunk_offset = u64::from(seq)
-            .checked_mul(NATIVE_CHUNK_SIZE)
-            .ok_or_else(|| "source offset overflow".to_string())?;
-        let remaining = source.size_bytes.saturating_sub(chunk_offset);
-        let expected = remaining.min(NATIVE_CHUNK_SIZE) as usize;
-        if expected == 0 {
-            return Err("native source ended before declared chunk count".to_string());
-        }
-        source
-            .file
-            .read_exact(&mut payload[..expected])
-            .map_err(|error| format!("read native source: {error}"))?;
-        payload.truncate(expected);
-        if seq == hashed_seq {
-            sent_hasher.update(&payload);
-            hashed_seq += 1;
-        } else if seq > hashed_seq {
-            return Err("sender recovery skipped an unhashed source chunk".to_string());
+        // Coalesce up to BATCH_CHUNKS_PER_FRAME chunks into a single FLNG batch
+        // frame (protocol ceiling: 128 KiB payload). The batch size is bounded by
+        // the remaining in-flight window so a frame never overshoots the cap.
+        // The receiver already decodes batch frames (see decode_direct_file_frame).
+        let window_left = SENDER_WINDOW_CHUNKS.saturating_sub(seq.saturating_sub(acked));
+        let chunks_left = source.total_chunks.saturating_sub(seq);
+        let batch_chunks = BATCH_CHUNKS_PER_FRAME
+            .min(window_left)
+            .min(chunks_left)
+            .max(1);
+        let batch_seq = seq;
+        let mut batch = Vec::with_capacity(batch_chunks as usize * NATIVE_CHUNK_SIZE as usize);
+        for _ in 0..batch_chunks {
+            let cs = seq;
+            let chunk_offset = u64::from(cs)
+                .checked_mul(NATIVE_CHUNK_SIZE)
+                .ok_or_else(|| "source offset overflow".to_string())?;
+            let remaining = source.size_bytes.saturating_sub(chunk_offset);
+            let expected = remaining.min(NATIVE_CHUNK_SIZE) as usize;
+            if expected == 0 {
+                return Err("native source ended before declared chunk count".to_string());
+            }
+            let mut chunk = vec![0u8; expected];
+            source
+                .file
+                .read_exact(&mut chunk)
+                .map_err(|error| format!("read native source: {error}"))?;
+            if cs == hashed_seq {
+                sent_hasher.update(&chunk);
+                hashed_seq += 1;
+            } else if cs > hashed_seq {
+                return Err("sender recovery skipped an unhashed source chunk".to_string());
+            }
+            // cs < hashed_seq: chunk was already hashed before a recovery rewind;
+            // re-send it as-is without re-hashing.
+            batch.extend_from_slice(&chunk);
+            seq += 1;
         }
         let frame = native_lan::encode_direct_file_frame(
             &transfer_id,
-            seq,
-            &payload,
+            batch_seq,
+            &batch,
             NATIVE_CHUNK_SIZE as u16,
-            1,
+            batch_chunks as u16,
         )?;
+        // Event-driven backpressure: wait until the DataChannel buffer drains below
+        // MAX_BUFFERED_BYTES instead of polling on a fixed 5 ms sleep.
         let drain_started = Instant::now();
-        while channel.buffered_amount() > MAX_BUFFERED_BYTES {
+        loop {
+            if channel.buffered_amount() <= MAX_BUFFERED_BYTES {
+                break;
+            }
             if channel.state() != DataChannelState::Open {
                 return Err("LAN DataChannel closed while applying backpressure".to_string());
             }
             if drain_started.elapsed() > Duration::from_secs(15) {
                 return Err("LAN DataChannel send buffer did not drain".to_string());
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = timeout(Duration::from_millis(200), drain_rx.changed()).await;
         }
-        if seq == 0 {
+        if batch_seq == 0 {
             session
                 .diagnostic
                 .record(FunnelEvent::FirstFrameSendAttempt);
         }
         if let Err(error) = channel.send(&frame, true) {
             session.diagnostic.record(FunnelEvent::DataChannelError);
-            if seq == 0 {
+            if batch_seq == 0 {
                 session.diagnostic.record(FunnelEvent::FirstFrameSendError);
             }
             return Err(format!("send FLNG frame: {error}"));
         }
-        if seq == 0 {
+        if batch_seq == 0 {
             session
                 .diagnostic
                 .record(FunnelEvent::FirstFrameNativeAccepted);
         }
-        sent_bytes = sent_bytes.max(chunk_offset.saturating_add(expected as u64));
-        seq += 1;
+        sent_bytes = sent_bytes.max(
+            u64::from(batch_seq)
+                .saturating_mul(NATIVE_CHUNK_SIZE)
+                .saturating_add(batch.len() as u64),
+        );
         if sent_bytes.saturating_sub(last_progress_bytes) >= PROGRESS_MIN_BYTES
             || last_progress_at.elapsed() >= PROGRESS_MIN_INTERVAL
         {
