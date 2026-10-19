@@ -55,7 +55,7 @@ pub struct OfferItem {
 /// All Fling wire messages. The `kind` tag values must match the TypeScript
 /// `FlingMessage` union in `packages/core/src/protocol.ts` exactly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(tag = "kind")]
 pub enum FlingMessage {
     #[serde(rename = "hello")]
     Hello { device: String },
@@ -70,7 +70,7 @@ pub enum FlingMessage {
     /// Relay path chunk: base64 data.
     #[serde(rename = "file-chunk")]
     FileChunk { id: String, seq: u32, data: String },
-    #[serde(rename = "file-manifest-ack")]
+    #[serde(rename = "file-manifest-ack", rename_all = "camelCase")]
     FileManifestAck {
         id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -82,7 +82,7 @@ pub enum FlingMessage {
     },
     /// Application-level cumulative ACK for direct P2P windows. Stays on the
     /// encrypted LiveKit relay by design.
-    #[serde(rename = "file-chunk-ack")]
+    #[serde(rename = "file-chunk-ack", rename_all = "camelCase")]
     FileChunkAck {
         id: String,
         /// Next contiguous chunk the receiver still needs.
@@ -96,7 +96,7 @@ pub enum FlingMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         failed: Option<bool>,
     },
-    #[serde(rename = "offer")]
+    #[serde(rename = "offer", rename_all = "camelCase")]
     Offer {
         task_id: String,
         from_device: String,
@@ -111,22 +111,22 @@ pub enum FlingMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         total_bytes: Option<u64>,
     },
-    #[serde(rename = "offer-withdraw")]
+    #[serde(rename = "offer-withdraw", rename_all = "camelCase")]
     OfferWithdraw { task_id: String },
-    #[serde(rename = "offer-rejected")]
+    #[serde(rename = "offer-rejected", rename_all = "camelCase")]
     OfferRejected { task_id: String },
-    #[serde(rename = "task-done")]
+    #[serde(rename = "task-done", rename_all = "camelCase")]
     TaskDone { task_id: String },
-    #[serde(rename = "task-ack")]
+    #[serde(rename = "task-ack", rename_all = "camelCase")]
     TaskAck { task_id: String },
-    #[serde(rename = "task-cancel")]
+    #[serde(rename = "task-cancel", rename_all = "camelCase")]
     TaskCancel { task_id: String },
-    #[serde(rename = "task-failed")]
+    #[serde(rename = "task-failed", rename_all = "camelCase")]
     TaskFailed {
         task_id: String,
         failures: Vec<TaskFailure>,
     },
-    #[serde(rename = "task-progress")]
+    #[serde(rename = "task-progress", rename_all = "camelCase")]
     TaskProgress {
         task_id: String,
         done_bytes: u64,
