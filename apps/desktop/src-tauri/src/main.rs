@@ -31,6 +31,12 @@ mod transport_diagnostics;
 #[allow(dead_code)]
 mod native_lan;
 mod native_lan_runtime;
+mod online_crypto;
+mod online_p2p;
+mod online_proto;
+mod online_room;
+mod online_session;
+mod online_transfer;
 // ================================================================ config ==
 
 /// 16 random bytes as lowercase hex. Generated once on first run, never rotated.
@@ -399,6 +405,123 @@ fn mint_token(app: tauri::AppHandle, room: String, identity: String) -> Result<S
         &jsonwebtoken::EncodingKey::from_secret(cfg.api_secret.as_bytes()),
     )
     .map_err(|e| format!("sign: {e}"))
+}
+
+// ============================================================ online ===
+// Online (LiveKit) sessions in Rust. The WebView only displays; signaling
+// and the data plane both live here.
+
+/// Connect to a LiveKit room for online transfers. Returns a session id.
+/// The frontend listens on `fling://online/event` for messages, progress,
+/// and peer events.
+#[tauri::command]
+async fn online_connect(
+    app: tauri::AppHandle,
+    registry: tauri::State<'_, online_session::OnlineSessionRegistry>,
+    server_url: String,
+    token: String,
+    pairing_code: String,
+    key_context: String,
+) -> Result<String, String> {
+    let download_dir = get_download_dir(app.clone())?;
+    let id = format!("{:x}", rand::random::<u64>());
+    let session = online_session::OnlineSession::connect(
+        app,
+        id.clone(),
+        &server_url,
+        &token,
+        &pairing_code,
+        &key_context,
+        std::path::PathBuf::from(download_dir),
+    )
+    .await?;
+    registry.insert(id.clone(), session).await;
+    Ok(id)
+}
+
+/// Send a text message in an online session.
+#[tauri::command]
+async fn online_send_text(
+    registry: tauri::State<'_, online_session::OnlineSessionRegistry>,
+    session_id: String,
+    text: String,
+) -> Result<(), String> {
+    let session = registry
+        .get(&session_id)
+        .await
+        .ok_or_else(|| "unknown online session".to_string())?;
+    session.send_text(text).await
+}
+
+/// Send a file in an online session. Returns the transfer id.
+/// Progress arrives via `fling://online/event`.
+#[tauri::command]
+async fn online_send_file(
+    registry: tauri::State<'_, online_session::OnlineSessionRegistry>,
+    session_id: String,
+    path: String,
+    name: String,
+    kind: String,
+) -> Result<String, String> {
+    let session = registry
+        .get(&session_id)
+        .await
+        .ok_or_else(|| "unknown online session".to_string())?;
+    let file_kind = match kind.as_str() {
+        "clipboard-image" => online_proto::FileKind::ClipboardImage,
+        _ => online_proto::FileKind::File,
+    };
+    session
+        .send_file(std::path::Path::new(&path), name, file_kind)
+        .await
+}
+
+/// Send an arbitrary Fling protocol message (offer, task-ack, etc.).
+/// The message is a JSON value matching the `FlingMessage` schema.
+#[tauri::command]
+async fn online_send_message(
+    registry: tauri::State<'_, online_session::OnlineSessionRegistry>,
+    session_id: String,
+    message: serde_json::Value,
+) -> Result<(), String> {
+    let session = registry
+        .get(&session_id)
+        .await
+        .ok_or_else(|| "unknown online session".to_string())?;
+    let msg: online_proto::FlingMessage =
+        serde_json::from_value(message).map_err(|e| format!("bad Fling message: {e}"))?;
+    session.send_raw(msg).await
+}
+
+/// Write in-memory bytes (clipboard image, drag-drop) to a temp file so
+/// the Rust transfer engine can stream it. Returns the temp path.
+#[tauri::command]
+fn write_temp_file(_app: tauri::AppHandle, name: String, data: Vec<u8>) -> Result<String, String> {
+    let dir = std::env::temp_dir().join("fling-online");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create temp dir: {e}"))?;
+    // Sanitize the name to avoid path traversal.
+    let safe_name: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let path = dir.join(format!(
+        "{:x}-{safe_name}",
+        rand::random::<u64>()
+    ));
+    std::fs::write(&path, &data).map_err(|e| format!("write temp file: {e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Disconnect an online session and release its resources.
+#[tauri::command]
+async fn online_disconnect(
+    registry: tauri::State<'_, online_session::OnlineSessionRegistry>,
+    session_id: String,
+) -> Result<(), String> {
+    if let Some(session) = registry.remove(&session_id).await {
+        session.disconnect().await?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -2234,6 +2357,7 @@ fn main() {
             app.manage(RemoteConfig(Mutex::new(None)));
             app.manage(native_lan_runtime::NativeLanRuntime::new());
             app.manage(DiscoveryState { tx });
+            app.manage(online_session::OnlineSessionRegistry::new());
             if native_port != 0 {
                 if let Err(error) =
                     native_lan_runtime::start_listener(app.handle().clone(), listeners, ipv6_ready)
@@ -2254,6 +2378,12 @@ fn main() {
             get_config,
             save_config,
             mint_token,
+            online_connect,
+            online_send_text,
+            online_send_file,
+            online_send_message,
+            online_disconnect,
+            write_temp_file,
             server_url,
             pick_save_path,
             write_binary_file,

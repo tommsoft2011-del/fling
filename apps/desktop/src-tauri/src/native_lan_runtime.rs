@@ -27,7 +27,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc as async_mpsc, oneshot, watch, Mutex as AsyncMutex, Notify};
 use transfer::TransferState;
 
-const NATIVE_CHUNK_SIZE: u64 = 32 * 1024;
+pub(crate) const NATIVE_CHUNK_SIZE: u64 = 32 * 1024;
 const MAX_SOURCE_CHUNKS: u64 = u32::MAX as u64;
 const CONTROL_QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 

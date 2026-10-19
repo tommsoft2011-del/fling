@@ -2,7 +2,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { log } from './log.js';
 import {
-  FlingRoom,
   deriveRoomKey,
   inboxRoomName,
   lobbyNameForCode,
@@ -11,7 +10,7 @@ import {
   normalizeCode,
   type FlingRoomEvents,
 } from '@fling/core';
-import { BrowserTransport } from './transport-browser.js';
+import type { RustFlingRoom } from './online-rust.js';
 
 export { inboxRoomName, lobbyNameForCode, newTaskRoomName, newTaskKey, normalizeCode };
 
@@ -116,11 +115,11 @@ export function nearbyTaskSpecWithRoom(taskRoom: string, taskKeyB64: string): Ro
   return { roomName: taskRoom, keyMaterial: taskKeyB64, keyContext: KEY_CTX.task };
 }
 
-export async function connectFlingRoom(spec: RoomSpec, events: FlingRoomEvents): Promise<FlingRoom> {
-  const token = await mintToken(spec.roomName);
-  const room = new FlingRoom(new BrowserTransport(), deviceName);
-  await room.connect(serverUrl, token, spec.keyMaterial, events, spec.keyContext);
-  return room;
+export async function connectFlingRoom(spec: RoomSpec, events: FlingRoomEvents): Promise<RustFlingRoom> {
+  // WebRTC is deprecated in the WebView. Signaling and the data plane both
+  // live in Rust (online_session.rs); this returns a Rust-backed room.
+  const { connectRustRoom } = await import('./online-rust.js');
+  return connectRustRoom(spec, events, serverUrl);
 }
 
 /** 供调试/测试：密钥派生是否一致 */

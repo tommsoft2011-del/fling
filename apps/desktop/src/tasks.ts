@@ -40,7 +40,7 @@ import { b64encode, toast, uid, utf8bytes } from './ui.js';
 import { P2PLink, type P2PState } from './p2p.js';
 import { log, flushLogs, type LogTag } from './log.js';
 import { notifyTaskDone } from './notify.js';
-import type { FlingRoom } from '@fling/core';
+import type { RustFlingRoom } from './online-rust.js';
 
 export type ItemKind = 'text' | 'file' | 'clipboard-image';
 
@@ -294,7 +294,7 @@ export class SendTask {
   /** P2P 直连状态：idle=未尝试 connecting=握手中 open=直连传输中 failed=已回退中继 */
   p2p: P2PState = 'idle';
 
-  private room?: FlingRoom;
+  private room?: RustFlingRoom;
   private p2pLink: P2PLink | null = null;
   /** P2P 就绪（open/failed），文件发送前等待，避免前半走慢中继 */
   private p2pReady: Promise<'open' | 'failed'> | null = null;
@@ -985,31 +985,16 @@ export class SendTask {
     }
   }
 
-  /** 发起 P2P 直连（发送方做 initiator）。 */
+  /** P2P is handled in Rust (online_p2p.rs). This is a no-op stub. */
   private startP2P(): void {
-    if (this.p2pLink || !this.room || this.cancelled) return;
-    const link = new P2PLink(this.room, 'initiator', this.peerLabel);
-    this.p2pLink = link;
-    // 就绪 promise：open 或明确失败时 resolve，12s 超时则按失败处理。
-    // 文件在 P2P 结论出来前不发送——否则前半部分走慢速中继，永远追不上。
-    this.p2pReady = new Promise<'open' | 'failed'>((resolve) => {
-      const timer = setTimeout(() => resolve('failed'), 12_000);
-      link.onstate = (s) => {
-        this.p2p = s;
-        this.notify();
-        if (s === 'open' || s === 'failed') {
-          clearTimeout(timer);
-          resolve(s);
-        }
-      };
-    });
-    void link.start();
+    // The Rust session starts P2P automatically in send_file().
+    // P2P state arrives via fling://online/event { kind: 'p2p' }.
+    this.p2pReady = Promise.resolve('open' as const);
   }
 
   private closeP2P(): void {
     this.stopDirectHealth('p2p_link_owner_closed');
-    this.p2pLink?.close();
-    this.p2pLink = null;
+    // Rust owns the P2P link; nothing to close here.
   }
 
   /** Keep old-file silence from leaking into a new file's source/manifest startup. */
@@ -1385,7 +1370,7 @@ export class RecvTask {
   error?: string;
   onChange: () => void = () => {};
 
-  private room?: FlingRoom;
+  private room?: RustFlingRoom;
   private textParts: string[] = [];
   private textItem?: ItemState;
   private fileQueue: ItemState[] = [];
@@ -1843,45 +1828,9 @@ export class RecvTask {
   /** offer 之前到达的远端 ICE candidate 缓存（发起方局域网 host candidate 极快，经常跑赢 offer，不能丢） */
   private earlyIce: RTCIceCandidateInit[] = [];
 
-  /** P2P 信令：发送方发来 offer 则以 responder 身份应答，其余转给已建的链路。 */
-  private onP2PSignal(sig: Extract<FlingMessage, { kind: `p2p-${string}` }>): void {
-    if (this.finished) return;
-    if (sig.kind === 'p2p-offer') {
-      if (this.p2pLink || !this.room) return;
-      const link = new P2PLink(this.room, 'responder', this.peerLabel);
-      this.p2pLink = link;
-      link.onstate = (s) => {
-        this.p2p = s;
-        this.notify();
-      };
-      // 把 offer 之前到达的 candidate 补上
-      const early = this.earlyIce;
-      this.earlyIce = [];
-      for (const init of early) link.addRemoteIce(init);
-      void link.acceptOffer(sig.sdp);
-      return;
-    }
-    if (sig.kind === 'p2p-ice' && !this.p2pLink) {
-      // offer 还没到：先缓存，不能丢弃
-      if (sig.candidate) {
-        try {
-          this.earlyIce.push(JSON.parse(sig.candidate) as RTCIceCandidateInit);
-        } catch {
-          /* ignore */
-        }
-      }
-      return;
-    }
-    void this.p2pLink?.handleSignal(sig);
-  }
-
-  private closeP2P(): void {
-    this.p2pLink?.close();
-    this.p2pLink = null;
-  }
-
-  private onDirectFallback(reason: string): void {
-    this.p2pLink?.fallbackToRelay(reason);
+  /** P2P is handled in Rust. This is a no-op stub. */
+  private onP2PSignal(_sig: unknown): void {
+    // Rust consumes p2p-offer/p2p-answer/p2p-ice internally.
   }
 
   private async finish(completed: boolean): Promise<void> {
@@ -2072,8 +2021,8 @@ class TransferManager {
   recentSources = new Map<string, ComposeItem[]>();
 
   private listeners = new Set<ChangeFn>();
-  private inboxRoom?: FlingRoom;
-  private lobbies = new Map<string, { room: FlingRoom; refs: number }>();
+  private inboxRoom?: RustFlingRoom;
+  private lobbies = new Map<string, { room: RustFlingRoom; refs: number }>();
   private downloadDir = '';
   /**
    * 高频进度回调（每分块一次）会触发全量 UI 重渲染；在慢机器上不加节流会
@@ -2182,7 +2131,7 @@ class TransferManager {
     };
   }
 
-  lobbyRoomFor(code: string): FlingRoom | undefined {
+  lobbyRoomFor(code: string): RustFlingRoom | undefined {
     return this.lobbies.get(normalizeCode(code))?.room;
   }
 

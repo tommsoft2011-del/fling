@@ -1,0 +1,314 @@
+// Rust-backed online room: replaces the TypeScript FlingRoom +
+// livekit-client + RTCPeerConnection for online transfers.
+//
+// The WebView only displays; signaling and the data plane both live in
+// Rust (online_session.rs). This class implements the subset of the
+// FlingRoom interface used by tasks.ts, delegating to Tauri commands.
+
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import type {
+  FileKind,
+  FileManifest,
+  FlingRoomEvents,
+} from '@fling/core';
+import type { FileLike } from '@fling/core';
+import { log } from './log.js';
+import { KEY_CTX, mintToken } from './net.js';
+import type { RoomSpec } from './net.js';
+
+interface OnlineUiEvent {
+  session: string;
+  event: {
+    kind: string;
+    [key: string]: unknown;
+  };
+}
+
+/** Write in-memory file bytes to a temp file so Rust can stream it. */
+async function ensureFilePath(file: FileLike): Promise<string> {
+  if (file.path) return file.path;
+  // In-memory (clipboard / drag-drop): spill to temp via Rust.
+  const bytes = await file.slice(0, file.size);
+  const tmp = (await invoke('write_temp_file', {
+    name: file.name,
+    data: Array.from(bytes),
+  })) as string;
+  return tmp;
+}
+
+export class RustFlingRoom {
+  private sessionId: string | null = null;
+  private unlisten: (() => void) | null = null;
+  private events: FlingRoomEvents;
+  /** FlingRoom compat: whether a direct P2P path is active. */
+  directActive = false;
+
+  constructor(events: FlingRoomEvents) {
+    this.events = events;
+  }
+
+  async connect(spec: RoomSpec, serverUrl: string): Promise<void> {
+    const token = await mintToken(spec.roomName);
+    this.sessionId = (await invoke('online_connect', {
+      serverUrl,
+      token,
+      pairingCode: spec.keyMaterial,
+      keyContext: spec.keyContext,
+    })) as string;
+
+    this.unlisten = await listen<OnlineUiEvent>('fling://online/event', (e) => {
+      if (e.payload.session !== this.sessionId) return;
+      this.dispatch(e.payload.event);
+    });
+  }
+
+  private dispatch(ev: OnlineUiEvent['event']): void {
+    const events = this.events;
+    try {
+      switch (ev.kind) {
+        case 'text':
+          events.onText?.(ev.text as string, ev.from as string);
+          break;
+        case 'peer': {
+          const identity = ev.identity as string;
+          if (ev.joined) events.onPeerJoined?.(identity);
+          else events.onPeerLeft?.(identity);
+          break;
+        }
+        case 'progress':
+          // Receiver-side or sender-side progress.
+          events.onFileProgress?.(
+            ev.transfer_id as string,
+            ev.sent_bytes as number,
+            ev.total_bytes as number,
+          );
+          break;
+        case 'p2p':
+          this.directActive = ev.state === 'open';
+          if (ev.state === 'open') {
+            events.onFileRoute?.('p2p', '');
+          }
+          break;
+        case 'transfer-done':
+          if (ev.ok) {
+            // The Rust receiver already persisted the file; the desktop
+            // task marks it done from the transfer-done event.
+            events.onTaskProgress?.(
+              ev.transfer_id as string,
+              0, 0, '', 0,
+            );
+          } else {
+            events.onFileError?.(ev.transfer_id as string, (ev.error as string) ?? 'transfer failed');
+          }
+          break;
+        case 'disconnected':
+          log('online-rust', 'room disconnected', { reason: ev.reason });
+          break;
+        case 'protocol': {
+          // Task-level signaling for the frontend orchestrator.
+          const msg = ev.message as { kind: string; [k: string]: unknown };
+          const from = ev.from as string;
+          switch (msg.kind) {
+            case 'offer':
+              events.onOffer?.(msg as never, from);
+              break;
+            case 'offer-withdraw':
+              events.onOfferWithdraw?.(msg.taskId as string, from);
+              break;
+            case 'offer-rejected':
+              events.onOfferRejected?.(msg.taskId as string, from);
+              break;
+            case 'task-done':
+              events.onTaskDone?.(msg.taskId as string, from);
+              break;
+            case 'task-ack':
+              events.onTaskAck?.(msg.taskId as string, from);
+              break;
+            case 'task-cancel':
+              events.onTaskCancel?.(msg.taskId as string, from);
+              break;
+            case 'task-failed':
+              events.onTaskFailed?.(
+                msg.taskId as string,
+                msg.failures as { name: string; size: number; error: string }[],
+                from,
+              );
+              break;
+            case 'task-progress':
+              events.onTaskProgress?.(
+                msg.taskId as string,
+                (msg.receivedBytes ?? msg.doneBytes) as number,
+                msg.totalBytes as number,
+                from,
+                msg.savedBytes as number | undefined,
+              );
+              break;
+            case 'hello':
+              // Presence is handled via peer events; ignore.
+              break;
+            case 'bye':
+              break;
+            default:
+              break;
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    } catch (e) {
+      log('online-rust', 'event dispatch failed', { error: String(e) });
+    }
+  }
+
+  private requireSession(): string {
+    if (!this.sessionId) throw new Error('online session not connected');
+    return this.sessionId;
+  }
+
+  async sendText(text: string): Promise<void> {
+    await invoke('online_send_text', {
+      sessionId: this.requireSession(),
+      text,
+    });
+  }
+
+  /**
+   * Send a file via Rust. Mirrors FlingRoom.sendFile() signature used by
+   * tasks.ts. Returns the manifest (built by Rust).
+   */
+  async sendFile(
+    file: FileLike,
+    onProgress?: (sentBytes: number, totalBytes: number, receiverSaved?: boolean) => void,
+    kind: FileKind = 'file',
+  ): Promise<FileManifest> {
+    const path = await ensureFilePath(file);
+    // Progress arrives via fling://online/event; also poll via the
+    // dispatch above. Wire the callback to progress events for this
+    // transfer by tracking the transfer id from the result.
+    const transferId = (await invoke('online_send_file', {
+      sessionId: this.requireSession(),
+      path,
+      name: file.name,
+      kind,
+    })) as string;
+    // The manifest is not returned by the command; synthesize a minimal
+    // one for tasks.ts bookkeeping. Full manifest lives in Rust.
+    const manifest: FileManifest = {
+      id: transferId,
+      name: file.name,
+      size: file.size,
+      sha256: '',
+      chunkSize: 32 * 1024,
+      totalChunks: Math.ceil(file.size / (32 * 1024)),
+      kind,
+    };
+    // Hook progress: the dispatch() already calls onFileProgress; bridge
+    // it to the per-sendFile callback.
+    const origProgress = this.events.onFileProgress;
+    this.events.onFileProgress = (id, sent, total) => {
+      if (id === transferId) onProgress?.(sent, total);
+      origProgress?.(id, sent, total);
+    };
+    return manifest;
+  }
+
+  async sendOffer(offer: unknown): Promise<void> {
+    await invoke('online_send_message', {
+      sessionId: this.requireSession(),
+      message: { kind: 'offer', ...(offer as object) },
+    });
+  }
+
+  async sendOfferWithdraw(taskId: string): Promise<void> {
+    await invoke('online_send_message', {
+      sessionId: this.requireSession(),
+      message: { kind: 'offer-withdraw', taskId },
+    });
+  }
+
+  async sendOfferRejected(taskId: string): Promise<void> {
+    await invoke('online_send_message', {
+      sessionId: this.requireSession(),
+      message: { kind: 'offer-rejected', taskId },
+    });
+  }
+
+  async sendTaskAck(taskId: string): Promise<void> {
+    await invoke('online_send_message', {
+      sessionId: this.requireSession(),
+      message: { kind: 'task-ack', taskId },
+    });
+  }
+
+  async sendTaskFailed(
+    taskId: string,
+    failures: { name: string; size: number; error: string }[],
+  ): Promise<void> {
+    await invoke('online_send_message', {
+      sessionId: this.requireSession(),
+      message: { kind: 'task-failed', taskId, failures },
+    });
+  }
+
+  async sendTaskProgress(
+    taskId: string,
+    receivedBytes: number,
+    totalBytes: number,
+    savedBytes = 0,
+  ): Promise<void> {
+    await invoke('online_send_message', {
+      sessionId: this.requireSession(),
+      message: {
+        kind: 'task-progress',
+        taskId,
+        doneBytes: receivedBytes,
+        receivedBytes,
+        savedBytes,
+        totalBytes,
+      },
+    });
+  }
+
+  async sendTaskDone(taskId: string): Promise<void> {
+    await invoke('online_send_message', {
+      sessionId: this.requireSession(),
+      message: { kind: 'task-done', taskId },
+    });
+  }
+
+  async flush(): Promise<void> {
+    // Rust publishes are already flushed; no-op for compat.
+  }
+
+  async close(): Promise<void> {
+    if (this.sessionId) {
+      try {
+        await invoke('online_disconnect', { sessionId: this.sessionId });
+      } catch {
+        /* ignore */
+      }
+      this.sessionId = null;
+    }
+    this.unlisten?.();
+    this.unlisten = null;
+  }
+}
+
+/**
+ * Drop-in replacement for connectFlingRoom() from net.ts.
+ * Returns a Rust-backed room; the WebView does no WebRTC.
+ */
+export async function connectRustRoom(
+  spec: RoomSpec,
+  events: FlingRoomEvents,
+  serverUrl: string,
+): Promise<RustFlingRoom> {
+  const room = new RustFlingRoom(events);
+  await room.connect(spec, serverUrl);
+  return room;
+}
+
+// Re-export key contexts for callers.
+export { KEY_CTX };
