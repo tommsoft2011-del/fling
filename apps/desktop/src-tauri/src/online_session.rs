@@ -530,11 +530,7 @@ impl OnlineSession {
         };
 
         let result = if let Some((_p2p, dc)) = use_p2p {
-            // P2P path: FLNG batch frames with event-driven backpressure.
-            let (drain_tx, drain_rx) = mpsc::unbounded_channel::<()>();
-            dc.on_buffered_amount_change(Some(Box::new(move |_n: u64| {
-                let _ = drain_tx.send(());
-            })));
+            // P2P path: FLNG batch frames with polling backpressure.
             let dc_send = dc.clone();
             sender
                 .send_via_p2p(
@@ -544,7 +540,6 @@ impl OnlineSession {
                             .map_err(|e| format!("P2P send frame: {e}"))
                     },
                     || dc.buffered_amount(),
-                    drain_rx,
                     on_progress,
                 )
                 .await

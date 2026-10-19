@@ -1989,15 +1989,9 @@ async fn run_sender(
     let mut recovery_retries = 0u8;
     let mut last_progress_bytes = 0u64;
     let mut last_progress_at = Instant::now();
-    // Event-driven backpressure: the sender waits on this watch channel instead of
-    // polling buffered_amount() on a fixed sleep. The native stack fires
-    // on_buffered_amount_change whenever the SCTP buffer drains; the wait loop
-    // re-checks buffered_amount() itself, so spurious wakeups are harmless.
-    // (A 200 ms timeout inside the wait loop is only a safety net.)
-    let (drain_tx, mut drain_rx) = watch::channel(());
-    channel.on_buffered_amount_change(Some(Box::new(move |_sent_bytes: u64| {
-        let _ = drain_tx.send(());
-    })));
+    // Backpressure: poll buffered_amount() on a short sleep. (v0.6.6 tried
+    // event-driven via on_buffered_amount_change + watch channel, but it
+    // caused a silent sender stall after the first frame; reverted.)
     while seq < source.total_chunks {
         let acked = session
             .ack_next_seq
@@ -2087,20 +2081,17 @@ async fn run_sender(
             NATIVE_CHUNK_SIZE as u16,
             batch_chunks as u16,
         )?;
-        // Event-driven backpressure: wait until the DataChannel buffer drains below
-        // MAX_BUFFERED_BYTES instead of polling on a fixed 5 ms sleep.
+        // Backpressure: poll buffered_amount() (reverted from event-driven;
+        // see above).
         let drain_started = Instant::now();
-        loop {
-            if channel.buffered_amount() <= MAX_BUFFERED_BYTES {
-                break;
-            }
+        while channel.buffered_amount() > MAX_BUFFERED_BYTES {
             if channel.state() != DataChannelState::Open {
                 return Err("LAN DataChannel closed while applying backpressure".to_string());
             }
             if drain_started.elapsed() > Duration::from_secs(15) {
                 return Err("LAN DataChannel send buffer did not drain".to_string());
             }
-            let _ = timeout(Duration::from_millis(200), drain_rx.changed()).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
         if batch_seq == 0 {
             session

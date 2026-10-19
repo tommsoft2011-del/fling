@@ -149,16 +149,13 @@ impl OnlineSender {
         &self,
         send_frame: impl Fn(Vec<u8>) -> Result<(), String>,
         buffered_amount: impl Fn() -> u64,
-        on_drain: mpsc::UnboundedReceiver<()>,
         on_progress: impl Fn(u64, u64),
     ) -> Result<(), String> {
         let total_chunks = self.manifest.total_chunks;
         let size_bytes = self.manifest.size;
         let transfer_id = self.manifest.id.clone();
-        let mut on_drain = on_drain;
 
-        // Event-driven backpressure: wait on the drain signal instead of
-        // polling buffered_amount() on a fixed sleep.
+        // Backpressure is polling-based (see below).
         let mut seq_guard = self.seq.lock().await;
         let mut seq = *seq_guard;
         drop(seq_guard);
@@ -220,16 +217,13 @@ impl OnlineSender {
             )
             .map_err(|e| format!("encode FLNG frame: {e}"))?;
 
-            // Backpressure: wait until the DataChannel buffer drains.
+            // Backpressure: poll buffered_amount() on a short sleep.
             let drain_started = Instant::now();
-            loop {
-                if buffered_amount() <= MAX_BUFFERED_BYTES {
-                    break;
-                }
+            while buffered_amount() > MAX_BUFFERED_BYTES {
                 if drain_started.elapsed() > Duration::from_secs(15) {
                     return Err("P2P DataChannel send buffer did not drain".to_string());
                 }
-                let _ = tokio::time::timeout(Duration::from_millis(200), on_drain.recv()).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
 
             send_frame(frame)?;
