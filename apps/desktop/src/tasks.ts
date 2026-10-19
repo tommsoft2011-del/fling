@@ -2102,12 +2102,7 @@ class TransferManager {
     });
     await invoke('discovery_set_browsing', { on: true });
     await invoke('discovery_set_discoverable', { on: settings.discoverable });
-    // v0.6.9+: 启动 LAN 运行时（用于局域网直连信令优先）
-    try {
-      await invoke('native_lan_start_mode');
-    } catch {
-      // LAN 不可用时忽略，信令回退到 LiveKit
-    }
+    // v0.6.9 曾在此启动 LAN 运行时，但导致初始化失败；回退到按需启动
   }
 
   async setDiscoverable(on: boolean): Promise<void> {

@@ -173,7 +173,8 @@ async function startMain(): Promise<void> {
   try {
     await manager.init();
   } catch (e) {
-    toast('传输服务初始化失败：' + (e as Error).message + '（可先检查服务器配置）', true);
+    const msg = typeof e === 'string' ? e : (e as Error)?.message ?? String(e);
+    toast('传输服务初始化失败：' + msg + '（可先检查服务器配置）', true);
   }
   try {
     const ver = (await invoke('app_version')) as string;
