@@ -943,11 +943,13 @@ export class SendTask {
       await this.archive();
       this.closeRooms();
     } catch (e) {
+      const errMsg = typeof e === 'string' ? e : (e as Error)?.message || String(e);
+      log('task', 'send failed', { taskId: this.taskId, error: errMsg });
       if (this.cancelled) {
         this.phase = 'cancelled';
       } else {
         this.phase = 'error';
-        this.error = (e as Error).message || '发送失败';
+        this.error = errMsg || '发送失败';
         for (const it of this.items) {
           if (it.status !== 'done') {
             it.status = 'error';
@@ -1218,34 +1220,14 @@ export class SendTask {
       keyMaterial: 'inbox:' + peerDeviceId,
       keyContext: KEY_CTX.inbox,
     };
-    // v0.6.9+: 优先尝试局域网直连投递 offer（不经过 LiveKit），失败则回退
-    const sendViaLan = async (): Promise<boolean> => {
-      try {
-        const ok = await invoke<boolean>('native_lan_try_direct_offer', {
-          peerId: peerDeviceId,
-          offerJson: JSON.stringify(offer),
-        });
-        return ok;
-      } catch {
-        return false;
-      }
-    };
-    const sendViaLiveKit = async () => {
+    // v0.6.13: 暂时回退到纯 LiveKit（v0.6.9 的局域网直连可能有问题，先保证基本功能）
+    const sendOnce = async () => {
       const r = await connectFlingRoom(spec, {});
       try {
         await r.sendOffer(offer);
         await delay(1200);
       } finally {
         await r.close().catch(() => {});
-      }
-    };
-    const sendOnce = async () => {
-      // 先试局域网，2-3 秒无响应则用 LiveKit
-      const lanOk = await sendViaLan();
-      if (!lanOk) {
-        await sendViaLiveKit();
-      } else {
-        await delay(1200);
       }
     };
     await sendOnce();

@@ -117,6 +117,16 @@ fn default_config() -> FlingConfig {
 }
 
 fn config_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    // 便携版：exe 文件名含 "portable" 时，配置放 exe 旁边，跟着 U 盘走
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(name) = exe.file_name().and_then(|n| n.to_str()) {
+            if name.to_lowercase().contains("portable") {
+                if let Some(dir) = exe.parent() {
+                    return Ok(dir.join("config.json"));
+                }
+            }
+        }
+    }
     let dir = app
         .path()
         .app_config_dir()
