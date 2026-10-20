@@ -34,21 +34,31 @@ async function ensureFilePath(file: FileLike): Promise<string> {
   const diskPath = (file as unknown as { diskPath?: string }).diskPath;
   if (diskPath) return diskPath;
   // In-memory source (file picker, HTML drag-drop, paste): the blob has no
-  // disk path. Spill it to a temp file in 4 MiB chunks — the previous
-  // implementation did Array.from(wholeFile) + one JSON IPC payload, which
-  // explodes for large files (a 745 MB file dies ~3 s in, before the
-  // manifest is even sent). Chunked base64 keeps memory bounded.
+  // disk path. Spill it to a temp file in 4 MiB chunks over Tauri's native
+  // binary IPC (a bare Uint8Array invoke arg is sent as application/octet-stream,
+  // no JSON, no base64 on file content): frame = [u32 LE path_len][path UTF-8][chunk].
   const tmp = (await invoke('online_temp_begin', { name: file.name })) as string;
+  const pathBytes = new TextEncoder().encode(tmp);
+  const header = new Uint8Array(4 + pathBytes.length);
+  new DataView(header.buffer).setUint32(0, pathBytes.length, true);
+  header.set(pathBytes, 4);
   const CHUNK = 4 * 1024 * 1024;
   try {
+    let lastSpillLogFrac = 0;
     for (let off = 0; off < file.size; off += CHUNK) {
       const bytes = await file.slice(off, Math.min(off + CHUNK, file.size));
-      let bin = '';
-      const SUB = 0x8000;
-      for (let i = 0; i < bytes.length; i += SUB) {
-        bin += String.fromCharCode(...bytes.subarray(i, i + SUB));
+      const frame = new Uint8Array(header.length + bytes.length);
+      frame.set(header);
+      frame.set(bytes, header.length);
+      await invoke('online_temp_append', frame);
+      const frac = (off + bytes.length) / file.size;
+      if (frac - lastSpillLogFrac >= 0.25 || frac >= 1) {
+        lastSpillLogFrac = frac;
+        log('p2p', 'temp spill progress', {
+          spilledBytes: off + bytes.length,
+          fileSize: file.size,
+        });
       }
-      await invoke('online_temp_append', { path: tmp, dataB64: btoa(bin) });
     }
   } catch (e) {
     log('p2p', 'temp spill failed', { fileSize: file.size, errMsg: String(e) });
@@ -64,6 +74,9 @@ export class RustFlingRoom {
   private events: FlingRoomEvents;
   /** FlingRoom compat: whether a direct P2P path is active. */
   directActive = false;
+  /** Live progress callback of the currently sending file (set BEFORE
+   * the blocking invoke, since Rust emits progress DURING the transfer). */
+  private activeSendProgress: ((sent: number, total: number) => void) | null = null;
 
   constructor(events: FlingRoomEvents) {
     this.events = events;
@@ -104,6 +117,14 @@ export class RustFlingRoom {
             ev.sent_bytes as number,
             ev.total_bytes as number,
           );
+          // Sender-side live progress: route to the in-flight sendFile
+          // callback (installed BEFORE the blocking invoke starts).
+          if (ev.direction === 'sending') {
+            this.activeSendProgress?.(
+              ev.sent_bytes as number,
+              ev.total_bytes as number,
+            );
+          }
           break;
         case 'file-manifest':
           // Receiver-side: Rust got a manifest, frontend needs to create
@@ -225,15 +246,23 @@ export class RustFlingRoom {
     kind: FileKind = 'file',
   ): Promise<FileManifest> {
     const path = await ensureFilePath(file);
-    // Progress arrives via fling://online/event; also poll via the
-    // dispatch above. Wire the callback to progress events for this
-    // transfer by tracking the transfer id from the result.
-    const transferId = (await invoke('online_send_file', {
-      sessionId: this.requireSession(),
-      path,
-      name: file.name,
-      kind,
-    })) as string;
+    // Progress arrives via fling://online/event DURING the transfer, but
+    // `online_send_file` only returns after the receiver's complete ACK —
+    // so the callback MUST be installed before the invoke starts. (The old
+    // code bridged events.onFileProgress after the invoke resolved, which
+    // meant the sender UI showed 0 bytes for the whole transfer.)
+    this.activeSendProgress = onProgress ? (sent, total) => onProgress(sent, total) : null;
+    let transferId: string;
+    try {
+      transferId = (await invoke('online_send_file', {
+        sessionId: this.requireSession(),
+        path,
+        name: file.name,
+        kind,
+      })) as string;
+    } finally {
+      this.activeSendProgress = null;
+    }
     // The manifest is not returned by the command; synthesize a minimal
     // one for tasks.ts bookkeeping. Full manifest lives in Rust.
     const manifest: FileManifest = {
@@ -244,13 +273,6 @@ export class RustFlingRoom {
       chunkSize: 32 * 1024,
       totalChunks: Math.ceil(file.size / (32 * 1024)),
       kind,
-    };
-    // Hook progress: the dispatch() already calls onFileProgress; bridge
-    // it to the per-sendFile callback.
-    const origProgress = this.events.onFileProgress;
-    this.events.onFileProgress = (id, sent, total) => {
-      if (id === transferId) onProgress?.(sent, total);
-      origProgress?.(id, sent, total);
     };
     return manifest;
   }

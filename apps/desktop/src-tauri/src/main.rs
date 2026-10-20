@@ -544,12 +544,31 @@ fn online_temp_begin(name: String) -> Result<String, String> {
     Ok(path.to_string_lossy().to_string())
 }
 
-/// Append one base64-encoded chunk to a temp file created by
-/// `online_temp_begin`. Only paths inside the spill directory are allowed.
+/// Append one raw-bytes chunk to a temp file created by `online_temp_begin`.
+/// The invoke payload is a raw octet-stream frame (Tauri 2 ships a bare
+/// Uint8Array arg as application/octet-stream, no JSON/base64 in the path):
+/// `[u32 LE path_len][path UTF-8 bytes][chunk bytes]`.
+/// Only paths inside the spill directory are allowed.
 #[tauri::command]
-fn online_temp_append(path: String, data_b64: String) -> Result<(), String> {
+fn online_temp_append(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let body = match request.body() {
+        tauri::ipc::InvokeBody::Raw(b) => b,
+        tauri::ipc::InvokeBody::Json(_) => {
+            return Err("temp append expects a raw bytes payload".to_string())
+        }
+    };
+    if body.len() < 4 {
+        return Err("temp append frame too short".to_string());
+    }
+    let path_len =
+        u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    if path_len > 4096 || body.len() < 4 + path_len {
+        return Err("temp append frame malformed".to_string());
+    }
+    let path = std::str::from_utf8(&body[4..4 + path_len])
+        .map_err(|_| "temp append path not utf8".to_string())?;
     let dir = fling_temp_dir()?;
-    let target = std::path::PathBuf::from(&path);
+    let target = std::path::PathBuf::from(path);
     let canonical_dir = dir.canonicalize().map_err(|e| format!("temp dir: {e}"))?;
     let parent = target
         .parent()
@@ -560,16 +579,13 @@ fn online_temp_append(path: String, data_b64: String) -> Result<(), String> {
     if canonical_parent != canonical_dir {
         return Err("temp append path outside spill dir".to_string());
     }
-    use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data_b64.as_bytes())
-        .map_err(|e| format!("temp chunk base64: {e}"))?;
     use std::io::Write as _;
     let mut f = std::fs::OpenOptions::new()
         .append(true)
         .open(&target)
         .map_err(|e| format!("open temp for append: {e}"))?;
-    f.write_all(&bytes).map_err(|e| format!("append temp: {e}"))?;
+    f.write_all(&body[4 + path_len..])
+        .map_err(|e| format!("append temp: {e}"))?;
     Ok(())
 }
 
