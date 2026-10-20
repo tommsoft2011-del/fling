@@ -140,6 +140,9 @@ export class RustFlingRoom {
           this.directActive = ev.state === 'open';
           if (ev.state === 'open') {
             events.onFileRoute?.('p2p', '');
+          } else if (ev.state === 'failed') {
+            // So tasks can mark their P2P state as failed (card shows 中转).
+            events.onFileRoute?.('relay', '');
           }
           break;
         case 'p2p-log':

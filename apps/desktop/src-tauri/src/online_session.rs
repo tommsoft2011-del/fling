@@ -398,6 +398,9 @@ impl OnlineSession {
                     emit(&app, &session_id, OnlineUiEvent::P2pLog {
                         message: format!("responder: wait_open OK, elapsed_ms={}", wait_t0.elapsed().as_millis()),
                     });
+                    // Surface the P2P state to the UI (⚡ label): the sender
+                    // emits this from send_file, the responder must too.
+                    emit(&app, &session_id, OnlineUiEvent::P2p { state: "open".to_string() });
                     let _ = app.emit(
                         "fling://online/event",
                         serde_json::json!({
@@ -503,6 +506,7 @@ impl OnlineSession {
                     emit(&app, &session_id, OnlineUiEvent::P2pLog {
                         message: format!("responder: wait_open FAILED after {}ms: {}", wait_t0.elapsed().as_millis(), e),
                     });
+                    emit(&app, &session_id, OnlineUiEvent::P2p { state: "failed".to_string() });
                     eprintln!("fling online P2P responder failed: {e}");
                 }
             }

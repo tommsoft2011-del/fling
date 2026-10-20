@@ -651,6 +651,13 @@ export class SendTask {
           }
         },
         onFileRoute: (route, id) => {
+          // Task-level P2P state (drives the ⚡ card label and the direct
+          // stall watchdog): route 'p2p' means the direct channel is open.
+          const nextP2p = route === 'p2p' ? 'open' : 'failed';
+          if (this.p2p !== nextP2p) {
+            this.p2p = nextP2p as typeof this.p2p;
+            this.notify();
+          }
           if (this.currentSendingItem) {
             this.currentSendingItem.transport = mergeTransport(this.currentSendingItem.transport, route);
             if (route === 'p2p' && !this.currentFileFirstFrameAccepted) {
@@ -1507,6 +1514,13 @@ export class RecvTask {
         onFileManifest: (m) => this.onManifest(m),
         onFileProgress: (id, r, t) => this.onProgress(id, r, t),
         onFileRoute: (route, id) => {
+          // Task-level P2P state (drives the ⚡ card label): route 'p2p'
+          // means the direct channel is open.
+          const nextP2p = route === 'p2p' ? 'open' : 'failed';
+          if (this.p2p !== nextP2p) {
+            this.p2p = nextP2p as typeof this.p2p;
+            this.notify();
+          }
           // Rust reports p2p-open as a session-level event (empty id);
           // attribute the route to all items so the UI shows the ⚡ label.
           if (id) {

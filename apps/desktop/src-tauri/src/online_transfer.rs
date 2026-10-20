@@ -39,8 +39,9 @@ const SENDER_WINDOW_CHUNKS: u32 = 256;
 const BATCH_CHUNKS_PER_FRAME: u32 = 4;
 /// Receiver sends a cumulative ACK every N chunks.
 const ACK_INTERVAL_CHUNKS: u32 = 8;
-/// DataChannel backpressure threshold.
-const MAX_BUFFERED_BYTES: u64 = 256 * 1024;
+/// DataChannel backpressure threshold (2 MiB; frames are 128 KiB, so the
+/// old 256 KiB limit held barely 2 frames before stalling the pump).
+const MAX_BUFFERED_BYTES: u64 = 2 * 1024 * 1024;
 /// How long to wait for a manifest ACK / file-complete ACK.
 const MANIFEST_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_COMPLETE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -331,6 +332,11 @@ pub struct OnlineReceiver {
     /// Where the completed file goes.
     target_path: PathBuf,
     temp_path: PathBuf,
+    /// Lazily opened append handle for the temp file. Opening the file
+    /// per frame cost tens of ms per 128 KiB frame on Windows (file open
+    /// + AV scan) and capped P2P receive at ~2 MB/s; the handle is now
+    /// opened once and dropped before the final rename.
+    file: Mutex<Option<std::fs::File>>,
     complete_notify: Arc<Notify>,
 }
 
@@ -349,12 +355,33 @@ impl OnlineReceiver {
             hasher: Mutex::new(Sha256::new()),
             target_path,
             temp_path,
+            file: Mutex::new(None),
             complete_notify: Arc::new(Notify::new()),
         })
     }
 
     pub fn manifest(&self) -> &FileManifest {
         &self.manifest
+    }
+
+    /// Append bytes to the temp file through the persistent handle.
+    async fn append_bytes(&self, bytes: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        let mut guard = self.file.lock().await;
+        if guard.is_none() {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.temp_path)
+                .map_err(|e| format!("open temp file: {e}"))?;
+            *guard = Some(f);
+        }
+        guard
+            .as_mut()
+            .expect("temp file handle just opened")
+            .write_all(bytes)
+            .map_err(|e| format!("write temp file: {e}"))?;
+        Ok(())
     }
 
     /// Handle one decoded FLNG batch frame from the P2P DataChannel.
@@ -396,18 +423,9 @@ impl OnlineReceiver {
             return Err("FLNG frame contains trailing payload bytes".to_string());
         }
 
-        // Append to the temp file.
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.temp_path)
-                .map_err(|e| format!("open temp file: {e}"))?;
-            f.write_all(&frame.payload[..offset])
-                .map_err(|e| format!("write temp file: {e}"))?;
-            self.hasher.lock().await.update(&frame.payload[..offset]);
-        }
+        // Append to the temp file (persistent handle, opened once).
+        self.append_bytes(&frame.payload[..offset]).await?;
+        self.hasher.lock().await.update(&frame.payload[..offset]);
         *self.received_bytes.lock().await += offset as u64;
         next += count as u32;
         *self.next_seq.lock().await = next;
@@ -425,18 +443,17 @@ impl OnlineReceiver {
         let mut hasher = self.hasher.lock().await;
 
         chunks.insert(seq, data);
-        // Drain contiguous chunks in order.
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.temp_path)
-            .map_err(|e| format!("open temp file: {e}"))?;
+        // Drain contiguous chunks in order, then append once.
+        let mut pending: Vec<u8> = Vec::new();
         while let Some(data) = chunks.remove(&next) {
-            f.write_all(&data).map_err(|e| format!("write temp file: {e}"))?;
             hasher.update(&data);
             received += data.len() as u64;
             next += 1;
+            pending.extend_from_slice(&data);
+        }
+        if !pending.is_empty() {
+            drop(hasher);
+            self.append_bytes(&pending).await?;
         }
         *self.next_seq.lock().await = next;
         *self.received_bytes.lock().await = received;
@@ -461,6 +478,9 @@ impl OnlineReceiver {
                 self.manifest.sha256
             ));
         }
+        // Close the persistent temp handle first: Windows refuses to
+        // rename a file that is still open.
+        *self.file.lock().await = None;
         std::fs::rename(&self.temp_path, &self.target_path)
             .map_err(|e| format!("move received file into place: {e}"))?;
         self.complete_notify.notify_waiters();
