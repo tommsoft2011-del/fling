@@ -29,6 +29,15 @@ enum OnlineUiEvent {
     /// A text message arrived.
     #[serde(rename = "text")]
     Text { from: String, id: String, text: String },
+    /// A file manifest arrived (receiver side). Frontend uses this to
+    /// create the transferId -> item mapping for progress display.
+    #[serde(rename = "file-manifest")]
+    FileManifest {
+        transfer_id: String,
+        name: String,
+        size: u64,
+        file_kind: String,
+    },
     /// Peer presence changed.
     #[serde(rename = "peer")]
     Peer { identity: String, joined: bool },
@@ -43,6 +52,9 @@ enum OnlineUiEvent {
     /// P2P link state changed.
     #[serde(rename = "p2p")]
     P2p { state: String },
+    /// P2P diagnostic log (goes to the frontend log file via log('p2p', ...)).
+    #[serde(rename = "p2p-log")]
+    P2pLog { message: String },
     /// A transfer finished (or failed).
     #[serde(rename = "transfer-done")]
     TransferDone {
@@ -243,6 +255,22 @@ impl OnlineSession {
         manifest: crate::online_proto::FileManifest,
     ) -> Result<(), String> {
         let id = manifest.id.clone();
+        // Notify the frontend so it can create the transferId -> item mapping
+        // for progress display. The manifest kind is an enum; convert to string.
+        let kind_str = match &manifest.kind {
+            crate::online_proto::FileKind::File => "file",
+            crate::online_proto::FileKind::ClipboardImage => "clipboard-image",
+        };
+        emit(
+            &self.app,
+            &self.id,
+            OnlineUiEvent::FileManifest {
+                transfer_id: id.clone(),
+                name: manifest.name.clone(),
+                size: manifest.size,
+                file_kind: kind_str.to_string(),
+            },
+        );
         let receiver = Arc::new(OnlineReceiver::new(manifest, &self.download_dir)?);
         self.receivers.lock().await.insert(id.clone(), receiver);
         self.receiver_last_ack.lock().await.insert(id.clone(), 0);
@@ -315,9 +343,21 @@ impl OnlineSession {
 
     /// Receiver: a P2P offer arrived. Become the responder.
     async fn on_p2p_offer(&self, sdp: String) -> Result<(), String> {
+        let t0 = std::time::Instant::now();
+        emit(&self.app, &self.id, OnlineUiEvent::P2pLog {
+            message: format!("on_p2p_offer: received offer sdp_len={}", sdp.len()),
+        });
         // TODO: read TURN config; for now use STUN defaults.
         let ice_servers = default_ice_servers(None, None, None);
-        let (p2p, ice_rx, answer_sdp) = OnlineP2p::accept_offer(ice_servers, &sdp).await?;
+        let (p2p, ice_rx, answer_sdp) = OnlineP2p::accept_offer(ice_servers, &sdp).await.map_err(|e| {
+            emit(&self.app, &self.id, OnlineUiEvent::P2pLog {
+                message: format!("on_p2p_offer: accept_offer FAILED: {}", e),
+            });
+            e
+        })?;
+        emit(&self.app, &self.id, OnlineUiEvent::P2pLog {
+            message: format!("on_p2p_offer: accept_offer ok, answer_sdp_len={}, elapsed_ms={}", answer_sdp.len(), t0.elapsed().as_millis()),
+        });
         let p2p = Arc::new(p2p);
         *self.p2p.lock().await = Some(p2p.clone());
 
@@ -346,8 +386,18 @@ impl OnlineSession {
         let receivers = self.receivers.clone();
         let receiver_last_ack = self.receiver_last_ack.clone();
         tokio::spawn(async move {
+            // Register the message handler BEFORE wait_open(): libwebrtc drops
+            // messages received before on_message is set, so the handler must
+            // be attached as soon as the DataChannel is created (via
+            // on_data_channel), not after it opens.
+            let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            p2p.set_message_handler(frame_tx);
+            let wait_t0 = std::time::Instant::now();
             match p2p.wait_open().await {
-                Ok(dc) => {
+                Ok(_dc) => {
+                    emit(&app, &session_id, OnlineUiEvent::P2pLog {
+                        message: format!("responder: wait_open OK, elapsed_ms={}", wait_t0.elapsed().as_millis()),
+                    });
                     let _ = app.emit(
                         "fling://online/event",
                         serde_json::json!({
@@ -355,16 +405,25 @@ impl OnlineSession {
                             "event": { "kind": "p2p", "state": "open" },
                         }),
                     );
-                    // Pump: on_message (native thread) -> channel -> async
-                    // task that routes frames to receivers and ACKs.
-                    let (frame_tx, mut frame_rx) =
-                        mpsc::unbounded_channel::<Vec<u8>>();
-                    dc.on_message(Some(Box::new(move |msg| {
-                        if msg.binary {
-                            let _ = frame_tx.send(msg.data.to_vec());
-                        }
-                    })));
+                    // Pump: on_message (native thread, attached early by
+                    // OnlineP2p) -> channel -> async task that routes frames
+                    // to receivers and ACKs.
+                    let mut frame_count: u64 = 0;
+                    let mut frame_bytes_total: u64 = 0;
+                    let first_frame_at = std::time::Instant::now();
                     while let Some(frame_bytes) = frame_rx.recv().await {
+                        frame_count += 1;
+                        frame_bytes_total += frame_bytes.len() as u64;
+                        if frame_count == 1 {
+                            emit(&app, &session_id, OnlineUiEvent::P2pLog {
+                                message: format!("responder: FIRST frame received, len={}, after_open_ms={}", frame_bytes.len(), first_frame_at.elapsed().as_millis()),
+                            });
+                        }
+                        if frame_count % 100 == 0 {
+                            emit(&app, &session_id, OnlineUiEvent::P2pLog {
+                                message: format!("responder: frames={}, bytes={}", frame_count, frame_bytes_total),
+                            });
+                        }
                         // Decode just the transfer id synchronously.
                         let id = match crate::native_lan::decode_direct_file_frame(&frame_bytes) {
                             Ok(Some(f)) => f.id,
@@ -420,6 +479,9 @@ impl OnlineSession {
                     let _ = room;
                 }
                 Err(e) => {
+                    emit(&app, &session_id, OnlineUiEvent::P2pLog {
+                        message: format!("responder: wait_open FAILED after {}ms: {}", wait_t0.elapsed().as_millis(), e),
+                    });
                     eprintln!("fling online P2P responder failed: {e}");
                 }
             }
@@ -476,9 +538,13 @@ impl OnlineSession {
 
         // 2. P2P attempt (initiator).
         let ice_servers = default_ice_servers(None, None, None);
+        let p2p_t0 = std::time::Instant::now();
         let p2p_result = OnlineP2p::start_initiator(ice_servers).await;
         let use_p2p = match p2p_result {
             Ok((p2p, ice_rx, offer_sdp)) => {
+                emit(&self.app, &self.id, OnlineUiEvent::P2pLog {
+                    message: format!("initiator: start_initiator ok, offer_sdp_len={}, elapsed_ms={}", offer_sdp.len(), p2p_t0.elapsed().as_millis()),
+                });
                 let p2p = Arc::new(p2p);
                 *self.p2p.lock().await = Some(p2p.clone());
                 let room = self.room.clone();
@@ -489,17 +555,30 @@ impl OnlineSession {
                     }
                 });
                 self.room.send(&FlingMessage::P2pOffer { sdp: offer_sdp }).await?;
+                emit(&self.app, &self.id, OnlineUiEvent::P2pLog {
+                    message: "initiator: P2pOffer sent via room".to_string(),
+                });
                 // Flush pending ICE.
                 let pending: Vec<String> = std::mem::take(&mut *self.pending_ice.lock().await);
+                emit(&self.app, &self.id, OnlineUiEvent::P2pLog {
+                    message: format!("initiator: flushing {} pending ICE", pending.len()),
+                });
                 for candidate in pending {
                     p2p.add_remote_ice(Some(candidate)).await?;
                 }
+                let wait_t0 = std::time::Instant::now();
                 match p2p.wait_open().await {
                     Ok(dc) => {
+                        emit(&self.app, &self.id, OnlineUiEvent::P2pLog {
+                            message: format!("initiator: wait_open OK, elapsed_ms={}", wait_t0.elapsed().as_millis()),
+                        });
                         emit(&self.app, &self.id, OnlineUiEvent::P2p { state: "open".to_string() });
                         Some((p2p, dc))
                     }
                     Err(e) => {
+                        emit(&self.app, &self.id, OnlineUiEvent::P2pLog {
+                            message: format!("initiator: wait_open FAILED after {}ms, falling back to relay: {}", wait_t0.elapsed().as_millis(), e),
+                        });
                         eprintln!("fling online P2P initiator failed, falling back to relay: {e}");
                         emit(&self.app, &self.id, OnlineUiEvent::P2p { state: "failed".to_string() });
                         None
@@ -576,12 +655,11 @@ impl OnlineSession {
         };
 
         // 4. Report.
+        // NOTE: Do NOT send FlingMessage::TaskDone here — that's a task-level
+        // message for the whole task (all files), sent by the frontend.
+        // We only emit the per-file TransferDone UI event.
         match &result {
             Ok(()) => {
-                let _ = self
-                    .room
-                    .send(&FlingMessage::TaskDone { task_id: transfer_id.clone() })
-                    .await;
                 emit(
                     &self.app,
                     &self.id,

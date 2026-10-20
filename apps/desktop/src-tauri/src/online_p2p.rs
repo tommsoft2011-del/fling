@@ -9,7 +9,7 @@
 //! If the handshake fails or the channel drops, the caller falls back to
 //! the LiveKit relay path (per-chunk routing), mirroring the TypeScript.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use livekit::webrtc::{
@@ -92,6 +92,10 @@ pub struct OnlineP2p {
     /// responder: the remote channel).
     open_tx: mpsc::UnboundedSender<DataChannel>,
     open_rx: Mutex<mpsc::UnboundedReceiver<DataChannel>>,
+    /// Early message handler: attached to the DataChannel as soon as it is
+    /// created (before Open), so no frames are dropped by libwebrtc.
+    /// If not set before the channel is created, messages may be lost.
+    msg_handler: Arc<StdMutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
 }
 
 impl OnlineP2p {
@@ -133,7 +137,28 @@ impl OnlineP2p {
             ice_tx,
             open_tx,
             open_rx: Mutex::new(open_rx),
+            msg_handler: Arc::new(StdMutex::new(None)),
         })
+    }
+
+    /// Set the message handler BEFORE the DataChannel is created/opened.
+    /// The handler will be attached as soon as the channel exists, preventing
+    /// libwebrtc from dropping early frames (it does not queue messages
+    /// received before on_message is registered).
+    pub fn set_message_handler(&self, tx: mpsc::UnboundedSender<Vec<u8>>) {
+        *self.msg_handler.lock().unwrap() = Some(tx);
+    }
+
+    /// Attach the early message handler to a DataChannel, if one was set.
+    /// Called as soon as the channel is created (before Open).
+    fn attach_early_handler(&self, dc: &DataChannel) {
+        if let Some(tx) = self.msg_handler.lock().unwrap().clone() {
+            dc.on_message(Some(Box::new(move |msg| {
+                if msg.binary {
+                    let _ = tx.send(msg.data.to_vec());
+                }
+            })));
+        }
     }
 
     /// Initiator: create the PeerConnection + DataChannel and return the
@@ -179,7 +204,18 @@ impl OnlineP2p {
 
         // The responder's DataChannel arrives via on_data_channel.
         let link_open_tx = link.open_tx.clone();
+        let link_msg_handler = link.msg_handler.clone();
         link.peer.on_data_channel(Some(Box::new(move |dc: DataChannel| {
+            // Attach early message handler BEFORE Open, so libwebrtc doesn't
+            // drop frames that arrive before the handler is registered.
+            if let Some(tx) = link_msg_handler.lock().unwrap().clone() {
+                let tx_clone = tx.clone();
+                dc.on_message(Some(Box::new(move |msg| {
+                    if msg.binary {
+                        let _ = tx_clone.send(msg.data.to_vec());
+                    }
+                })));
+            }
             // Wire open-state delivery like the initiator path.
             let open_tx = link_open_tx.clone();
             let dc_for_open = dc.clone();
@@ -273,6 +309,9 @@ impl OnlineP2p {
     }
 
     fn wire_data_channel(&self, dc: DataChannel) {
+        // Attach early message handler BEFORE the channel opens, so no
+        // frames are dropped by libwebrtc (it doesn't queue pre-handler msgs).
+        self.attach_early_handler(&dc);
         // Deliver the channel via open_tx only once it reaches Open state.
         let open_tx = self.open_tx.clone();
         let dc_for_open = dc.clone();
