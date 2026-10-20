@@ -166,3 +166,110 @@ async fn sync_failure_cannot_publish_or_produce_success() {
     receiver.abort().await;
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn consecutive_four_chunk_frames_ack_every_eight_chunks() {
+    use crate::online_session::publish_progress_ack;
+    let dir = directory();
+    let data = vec![11; NATIVE_CHUNK_SIZE as usize * 20];
+    let meta = manifest(&data);
+    let receiver = OnlineReceiver::new(meta.clone(), &dir).unwrap();
+    let cursors = Mutex::new(HashMap::from([(meta.id.clone(), 0)]));
+    let published = std::sync::Mutex::new(Vec::new());
+    for seq in (0..16).step_by(4) {
+        let start = seq as usize * NATIVE_CHUNK_SIZE as usize;
+        let end = start + 4 * NATIVE_CHUNK_SIZE as usize;
+        let frame = encode_direct_file_frame(&meta.id, seq, &data[start..end], NATIVE_CHUNK_SIZE as u16, 4).unwrap();
+        let next = receiver.on_p2p_frame(&frame).await.unwrap();
+        let sent = publish_progress_ack(&receiver, &cursors, next, async {
+            published.lock().unwrap().push(next);
+            Ok(())
+        }).await.unwrap();
+        assert_eq!(sent, next % 8 == 0);
+        assert_eq!(cursors.lock().await[&meta.id], (next / 8) * 8);
+    }
+    assert_eq!(*published.lock().unwrap(), vec![8, 16]);
+    receiver.abort().await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn ack_cursor_does_not_advance_on_skip_or_failed_publish() {
+    use crate::online_session::publish_progress_ack;
+    let dir = directory();
+    let receiver = OnlineReceiver::new(manifest(&vec![3; NATIVE_CHUNK_SIZE as usize * 24]), &dir).unwrap();
+    let id = receiver.manifest().id.clone();
+    let cursors = Mutex::new(HashMap::from([(id.clone(), 0)]));
+    assert!(!publish_progress_ack(&receiver, &cursors, 4, async {
+        panic!("no ACK is due: publisher must not be polled");
+        #[allow(unreachable_code)] Ok(())
+    }).await.unwrap());
+    assert_eq!(cursors.lock().await[&id], 0);
+    assert_eq!(publish_progress_ack(&receiver, &cursors, 8, async {
+        Err("injected publish failure".into())
+    }).await.unwrap_err(), "injected publish failure");
+    assert_eq!(cursors.lock().await[&id], 0);
+    assert!(publish_progress_ack(&receiver, &cursors, 8, async { Ok(()) }).await.unwrap());
+    assert_eq!(cursors.lock().await[&id], 8);
+    assert!(!publish_progress_ack(&receiver, &cursors, 12, async { panic!("below threshold") }).await.unwrap());
+    assert_eq!(cursors.lock().await[&id], 8);
+    assert!(publish_progress_ack(&receiver, &cursors, 16, async { Err("offline".into()) }).await.is_err());
+    assert_eq!(cursors.lock().await[&id], 8);
+    // A later frame still counts from the last successfully sent ACK.
+    assert!(publish_progress_ack(&receiver, &cursors, 20, async { Ok(()) }).await.unwrap());
+    assert_eq!(cursors.lock().await[&id], 20);
+    receiver.abort().await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn p2p_cumulative_acks_allow_sending_beyond_eight_mib_window() {
+    use crate::online_session::publish_progress_ack;
+    let dir = directory();
+    // More than two windows, with a short final chunk as well.
+    let data = vec![19; NATIVE_CHUNK_SIZE as usize * (SENDER_WINDOW_CHUNKS as usize * 2 + 3) + 17];
+    let source = dir.join("source.bin");
+    std::fs::write(&source, &data).unwrap();
+    let meta = manifest(&data);
+    let sender = OnlineSender::new(meta.clone(), &source).unwrap();
+    let receiver = OnlineReceiver::new(meta.clone(), &dir).unwrap();
+    let cursors = Mutex::new(HashMap::from([(meta.id.clone(), 0)]));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let progress = std::sync::atomic::AtomicU64::new(0);
+    let pump = sender.send_via_p2p(
+        |frame| tx.send(frame).map_err(|_| "frame channel closed".to_string()),
+        || 0,
+        |sent, _| { progress.store(sent, Ordering::Release); },
+    );
+    let receive = async {
+        let mut ack_count = 0;
+        loop {
+            let frame = rx.recv().await.ok_or("sender stopped")?;
+            let next = receiver.on_p2p_frame(&frame).await?;
+            if receiver.check_complete().await? {
+                // Completion can only be delivered after the real disk commit.
+                assert!(receiver.is_committed());
+                assert_eq!(std::fs::read(receiver.target_path()).unwrap(), data);
+                sender.on_chunk_ack(next);
+                sender.on_complete();
+                break;
+            }
+            if publish_progress_ack(&receiver, &cursors, next, async {
+                sender.on_chunk_ack(next);
+                Ok(())
+            }).await? { ack_count += 1; }
+        }
+        assert!(ack_count > SENDER_WINDOW_CHUNKS / ACK_INTERVAL_CHUNKS);
+        Ok::<(), String>(())
+    };
+    let (sent, received) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(pump, receive)
+    }).await.expect("ACKs must unblock the real sender beyond its 8 MiB window");
+    sent.unwrap();
+    received.unwrap();
+    assert_eq!(progress.load(Ordering::Acquire), meta.size);
+    assert!(meta.size > u64::from(SENDER_WINDOW_CHUNKS) * NATIVE_CHUNK_SIZE);
+    drop(sender);
+    drop(receiver);
+    std::fs::remove_dir_all(dir).unwrap();
+}

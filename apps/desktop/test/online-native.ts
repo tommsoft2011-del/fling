@@ -43,7 +43,16 @@ assert.ok(commit.indexOf('digest != self.manifest.sha256') < commit.indexOf('std
 const ack = /async fn maybe_ack[\s\S]*?\/\/\/ Receiver: a P2P offer/.exec(session)?.[0] ?? '';
 assert.ok(ack.indexOf('receiver.check_complete()') < ack.indexOf('chunk_ack_message'));
 assert.match(ack, /for attempt in 0\.\.3/);
+assert.match(ack, /publish_progress_ack\(receiver, &self\.receiver_last_ack, next_seq, self\.room\.send\(&ack\)\)/);
+assert.doesNotMatch(ack, /insert\(id, next_seq\)/, 'no unconditional per-frame ACK cursor update');
+const cursorWrite = ack.indexOf('self.receiver_last_ack.lock().await.insert');
+assert.ok(cursorWrite > ack.indexOf('if !published'), 'final cursor follows successful ACK publication');
+assert.ok(cursorWrite < ack.indexOf('status.stage = "done"'), 'completion follows successful final ACK');
+const progressAck = /async fn publish_progress_ack[\s\S]*?\/\/\/ Events emitted/.exec(session)?.[0] ?? '';
+assert.ok(progressAck.indexOf('return Ok(false)') < progressAck.indexOf('publish.await?'));
+assert.ok(progressAck.indexOf('publish.await?') < progressAck.indexOf('last_acks.lock().await.insert'));
 assert.match(session, /native_single_file != Some\(true\)/);
 assert.match(read('../src/taskcard.ts'), /activityBytes > 0 && idleMs > 15000/);
 console.log('ok - sourceId-only high-level UI boundary, legacy isolation, durable commit/ACK order and pre-progress UI guards (static)');
+console.log('ok - production ACK cursor advances only after publish; skipped frames accumulate toward threshold (static)');
 console.log('These mocks/contracts are not native picker GUI or two-machine Windows validation.');

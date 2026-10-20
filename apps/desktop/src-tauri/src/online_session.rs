@@ -26,6 +26,22 @@ const MANIFEST_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_PROGRESS_UI_INTERVAL: Duration = Duration::from_millis(500);
 const PEER_PROGRESS_UI_BYTES: u64 = 4 * 1024 * 1024;
 
+/// The cursor tracks successfully published ACKs, not received frames. In
+/// particular, two 4-chunk frames must accumulate to the 8-chunk ACK threshold.
+pub(crate) async fn publish_progress_ack(
+    receiver: &OnlineReceiver,
+    last_acks: &Mutex<HashMap<String, u32>>,
+    next_seq: u32,
+    publish: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<bool, String> {
+    let id = &receiver.manifest().id;
+    let last_ack = *last_acks.lock().await.get(id).unwrap_or(&0);
+    if !receiver.should_ack(last_ack, next_seq) { return Ok(false); }
+    publish.await?;
+    last_acks.lock().await.insert(id.clone(), next_seq);
+    Ok(true)
+}
+
 /// Events emitted to the WebView. The frontend only renders these.
 #[derive(Clone, serde::Serialize)]
 #[serde(tag = "kind")]
@@ -472,7 +488,6 @@ impl OnlineSession {
                 }
             }
         }
-        let last_ack = *self.receiver_last_ack.lock().await.get(&id).unwrap_or(&0);
         if complete {
             let mut published = false;
             let mut publish_error = String::new();
@@ -499,6 +514,7 @@ impl OnlineSession {
                 }
                 return Err(publish_error);
             }
+            self.receiver_last_ack.lock().await.insert(id.clone(), next_seq);
             if let Some(native) = &self.native {
                 let mut status = native.status.lock().await;
                 if !status.terminal() {
@@ -512,11 +528,12 @@ impl OnlineSession {
                 // It is released on peer departure/disconnect, not by the UI.
             } else { self.receivers.lock().await.remove(&id); }
             emit(&self.app, &self.id, OnlineUiEvent::TransferDone { transfer_id: id.clone(), ok: true, error: None });
-        } else if receiver.should_ack(last_ack, next_seq) {
-            self.room.send(&chunk_ack_message(receiver, next_seq, received_bytes, false)).await?;
-            if due { emit(&self.app, &self.id, OnlineUiEvent::Progress { transfer_id: id.clone(), sent_bytes: received_bytes, total_bytes: receiver.manifest().size, direction: "receiving".into() }); }
+        } else {
+            let ack = chunk_ack_message(receiver, next_seq, received_bytes, false);
+            if publish_progress_ack(receiver, &self.receiver_last_ack, next_seq, self.room.send(&ack)).await? {
+                if due { emit(&self.app, &self.id, OnlineUiEvent::Progress { transfer_id: id.clone(), sent_bytes: received_bytes, total_bytes: receiver.manifest().size, direction: "receiving".into() }); }
+            }
         }
-        self.receiver_last_ack.lock().await.insert(id, next_seq);
         Ok(())
     }
 
