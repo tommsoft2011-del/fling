@@ -1668,7 +1668,12 @@ export class RecvTask {
       return;
     }
     item.doneBytes = item.totalBytes;
+    item.saveBytes = item.totalBytes;
     item.status = 'done';
+    // Rust path persists the file itself, so the legacy onFileComplete
+    // finally-block that settles the pending counter never runs. Settle
+    // here, or finish() stalls 30s in waitForPendingFiles.
+    this.settlePendingFile(transferId);
     log('xfer', 'transfer-done marked', { taskId: this.taskId, name: item.name, size: item.totalBytes });
     this.notify();
     this.reportProgress(true);
@@ -1830,6 +1835,21 @@ export class RecvTask {
       });
     }
     return ok;
+  }
+
+  /** Mirrors SendTask.closeP2P: in the Rust architecture the P2P link is
+   * owned by the Rust session, so there is nothing to close here. This
+   * method was missing on RecvTask while finish()/run() call it — the
+   * resulting TypeError aborted finish() before task-ack was sent. */
+  private closeP2P(): void {
+    this.p2pLink = null;
+  }
+
+  /** Registered in the room events but never defined on RecvTask (only
+   * SendTask had it). The Rust room never emits it today; keep a log-only
+   * handler so a future emit can't throw. */
+  private onDirectFallback(reason: string): void {
+    log('p2p', 'receiver observed relay fallback', { taskId: this.taskId, reason });
   }
 
   private onPeerLeft(): void {
