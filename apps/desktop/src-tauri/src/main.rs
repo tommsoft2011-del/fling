@@ -38,6 +38,7 @@ mod online_room;
 mod online_session;
 mod online_transfer;
 mod online_source;
+mod ice_syntax;
 mod online_native;
 // ================================================================ config ==
 

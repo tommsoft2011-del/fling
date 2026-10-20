@@ -271,6 +271,7 @@ impl OnlineP2p {
         }
         let sig: SignalingIceCandidate =
             serde_json::from_str(&json).map_err(|e| format!("parse ICE candidate: {e}"))?;
+        crate::ice_syntax::validate(&sig.candidate)?;
         let candidate = IceCandidate::parse(
             sig.sdp_mid.as_deref().unwrap_or(""),
             sig.sdp_mline_index.unwrap_or(0),

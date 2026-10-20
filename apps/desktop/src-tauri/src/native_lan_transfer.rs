@@ -972,6 +972,9 @@ fn parse_remote_ice(
             "ICE candidate missing sdpMLineIndex".into(),
         );
     };
+    if let Err(error) = crate::ice_syntax::validate(&init.candidate) {
+        return rejected_classified(session, Tr::CandidateParse, error);
+    }
     match IceCandidate::parse(mid, mline, &init.candidate) {
         Ok(candidate) => Ok(candidate),
         Err(error) => rejected_classified(
