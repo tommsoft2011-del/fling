@@ -126,6 +126,17 @@ export class RustFlingRoom {
             );
           }
           break;
+        case 'peer-progress':
+          events.onPeerProgress?.(
+            ev.transfer_id as string,
+            ev.received_bytes as number,
+            ev.total_bytes as number,
+            ev.complete === true,
+          );
+          break;
+        case 'file-send-started':
+          events.onFileSendStarted?.(ev.transfer_id as string, ev.total_bytes as number);
+          break;
         case 'file-manifest':
           // Receiver-side: Rust got a manifest, frontend needs to create
           // the transferId -> item mapping for progress display.
@@ -134,7 +145,7 @@ export class RustFlingRoom {
             name: ev.name as string,
             size: ev.size as number,
             kind: ev.file_kind as string,
-          } as never);
+          } as never, String(ev.from ?? ''));
           break;
         case 'p2p':
           this.directActive = ev.state === 'open';
@@ -168,7 +179,7 @@ export class RustFlingRoom {
           }
           break;
         case 'disconnected':
-          log('online-rust', 'room disconnected', { reason: ev.reason });
+          log('net', 'room disconnected', { reason: ev.reason });
           break;
         case 'protocol': {
           // Task-level signaling for the frontend orchestrator.
@@ -223,7 +234,7 @@ export class RustFlingRoom {
           break;
       }
     } catch (e) {
-      log('online-rust', 'event dispatch failed', { error: String(e) });
+      log('net', 'event dispatch failed', { error: String(e) });
     }
   }
 
@@ -305,6 +316,13 @@ export class RustFlingRoom {
     await invoke('online_send_message', {
       sessionId: this.requireSession(),
       message: { kind: 'task-ack', taskId },
+    });
+  }
+
+  async sendTaskCancel(taskId: string): Promise<void> {
+    await invoke('online_send_message', {
+      sessionId: this.requireSession(),
+      message: { kind: 'task-cancel', taskId },
     });
   }
 

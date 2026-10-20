@@ -38,6 +38,7 @@ import {
 import { saveHistoryEntry, HIST_IMAGE_LIMIT, settings, type HistoryEntry } from './store.js';
 import { b64encode, toast, uid, utf8bytes } from './ui.js';
 import { P2PLink, type P2PState } from './p2p.js';
+import { mergePeerProgress } from './peer-progress.js';
 import { log, flushLogs, type LogTag } from './log.js';
 import { notifyTaskDone } from './notify.js';
 import type { RustFlingRoom } from './online-rust.js';
@@ -251,10 +252,6 @@ const WAIT_PEER_TIMEOUT_MS = 5 * 60 * 1000;
  * masking a genuinely silent direct path. */
 const DIRECT_HEALTH_CHECK_MS = 1000;
 const PEER_PROGRESS_WATCHDOG_STAGE = 'peer_progress_after_first_frame';
-/** Progress is an aggregate, throttled lower-bound; replay an overlap to cover interior holes. */
-const DIRECT_REPLAY_OVERLAP_CHUNKS = 64;
-/** Relay throughput is variable; fail only after it stops making progress for this long. */
-const RELAY_PEER_PROGRESS_SILENCE_TIMEOUT_MS = 30_000;
 
 function toOfferItem(c: ComposeItem): OfferItem {
   return {
@@ -303,10 +300,15 @@ export class SendTask {
   /** 接收端 Rust append 已确认的字节数；最终完成仍以提交后的 ACK 为准。 */
   peerSavedBytes = 0;
   peerTotalBytes = 0;
+  /** Estimated from the receiver's cumulative ACKs; separate from local send() speed. */
+  peerSpeedBps = 0;
+  /** True when the Rust-owned direct path has gone silent; it does not imply relay fallback. */
+  directProgressStalled = false;
   /** 等待接收方 task-ack 的 resolver（收到确认/对方离开/超时后置空） */
   private ackResolve: ((ok: boolean) => void) | null = null;
   private peerFailures: { name: string; size: number; error: string }[] = [];
   private currentSendingItem: ItemState | null = null;
+  private currentTransferId: string | null = null;
   private currentPeerProgressTarget: number | null = null;
   private currentFileFinalizing = false;
   /** At most one loaded next Blob is hashed while the current file is durably saved. */
@@ -324,6 +326,8 @@ export class SendTask {
   private doneNotified = false;
   private directHealthTimer: ReturnType<typeof setInterval> | null = null;
   private lastPeerProgressAt = 0;
+  private lastPeerSpeedAt = 0;
+  private lastPeerSpeedBytes = 0;
   private watchdogStartedAt = 0;
   private lastWatchdogArmedAt = 0;
   private watchdogPauseReason: string | null = null;
@@ -347,6 +351,12 @@ export class SendTask {
       doneBytes: 0,
       totalBytes: c.size,
     }));
+  }
+
+  get peerRateBps(): number {
+    return this.lastPeerProgressAt > 0 && Date.now() - this.lastPeerProgressAt <= 3_000
+      ? this.peerSpeedBps
+      : 0;
   }
 
   private runStartupStage<T>(
@@ -581,6 +591,15 @@ export class SendTask {
           this.notify();
         },
         onDirectFallback: (reason) => this.onDirectFallback(reason),
+        onFileSendStarted: (id) => {
+          if (this.currentSendingItem) this.currentTransferId = id;
+        },
+        onFileProgress: (id, sentBytes) => {
+          if (this.currentSendingItem && sentBytes > 0) this.currentTransferId = id;
+        },
+        onPeerProgress: (id, receivedBytes, totalBytes, complete) => {
+          this.onPeerProgress(id, receivedBytes, totalBytes, complete);
+        },
         onFileFinalizing: (id, size) => {
           this.currentFileFinalizing = true;
           log('p2p', 'receiver finalizing; pause byte-stall watchdog', {
@@ -660,21 +679,6 @@ export class SendTask {
           }
           if (this.currentSendingItem) {
             this.currentSendingItem.transport = mergeTransport(this.currentSendingItem.transport, route);
-            if (route === 'p2p' && !this.currentFileFirstFrameAccepted) {
-              const acceptedAt = Date.now();
-              this.currentFileFirstFrameAccepted = true;
-              log('p2p', 'first direct frame locally accepted by DataChannel send()', {
-                taskId: this.taskId,
-                xfer: id.slice(0, 8),
-                acceptedAt,
-                elapsedFromFileStartMs: this.currentFileStartedAt ? Math.max(0, acceptedAt - this.currentFileStartedAt) : undefined,
-                elapsedFromWatchdogArmMs: this.lastWatchdogArmedAt ? Math.max(0, acceptedAt - this.lastWatchdogArmedAt) : undefined,
-                watchdogStartedBeforeFirstAcceptedFrame: this.lastWatchdogArmedAt > 0 && this.lastWatchdogArmedAt < acceptedAt,
-                watchdogTimeoutMs: DIRECT_PEER_PROGRESS_TIMEOUT_MS,
-                peerProgressAlreadySeen: this.peerDoneBytes > 0,
-              });
-              this.startDirectHealthAfterFirstFrame();
-            }
           }
         },
         onLog: (tag, msg) => log(tag as LogTag, `[room] ${msg}`),
@@ -724,6 +728,7 @@ export class SendTask {
         const src = this.source[i];
         const st = this.items[i];
         this.currentSendingItem = src.kind === 'text' ? null : st;
+        this.currentTransferId = null;
         this.currentFileFinalizing = false;
         this.currentPeerProgressTarget = src.kind === 'text'
           ? null
@@ -731,8 +736,9 @@ export class SendTask {
         if (src.kind !== 'text' && !p2pAwaited) {
           p2pAwaited = true;
           const ready = (await this.p2pReady?.catch(() => 'failed' as const)) ?? 'failed';
-          log('p2p', ready === 'open' ? 'ready, files go direct' : 'not ready, files go relay', {
+          log('p2p', 'Rust transfer setup is active; actual route follows native room events', {
             taskId: this.taskId,
+            readyStub: ready,
           });
         }
         if (src.kind !== 'text') {
@@ -771,7 +777,6 @@ export class SendTask {
               if (!blob) throw new Error('文件内容不可用');
               file = wrapWebFile(blob, src.name, src.relPath);
             }
-            const directFileTransfer = this.room?.directActive === true;
             const peerTarget = this.currentPeerProgressTarget!;
             let receiverSaved = false;
             const onFileProgress = (sent: number, _total: number, saved = false) => {
@@ -780,94 +785,37 @@ export class SendTask {
                 this.currentFileFinalizing = false;
                 this.peerSavedBytes = Math.max(this.peerSavedBytes, peerTarget);
               }
-              // A relay replay uses the same manifest and must not make the
-              // local progress display jump backwards either.
+              // Local bytes accepted by Rust are distinct from receiver ACK progress.
               st.doneBytes = Math.max(st.doneBytes, sent);
               this.trackSpeed(this.doneBytes);
+              if (sent > 0 && this.p2p === 'open' && this.room?.directActive && !this.currentFileFirstFrameAccepted) {
+                this.currentFileFirstFrameAccepted = true;
+                log('p2p', 'first Rust send progress received; arming peer ACK watchdog', {
+                  taskId: this.taskId,
+                  sentBytes: sent,
+                  currentFileSize: this.currentSendingItem?.size,
+                });
+                this.startDirectHealthAfterFirstFrame();
+              }
               this.notify();
             };
             const prepared = this.preparedManifest?.index === i
               ? (await this.preparedManifest.promise) ?? undefined
               : undefined;
             if (this.preparedManifest?.index === i) this.preparedManifest = null;
-            // sendFile (Rust online_send_file) blocks until the receiver's
-            // complete ACK arrives (SHA verified + file renamed). A successful
-            // return means the file is confirmed — no need to wait for the
-            // legacy peerDoneBytes which Rust never updates (no task-progress
-            // messages in the v0.6.7+ Rust path).
-            let confirmed = true;
-            try {
-              const manifest = await this.room!.sendFile(
-                file,
-                onFileProgress,
-                src.kind,
-                prepared,
-                0,
-                this.currentFileStartupDeadlineAt,
-              );
-              st.sha256 = manifest.sha256;
-              st.mimeType = manifest.mimeType;
-              // Mark peer progress as complete so UI and waitForPeerProgress
-              // see the confirmation.
-              this.peerDoneBytes = Math.max(this.peerDoneBytes, peerTarget);
-              this.peerSavedBytes = Math.max(this.peerSavedBytes, peerTarget);
-            } catch (e) {
-              confirmed = false;
-              throw e;
-            }
-            // Legacy waitForPeerProgress removed: Rust already confirmed via
-            // complete ACK. Keep the variable for the replay logic below.
-            const directPathStillActive = directFileTransfer && this.room?.directActive === true;
-            if (directFileTransfer && !confirmed) {
-              const reason = `file progress stalled at ${this.peerDoneBytes}/${peerTarget}`;
-              const previousTarget = peerTarget - st.totalBytes;
-              const peerFileBytes = Math.min(
-                st.totalBytes,
-                Math.max(0, this.peerDoneBytes - previousTarget),
-              );
-              const replayFromSeq = Math.max(
-                0,
-                Math.floor(peerFileBytes / manifest.chunkSize) - DIRECT_REPLAY_OVERLAP_CHUNKS,
-              );
-              log('p2p', 'file confirmation stalled, replaying via relay', {
-                taskId: this.taskId,
-                name: st.name,
-                peerDoneBytes: this.peerDoneBytes,
-                peerTarget,
-                peerFileBytes,
-                replayFromSeq,
-                direct: this.room?.directActive ?? false,
-              });
-              this.room?.fallbackToRelay(reason);
-              await this.room!.sendFile(file, onFileProgress, src.kind, manifest, replayFromSeq);
-              confirmed = await this.waitForPeerProgress(
-                peerTarget,
-                RELAY_PEER_PROGRESS_SILENCE_TIMEOUT_MS,
-                true,
-              );
-              // A throttled progress report can still be stale, or the first
-              // overlap may not cover an unusual interior hole. Use one full
-              // replay as a bounded last resort, but never advance to the next
-              // file while the receiver still has not confirmed this one.
-              if (!confirmed && replayFromSeq > 0) {
-                log('p2p', 'selective relay replay not confirmed, retrying full file', {
-                  taskId: this.taskId,
-                  name: st.name,
-                  replayFromSeq,
-                });
-                await this.room!.sendFile(file, onFileProgress, src.kind, manifest, 0);
-                confirmed = await this.waitForPeerProgress(
-                  peerTarget,
-                  RELAY_PEER_PROGRESS_SILENCE_TIMEOUT_MS,
-                  true,
-                );
-              }
-            }
-            if (!confirmed) {
-              throw new Error(
-                directFileTransfer ? '中继重传后对方仍未确认文件进度' : '中继传输后对方进度停止',
-              );
-            }
+            // Rust owns this online transfer and emits cumulative peer ACKs.
+            // It does not expose a mid-flight relay switch, so never pretend a
+            // missing TypeScript fallback method replayed the file.
+            const manifest = await this.room!.sendFile(
+              file,
+              onFileProgress,
+              src.kind,
+            );
+            st.sha256 = manifest.sha256;
+            st.mimeType = manifest.mimeType;
+            // online_send_file returns only after the receiver's complete ACK.
+            this.peerDoneBytes = Math.max(this.peerDoneBytes, peerTarget);
+            this.peerSavedBytes = Math.max(this.peerSavedBytes, peerTarget);
           }
           st.status = 'done';
           st.doneBytes = st.totalBytes;
@@ -986,6 +934,53 @@ export class SendTask {
     }
   }
 
+  private onPeerProgress(transferId: string, fileReceivedBytes: number, fileTotalBytes: number, complete: boolean): void {
+    const item = this.currentSendingItem;
+    const target = this.currentPeerProgressTarget;
+    if (!item || this.currentTransferId !== transferId || target === null || !Number.isFinite(fileReceivedBytes) || !Number.isFinite(fileTotalBytes)) return;
+    const base = Math.max(0, target - item.totalBytes);
+    const next = mergePeerProgress(
+      { receivedBytes: this.peerDoneBytes, savedBytes: this.peerSavedBytes },
+      base,
+      Math.min(item.totalBytes, Math.max(0, Math.floor(fileTotalBytes))),
+      fileReceivedBytes,
+      complete,
+    );
+    const now = Date.now();
+    const receivedAdvanced = next.receivedBytes > this.peerDoneBytes;
+    if (receivedAdvanced) {
+      const elapsed = now - this.lastPeerSpeedAt;
+      if (this.lastPeerSpeedAt > 0 && elapsed >= 400) {
+        const instantaneous = ((next.receivedBytes - this.lastPeerSpeedBytes) * 1000) / elapsed;
+        if (Number.isFinite(instantaneous) && instantaneous >= 0) {
+          this.peerSpeedBps = this.peerSpeedBps === 0 ? instantaneous : this.peerSpeedBps * 0.7 + instantaneous * 0.3;
+        }
+        this.lastPeerSpeedAt = now;
+        this.lastPeerSpeedBytes = next.receivedBytes;
+      } else if (this.lastPeerSpeedAt === 0) {
+        this.lastPeerSpeedAt = now;
+        this.lastPeerSpeedBytes = next.receivedBytes;
+      }
+      this.lastPeerProgressAt = now;
+      if (this.directProgressStalled) {
+        this.directProgressStalled = false;
+        log('p2p', 'receiver ACK progress resumed; direct path remains active', {
+          taskId: this.taskId,
+          receivedBytes: next.receivedBytes,
+        });
+      }
+      if (this.p2p === 'open' && this.room?.directActive && this.currentFileFirstFrameAccepted && !this.directHealthTimer) {
+        this.startDirectHealthAfterFirstFrame();
+      }
+    }
+    this.peerDoneBytes = next.receivedBytes;
+    this.peerSavedBytes = next.savedBytes;
+    this.peerTotalBytes = Math.max(this.peerTotalBytes, this.totalBytes);
+    this.currentFileFinalizing = !complete && fileReceivedBytes >= item.totalBytes;
+    if (complete) this.currentFileFinalizing = false;
+    this.notify();
+  }
+
   /** P2P is handled in Rust (online_p2p.rs). This is a no-op stub. */
   private startP2P(): void {
     // The Rust session starts P2P automatically in send_file().
@@ -1003,6 +998,10 @@ export class SendTask {
     this.stopDirectHealth('waiting_for_first_direct_frame');
     this.lastWatchdogArmedAt = 0;
     this.lastPeerProgressAt = 0;
+    this.lastPeerSpeedAt = 0;
+    this.lastPeerSpeedBytes = this.peerDoneBytes;
+    this.peerSpeedBps = 0;
+    this.directProgressStalled = false;
     if (this.p2p === 'open' && this.room?.directActive) {
       log('p2p', 'peer progress watchdog deferred until first accepted frame', {
         taskId: this.taskId,
@@ -1070,7 +1069,8 @@ export class SendTask {
       }
       if (!peerProgressTimeoutExpired(this.lastPeerProgressAt, Date.now(), DIRECT_PEER_PROGRESS_TIMEOUT_MS)) return;
       const reason = 'peer_progress_silence_timeout';
-      log('p2p', 'peer progress watchdog timed out; relay fallback requested', {
+      this.directProgressStalled = true;
+      log('p2p', 'peer progress watchdog timed out; direct path remains active (no Rust relay switch)', {
         taskId: this.taskId,
         reason,
         timerStage: PEER_PROGRESS_WATCHDOG_STAGE,
@@ -1091,7 +1091,7 @@ export class SendTask {
         p2pState: this.p2p,
       });
       this.stopDirectHealth('watchdog_timeout');
-      this.room?.fallbackToRelay(reason);
+      this.notify();
       },
     );
     if (timer === null) return;
@@ -1256,7 +1256,7 @@ export class SendTask {
   }
 
   cancel(): void {
-    if (!this.active) return;
+    if (!this.active || this.cancelled) return;
     log('task', 'sender cancellation requested', { taskId: this.taskId, phase: this.phase, sentBytes: this.doneBytes, peerDoneBytes: this.peerDoneBytes, currentFileSize: this.currentSendingItem?.size, firstDirectFrameAccepted: this.currentFileFirstFrameAccepted });
     this.cancelled = true;
     this.stageAbortController.abort();

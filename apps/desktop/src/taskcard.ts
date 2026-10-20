@@ -4,6 +4,7 @@ import type { SendTask, RecvTask } from './tasks.js';
 import { fmtSize, fmtSpeed, el } from './ui.js';
 import { replaceChildrenPreservingScroll } from './dom-utils.js';
 import { distributeSequentialProgress, progressForItem, progressPercent } from './file-progress.js';
+import { estimateRemainingSeconds } from './peer-progress.js';
 
 type AnyTask = SendTask | RecvTask;
 
@@ -41,24 +42,16 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
   const closeBtn = el('button', 'x', '✕') as HTMLButtonElement;
   closeBtn.title = '取消';
   top.append(arrow, peer, sum, pct, closeBtn);
-  // 发送端主进度采用接收端 append 确认值，另列真实网络接收进度。
+  // 发送端主进度采用接收端累计 ACK；本机 send() 速率不冒充对端进度。
   const bars = el('div', 'trow-bars');
   const totalRow = el('div', 'tbar-row');
-  const totalLabel = el('span', 'tfile', dir === 'send' ? '对方已写入' : '总计');
+  const totalLabel = el('span', 'tfile', dir === 'send' ? '对端累计确认' : '总计');
   const totalBar = el('div', 'pbar thin');
   const totalFill = el('div', 'pfill');
   totalBar.appendChild(totalFill);
   const eta = el('span', 'teta', '');
   totalRow.append(totalLabel, totalBar, eta);
   bars.append(totalRow);
-  const receivedRow = dir === 'send' ? el('div', 'tbar-row') : undefined;
-  const receivedFill = dir === 'send' ? el('div', 'pfill') : undefined;
-  if (receivedRow && receivedFill) {
-    const receivedBar = el('div', 'pbar thin');
-    receivedBar.appendChild(receivedFill);
-    receivedRow.append(el('span', 'tfile', '对方已接收'), receivedBar, el('span', 'tfpct', '0%'));
-    bars.append(receivedRow);
-  }
   // 文件列表：点击上行展开/收起，每个文件自带进度条
   const detail = el('div', 'trow-detail');
   detail.hidden = true;
@@ -132,8 +125,7 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
         };
         r.append(
           head,
-          progressLine('已接收', fileReceivedB, confirmedDone),
-          progressLine('已写入', fileDoneB, confirmedDone),
+          progressLine(dir === 'send' ? '对端累计确认' : '已接收', dir === 'send' ? fileReceivedB : fileDoneB, confirmedDone),
         );
       } else {
         const p = progressPercent(it.totalBytes, fileDoneB, confirmedDone);
@@ -171,15 +163,13 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
     // 详情展开时跟随刷新
     if (!detail.hidden) renderDetail();
 
-    // 主进度：发送端以接收端的 Rust append 确认作为已写入，不采纳本机 send() 数字。
+    // 主进度与 ETA 同用对端累计 ACK，绝不拿本机 send() 速度倒推对端完成时间。
     let doneB = task.doneBytes;
     let totalB = task.totalBytes;
-    let receivedB = doneB;
     if (dir === 'send') {
       const sendTask = task as SendTask;
       const pd = sendTask.peerSavedBytes;
       const pt = sendTask.peerTotalBytes;
-      receivedB = sendTask.peerDoneBytes;
       doneB = pd;
       if (pt > 0) {
         totalB = pt;
@@ -187,21 +177,19 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
     }
     const pctNum = phase === 'done' ? 100 : totalB > 0 ? Math.min(100, Math.round((doneB / totalB) * 100)) : 0;
     totalFill.style.width = pctNum + '%';
-    if (receivedFill && receivedRow) {
-      const receivedPct = totalB > 0 ? Math.min(100, Math.round((receivedB / totalB) * 100)) : 0;
-      receivedFill.style.width = receivedPct + '%';
-      (receivedRow.querySelector('.tfpct') as HTMLElement).textContent = `${receivedPct}%`;
-    }
     totalBar.classList.toggle('live', active && (phase === 'sending' || (phase as string) === 'receiving'));
     // 右上角总百分比
     pct.textContent = pctNum + '%';
 
-    // 预计剩余时间：按当前速度估算
-    const effSpeedForEta = task.speedBps > 0 ? task.speedBps : 0;
-    if (active && effSpeedForEta > 0 && totalB > doneB) {
-      const sec = Math.ceil((totalB - doneB) / effSpeedForEta);
+    const sendTaskForEta = dir === 'send' ? task as SendTask : undefined;
+    const etaSpeed = sendTaskForEta ? sendTaskForEta.peerRateBps : task.speedBps;
+    const remainingSeconds = estimateRemainingSeconds(totalB, doneB, etaSpeed);
+    if (active && remainingSeconds !== null) {
+      const sec = remainingSeconds;
       eta.textContent = '剩余 ' + (sec >= 3600 ? `${Math.floor(sec / 3600)}:${String(Math.floor(sec / 60) % 60).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`
         : sec >= 60 ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}` : `${sec}秒`);
+    } else if (active && sendTaskForEta && sendTaskForEta.peerDoneBytes < totalB) {
+      eta.textContent = '等待对端进度';
     } else {
       eta.textContent = '';
     }
@@ -222,15 +210,18 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
         lastAdvanceT = Date.now();
       }
       const idleMs = Date.now() - lastAdvanceT;
-      const effSpeed = idleMs > 3000 ? 0 : task.speedBps;
+      const progressSpeed = sendTask ? sendTask.peerRateBps : task.speedBps;
+      const effSpeed = idleMs > 3000 ? 0 : progressSpeed;
       if (sendTask?.finalizing) {
         status = '对方已接收，正在校验并最终保存…';
-      } else if (idleMs > 15000 && pctNum < 100 && !(sendTask && receivedB >= totalB)) {
+      } else if (sendTask?.directProgressStalled && sendTask.p2p === 'open') {
+        status = '直连等待对端确认，尚未切换中继';
+        statusCls = 'bad';
+      } else if (idleMs > 15000 && pctNum < 100 && !(sendTask && sendTask.peerDoneBytes >= totalB)) {
         status = `⚠ 停滞 ${pctNum}%`;
         statusCls = 'bad';
       } else if (sendTask) {
-        const receivedPct = totalB > 0 ? Math.min(100, Math.round((receivedB / totalB) * 100)) : 0;
-        status = `写入 ${pctNum}% · 已收 ${receivedPct}%` + (effSpeed > 0 ? ` · ${fmtSpeed(effSpeed)}` : '');
+        status = `对端累计确认 ${pctNum}%` + (effSpeed > 0 ? ` · ${fmtSpeed(effSpeed)}` : '');
       } else {
         status = `${pctNum}%` + (effSpeed > 0 ? ` · ${fmtSpeed(effSpeed)}` : '');
       }

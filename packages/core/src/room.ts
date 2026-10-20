@@ -67,6 +67,10 @@ export interface FlingRoomEvents {
   onTaskFailed?(taskId: string, failures: { name: string; size: number; error: string }[], from: string): void;
   /** Receiver-confirmed arrival and Rust append progress (see task-progress). */
   onTaskProgress?(taskId: string, receivedBytes: number, totalBytes: number, from: string, savedBytes?: number): void;
+  /** The Rust sender has allocated a transfer id and is about to publish its manifest. */
+  onFileSendStarted?(transferId: string, totalBytes: number): void;
+  /** Rust online sender received a cumulative ACK; complete means hash/commit ACK. */
+  onPeerProgress?(transferId: string, receivedBytes: number, totalBytes: number, complete: boolean): void;
   /** A direct path was found unhealthy; callers should close their P2P link. */
   onDirectFallback?(reason: string): void;
   /** Optional diagnostics sink (the app wires this to its log file). */

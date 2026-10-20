@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Mutex};
@@ -21,6 +21,8 @@ use crate::online_transfer::{build_manifest, chunk_ack_message, OnlineReceiver, 
 
 /// How long to wait for a manifest ACK.
 const MANIFEST_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+const PEER_PROGRESS_UI_INTERVAL: Duration = Duration::from_millis(500);
+const PEER_PROGRESS_UI_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Events emitted to the WebView. The frontend only renders these.
 #[derive(Clone, serde::Serialize)]
@@ -48,6 +50,20 @@ enum OnlineUiEvent {
         sent_bytes: u64,
         total_bytes: u64,
         direction: String,
+    },
+    /// Sender-side view of the receiver's cumulative ACK. `received_bytes`
+    /// means appended to the receiver's temp file, not final durable commit.
+    #[serde(rename = "peer-progress")]
+    PeerProgress {
+        transfer_id: String,
+        received_bytes: u64,
+        total_bytes: u64,
+        complete: bool,
+    },
+    #[serde(rename = "file-send-started")]
+    FileSendStarted {
+        transfer_id: String,
+        total_bytes: u64,
     },
     /// P2P link state changed.
     #[serde(rename = "p2p")]
@@ -78,6 +94,32 @@ fn emit(app: &AppHandle, session_id: &str, event: OnlineUiEvent) {
     );
 }
 
+/// Limit peer-progress events to 500ms or 4MiB, while always emitting completion.
+async fn should_emit_peer_progress(
+    progress: &Mutex<HashMap<String, (u64, Instant)>>,
+    id: &str,
+    received_bytes: u64,
+    complete: bool,
+) -> bool {
+    let now = Instant::now();
+    let mut progress = progress.lock().await;
+    let due = progress
+        .get(id)
+        .map_or(true, |(previous_bytes, previous_at)| {
+            complete
+                || received_bytes.saturating_sub(*previous_bytes) >= PEER_PROGRESS_UI_BYTES
+                || now.saturating_duration_since(*previous_at) >= PEER_PROGRESS_UI_INTERVAL
+        });
+    if due {
+        if complete {
+            progress.remove(id);
+        } else {
+            progress.insert(id.to_string(), (received_bytes, now));
+        }
+    }
+    due
+}
+
 /// One online session: a LiveKit room plus its transfers.
 pub struct OnlineSession {
     id: String,
@@ -92,6 +134,8 @@ pub struct OnlineSession {
     download_dir: PathBuf,
     /// Notified when a `file-manifest-ack` arrives, keyed by transfer id.
     manifest_acks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    /// Rate-limit ACK progress events sent from Rust to the WebView.
+    peer_progress_ui: Arc<Mutex<HashMap<String, (u64, Instant)>>>,
 }
 
 impl OnlineSession {
@@ -121,6 +165,7 @@ impl OnlineSession {
             pending_ice: Mutex::new(Vec::new()),
             download_dir,
             manifest_acks: Arc::new(Mutex::new(HashMap::new())),
+            peer_progress_ui: Arc::new(Mutex::new(HashMap::new())),
         });
 
         // Dispatch loop.
@@ -216,14 +261,43 @@ impl OnlineSession {
             FlingMessage::FileChunk { id, seq, data } => {
                 self.on_relay_chunk(id, seq, data).await?;
             }
-            FlingMessage::FileChunkAck { id, next_seq, complete, failed, .. } => {
+            FlingMessage::FileChunkAck {
+                id,
+                next_seq,
+                received_bytes,
+                complete,
+                failed,
+                ..
+            } => {
                 if failed == Some(true) {
                     return Err(format!("receiver failed transfer {id}"));
                 }
-                if let Some(sender) = self.senders.lock().await.get(&id) {
+                if let Some(sender) = self.senders.lock().await.get(&id).cloned() {
                     sender.on_chunk_ack(next_seq);
-                    if complete == Some(true) {
+                    let is_complete = complete == Some(true);
+                    if is_complete {
                         sender.on_complete();
+                    }
+                    let total_bytes = sender.manifest().size;
+                    let received_bytes = received_bytes.min(total_bytes);
+                    if should_emit_peer_progress(
+                        &self.peer_progress_ui,
+                        &id,
+                        received_bytes,
+                        is_complete,
+                    )
+                    .await
+                    {
+                        emit(
+                            &self.app,
+                            &self.id,
+                            OnlineUiEvent::PeerProgress {
+                                transfer_id: id,
+                                received_bytes,
+                                total_bytes,
+                                complete: is_complete,
+                            },
+                        );
                     }
                 }
             }
@@ -316,6 +390,13 @@ impl OnlineSession {
                 .send(&chunk_ack_message(receiver, next_seq, received_bytes, complete))
                 .await?;
             if complete {
+                let _ = should_emit_peer_progress(
+                    &self.peer_progress_ui,
+                    &id,
+                    received_bytes,
+                    true,
+                )
+                .await;
                 emit(
                     &self.app,
                     &self.id,
@@ -385,6 +466,7 @@ impl OnlineSession {
         // We need &self in the async pump; clone the Arcs we need.
         let receivers = self.receivers.clone();
         let receiver_last_ack = self.receiver_last_ack.clone();
+        let peer_progress_ui = self.peer_progress_ui.clone();
         tokio::spawn(async move {
             // Register the message handler BEFORE wait_open(): libwebrtc drops
             // messages received before on_message is set, so the handler must
@@ -486,6 +568,13 @@ impl OnlineSession {
                                 ))
                                 .await;
                             if complete {
+                                let _ = should_emit_peer_progress(
+                                    &peer_progress_ui,
+                                    &id,
+                                    received_bytes,
+                                    true,
+                                )
+                                .await;
                                 let _ = app.emit(
                                     "fling://online/event",
                                     serde_json::json!({
@@ -496,6 +585,24 @@ impl OnlineSession {
                                             "ok": true,
                                         },
                                     }),
+                                );
+                            } else if should_emit_peer_progress(
+                                &peer_progress_ui,
+                                &id,
+                                received_bytes,
+                                false,
+                            )
+                            .await
+                            {
+                                emit(
+                                    &app,
+                                    &session_id,
+                                    OnlineUiEvent::Progress {
+                                        transfer_id: id,
+                                        sent_bytes: received_bytes,
+                                        total_bytes: receiver.manifest().size,
+                                        direction: "receiving".to_string(),
+                                    },
                                 );
                             }
                         }
@@ -534,6 +641,14 @@ impl OnlineSession {
     ) -> Result<String, String> {
         let manifest = build_manifest(path, name, kind)?;
         let transfer_id = manifest.id.clone();
+        emit(
+            &self.app,
+            &self.id,
+            OnlineUiEvent::FileSendStarted {
+                transfer_id: transfer_id.clone(),
+                total_bytes: manifest.size,
+            },
+        );
         let sender = Arc::new(OnlineSender::new(manifest, path)?);
         self.senders
             .lock()
@@ -708,6 +823,7 @@ impl OnlineSession {
             }
         }
         self.senders.lock().await.remove(&transfer_id);
+        self.peer_progress_ui.lock().await.remove(&transfer_id);
         result.map(|_| transfer_id)
     }
 
@@ -752,5 +868,50 @@ impl OnlineSessionRegistry {
 
     pub async fn remove(&self, id: &str) -> Option<Arc<OnlineSession>> {
         self.sessions.lock().await.remove(id)
+    }
+}
+
+#[cfg(test)]
+mod ui_event_serialization_tests {
+    use super::{should_emit_peer_progress, OnlineUiEvent, PEER_PROGRESS_UI_BYTES};
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+
+    #[test]
+    fn peer_progress_event_keeps_the_frontend_contract() {
+        let value = serde_json::to_value(OnlineUiEvent::PeerProgress {
+            transfer_id: "transfer-test".to_string(),
+            received_bytes: 256,
+            total_bytes: 1024,
+            complete: false,
+        })
+        .unwrap();
+        assert_eq!(value["kind"], "peer-progress");
+        assert_eq!(value["transfer_id"], "transfer-test");
+        assert_eq!(value["received_bytes"], 256);
+        assert_eq!(value["total_bytes"], 1024);
+        assert_eq!(value["complete"], false);
+    }
+
+    #[test]
+    fn file_send_started_event_keeps_the_frontend_contract() {
+        let value = serde_json::to_value(OnlineUiEvent::FileSendStarted {
+            transfer_id: "transfer-test".to_string(),
+            total_bytes: 1024,
+        })
+        .unwrap();
+        assert_eq!(value["kind"], "file-send-started");
+        assert_eq!(value["transfer_id"], "transfer-test");
+        assert_eq!(value["total_bytes"], 1024);
+    }
+
+    #[tokio::test]
+    async fn peer_progress_is_throttled_but_completion_is_always_emitted() {
+        let progress = Mutex::new(HashMap::new());
+        assert!(should_emit_peer_progress(&progress, "x", 0, false).await);
+        assert!(!should_emit_peer_progress(&progress, "x", 1024, false).await);
+        assert!(should_emit_peer_progress(&progress, "x", PEER_PROGRESS_UI_BYTES, false).await);
+        assert!(should_emit_peer_progress(&progress, "x", PEER_PROGRESS_UI_BYTES, true).await);
+        assert!(should_emit_peer_progress(&progress, "x", 0, false).await);
     }
 }

@@ -1,6 +1,6 @@
 {
   "name": "@fling/desktop",
-  "version": "0.6.5",
+  "version": "0.6.28",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,6 +8,7 @@
     "build": "vite build",
     "test:scroll": "bun test/taskcard-scroll.ts",
     "test:progress": "bun test/file-progress.ts",
+    "test:peer-progress": "bun test/peer-progress.ts",
     "test:lan-ipc-contract": "bun test/lan-ipc-contract.ts",
     "test:lan-picker-ui": "bun test/lan-picker-ui.ts"
   },
