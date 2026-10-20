@@ -29,6 +29,15 @@ enum OnlineUiEvent {
     /// A text message arrived.
     #[serde(rename = "text")]
     Text { from: String, id: String, text: String },
+    /// A file manifest arrived (receiver side). Frontend uses this to
+    /// create the transferId -> item mapping for progress display.
+    #[serde(rename = "file-manifest")]
+    FileManifest {
+        transfer_id: String,
+        name: String,
+        size: u64,
+        file_kind: String,
+    },
     /// Peer presence changed.
     #[serde(rename = "peer")]
     Peer { identity: String, joined: bool },
@@ -243,6 +252,22 @@ impl OnlineSession {
         manifest: crate::online_proto::FileManifest,
     ) -> Result<(), String> {
         let id = manifest.id.clone();
+        // Notify the frontend so it can create the transferId -> item mapping
+        // for progress display. The manifest kind is an enum; convert to string.
+        let kind_str = match &manifest.kind {
+            crate::online_proto::FileKind::File => "file",
+            crate::online_proto::FileKind::ClipboardImage => "clipboard-image",
+        };
+        emit(
+            &self.app,
+            &self.id,
+            OnlineUiEvent::FileManifest {
+                transfer_id: id.clone(),
+                name: manifest.name.clone(),
+                size: manifest.size,
+                file_kind: kind_str.to_string(),
+            },
+        );
         let receiver = Arc::new(OnlineReceiver::new(manifest, &self.download_dir)?);
         self.receivers.lock().await.insert(id.clone(), receiver);
         self.receiver_last_ack.lock().await.insert(id.clone(), 0);
@@ -346,8 +371,14 @@ impl OnlineSession {
         let receivers = self.receivers.clone();
         let receiver_last_ack = self.receiver_last_ack.clone();
         tokio::spawn(async move {
+            // Register the message handler BEFORE wait_open(): libwebrtc drops
+            // messages received before on_message is set, so the handler must
+            // be attached as soon as the DataChannel is created (via
+            // on_data_channel), not after it opens.
+            let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            p2p.set_message_handler(frame_tx);
             match p2p.wait_open().await {
-                Ok(dc) => {
+                Ok(_dc) => {
                     let _ = app.emit(
                         "fling://online/event",
                         serde_json::json!({
@@ -355,15 +386,9 @@ impl OnlineSession {
                             "event": { "kind": "p2p", "state": "open" },
                         }),
                     );
-                    // Pump: on_message (native thread) -> channel -> async
-                    // task that routes frames to receivers and ACKs.
-                    let (frame_tx, mut frame_rx) =
-                        mpsc::unbounded_channel::<Vec<u8>>();
-                    dc.on_message(Some(Box::new(move |msg| {
-                        if msg.binary {
-                            let _ = frame_tx.send(msg.data.to_vec());
-                        }
-                    })));
+                    // Pump: on_message (native thread, attached early by
+                    // OnlineP2p) -> channel -> async task that routes frames
+                    // to receivers and ACKs.
                     while let Some(frame_bytes) = frame_rx.recv().await {
                         // Decode just the transfer id synchronously.
                         let id = match crate::native_lan::decode_direct_file_frame(&frame_bytes) {
@@ -576,12 +601,11 @@ impl OnlineSession {
         };
 
         // 4. Report.
+        // NOTE: Do NOT send FlingMessage::TaskDone here — that's a task-level
+        // message for the whole task (all files), sent by the frontend.
+        // We only emit the per-file TransferDone UI event.
         match &result {
             Ok(()) => {
-                let _ = self
-                    .room
-                    .send(&FlingMessage::TaskDone { task_id: transfer_id.clone() })
-                    .await;
                 emit(
                     &self.app,
                     &self.id,
