@@ -6,3 +6,10 @@ dist/
 plain-config.json
 bundle.json
 fling-config-encrypted.json
+
+# Regenerable desktop build outputs
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+
+# Also ignore local shared dependency symlinks
+node_modules

@@ -367,6 +367,36 @@ pub struct OnlineReceiver {
     committed: AtomicBool,
 }
 
+/// Relative folder layout is display metadata, never a sender filesystem path.
+fn receive_directory(manifest: &FileManifest, root: &Path) -> Result<PathBuf, String> {
+    let Some(relative) = &manifest.path else { return Ok(root.to_path_buf()); };
+    let components: Vec<_> = relative.split('/').collect();
+    if components.len() > 65 || components.last().copied() != Some(manifest.name.as_str()) ||
+        components.iter().any(|part| !crate::online_source::safe_component(part)) {
+        return Err("invalid relative source path".into());
+    }
+    std::fs::create_dir_all(root).map_err(|_| "create receive root failed")?;
+    let root = root.canonicalize().map_err(|_| "receive root unavailable")?;
+    let mut directory = root.clone();
+    for part in &components[..components.len() - 1] {
+        directory.push(part);
+        match std::fs::create_dir(&directory) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+            Err(_) => return Err("create receive subdirectory failed".into()),
+        }
+        let stat = std::fs::symlink_metadata(&directory).map_err(|_| "receive subdirectory unavailable")?;
+        if !stat.is_dir() || stat.file_type().is_symlink() { return Err("unsafe receive subdirectory".into()); }
+        #[cfg(windows)] {
+            use std::os::windows::fs::MetadataExt;
+            if stat.file_attributes() & 0x400 != 0 { return Err("unsafe receive reparse point".into()); }
+        }
+        if !directory.canonicalize().map_err(|_| "receive subdirectory unavailable")?.starts_with(&root) {
+            return Err("receive directory escaped root".into());
+        }
+    }
+    Ok(directory)
+}
 impl OnlineReceiver {
     pub fn new(manifest: FileManifest, target_dir: &Path) -> Result<Self, String> {
         if manifest.id.len() != 24 || !manifest.id.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -378,7 +408,8 @@ impl OnlineReceiver {
         if u64::from(manifest.chunk_size) != NATIVE_CHUNK_SIZE || u64::from(manifest.total_chunks) != manifest.size.div_ceil(u64::from(NATIVE_CHUNK_SIZE)) {
             return Err("invalid manifest chunk accounting".into());
         }
-        std::fs::create_dir_all(target_dir).map_err(|e| format!("create receive directory: {e}"))?;
+        let target_dir = receive_directory(&manifest, target_dir)?;
+        std::fs::create_dir_all(&target_dir).map_err(|e| format!("create receive directory: {e}"))?;
         let target_path = target_dir.join(&manifest.name);
         let temp_path = target_dir.join(format!(".{}.part", manifest.id));
         let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp_path)

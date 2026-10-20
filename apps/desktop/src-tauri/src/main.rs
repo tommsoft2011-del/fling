@@ -38,6 +38,8 @@ mod online_room;
 mod online_session;
 mod online_transfer;
 mod online_source;
+mod ui_events;
+mod native_drop;
 mod ice_syntax;
 mod online_native;
 // ================================================================ config ==
@@ -473,6 +475,29 @@ async fn online_pick_source(app: tauri::AppHandle, window: tauri::WebviewWindow)
 }
 
 #[tauri::command]
+async fn online_pick_sources(app: tauri::AppHandle, window: tauri::WebviewWindow, folders: bool) -> Result<Vec<online_source::SourceMetadata>, String> {
+    let owner = window.label().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let dialog = app.dialog().file().set_title(if folders { "选择文件夹（Rust 原生文件源）" } else { "选择多个文件（Rust 原生文件源）" });
+        let chosen = if folders { dialog.blocking_pick_folders() } else { dialog.blocking_pick_files() };
+        let paths = chosen.map(|items| items.into_iter().map(|item| item.into_path().map_err(|_| "仅支持本地磁盘项目".to_string())).collect::<Result<Vec<_>, _>>()).transpose()?;
+        if app.get_webview_window(&owner).is_none() { return Err("选择窗口已关闭".into()); }
+        let registry = app.state::<online_source::OnlineSources>();
+        let selected = registry.register_selection(&owner, paths)?;
+        if app.get_webview_window(&owner).is_none() { registry.remove_owner(&owner); return Err("选择窗口已关闭".into()); }
+        Ok(selected)
+    }).await.map_err(|_| "文件选择工作线程失败")?
+}
+#[tauri::command]
+async fn online_send_registered_source(window: tauri::WebviewWindow, sources: tauri::State<'_, online_source::OnlineSources>, registry: tauri::State<'_, online_session::OnlineSessionRegistry>, session_id: String, source_id: String) -> Result<String, String> {
+    let session = registry.get(&session_id).await.ok_or("unknown online session")?;
+    session.authorize(window.label())?;
+    if session.native.is_some() { return Err("single-file task must use online_send_source".into()); }
+    let lease = sources.acquire(window.label(), &source_id)?;
+    let _busy = sources.busy_guard(window.label(), &source_id);
+    session.send_registered_source(lease).await
+}
+#[tauri::command]
 fn online_release_source(window: tauri::WebviewWindow, sources: tauri::State<'_, online_source::OnlineSources>, source_id: String) -> Result<(), String> {
     sources.remove(window.label(), &source_id)
 }
@@ -482,9 +507,8 @@ async fn online_send_source(window: tauri::WebviewWindow, sources: tauri::State<
     let session = registry.get(&session_id).await.ok_or("unknown online session")?;
     session.authorize(window.label())?;
     let lease = sources.acquire(window.label(), &source_id)?;
-    let result = session.send_source(lease).await;
-    sources.release(window.label(), &source_id);
-    result
+    let _busy = sources.busy_guard(window.label(), &source_id);
+    session.send_source(lease).await
 }
 
 #[tauri::command]
@@ -532,8 +556,11 @@ async fn online_send_file(
     };
     session.authorize(window.label())?;
     if session.native.is_some() { return Err("native task accepts high-level actions only".into()); }
+    let spill = std::path::Path::new(&path).canonicalize().map_err(|_| "兼容临时文件不可用")?;
+    let temp = fling_temp_dir()?.canonicalize().map_err(|_| "兼容临时目录不可用")?;
+    if spill.parent() != Some(temp.as_path()) { return Err("ordinary files require sourceId".into()); }
     session
-        .send_file(std::path::Path::new(&path), name, file_kind)
+        .send_file(&spill, name, file_kind)
         .await
 }
 
@@ -557,7 +584,8 @@ async fn online_send_message(
     session.send_raw(msg).await
 }
 
-/// Write in-memory bytes (clipboard image, drag-drop) to a temp file so
+/// Legacy memory-Blob compatibility only, NOT a Rust-owned ordinary file source.
+/// Write in-memory bytes (clipboard image) to a temp file so
 /// the Rust transfer engine can stream it. Returns the temp path.
 #[tauri::command]
 fn write_temp_file(_app: tauri::AppHandle, name: String, data: Vec<u8>) -> Result<String, String> {
@@ -2213,138 +2241,6 @@ fn discovery_set_discoverable(app: tauri::AppHandle, on: bool) -> Result<(), Str
 /// (used for received clipboard-images; they must NOT become files).
 /// 读取拖放进来的文件内容（base64）。走 Rust 命令而不是 fs 插件，
 /// 避免 fs scope 挡住用户文件目录的任意路径。
-fn emit_native_diagnostic(app: &tauri::AppHandle, payload: serde_json::Value) {
-    let _ = app.emit("fling:diagnostic", payload);
-}
-
-#[tauri::command]
-fn read_file_bytes(app: tauri::AppHandle, path: String) -> Result<Vec<u8>, String> {
-    let metadata_started = std::time::Instant::now();
-    let meta = match std::fs::metadata(&path) {
-        Ok(meta) => meta,
-        Err(error) => {
-            emit_native_diagnostic(
-                &app,
-                serde_json::json!({
-                    "stage": "source_file_metadata", "status": "error",
-                    "errorType": format!("{:?}", error.kind()),
-                    "elapsedMs": metadata_started.elapsed().as_secs_f64() * 1000.0,
-                }),
-            );
-            return Err(format!("读取文件失败: {error}"));
-        }
-    };
-    let metadata_ms = metadata_started.elapsed().as_secs_f64() * 1000.0;
-    if !meta.is_file() {
-        emit_native_diagnostic(
-            &app,
-            serde_json::json!({
-                "stage": "source_file_metadata", "status": "not_file",
-                "metadataMs": metadata_ms,
-            }),
-        );
-        return Err("仅支持拖入文件，暂不支持文件夹".into());
-    }
-
-    let open_started = std::time::Instant::now();
-    let mut file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(error) => {
-            emit_native_diagnostic(
-                &app,
-                serde_json::json!({
-                    "stage": "source_file_open", "status": "error",
-                    "expectedBytes": meta.len(), "metadataMs": metadata_ms,
-                    "errorType": format!("{:?}", error.kind()),
-                    "elapsedMs": open_started.elapsed().as_secs_f64() * 1000.0,
-                }),
-            );
-            return Err(format!("读取文件失败: {error}"));
-        }
-    };
-    let open_ms = open_started.elapsed().as_secs_f64() * 1000.0;
-    let read_started = std::time::Instant::now();
-    let mut bytes = Vec::with_capacity(meta.len().min(usize::MAX as u64) as usize);
-    if let Err(error) = file.read_to_end(&mut bytes) {
-        emit_native_diagnostic(
-            &app,
-            serde_json::json!({
-                "stage": "source_file_read", "status": "error",
-                "expectedBytes": meta.len(), "readBytes": bytes.len(),
-                "metadataMs": metadata_ms, "openMs": open_ms,
-                "errorType": format!("{:?}", error.kind()),
-                "elapsedMs": read_started.elapsed().as_secs_f64() * 1000.0,
-            }),
-        );
-        return Err(format!("读取文件失败: {error}"));
-    }
-    emit_native_diagnostic(
-        &app,
-        serde_json::json!({
-            "stage": "source_file_read", "status": "ok",
-            "expectedBytes": meta.len(), "readBytes": bytes.len(),
-            "metadataMs": metadata_ms, "openMs": open_ms,
-            "readMs": read_started.elapsed().as_secs_f64() * 1000.0,
-        }),
-    );
-    Ok(bytes)
-}
-
-/// 取文件大小（不读内容，供拖放时懒加载：只记路径+大小，发送时才读）。
-#[tauri::command]
-fn file_size(path: String) -> Result<u64, String> {
-    let meta = std::fs::metadata(&path).map_err(|e| format!("读取文件失败: {e}"))?;
-    if !meta.is_file() {
-        return Err("不是文件".into());
-    }
-    Ok(meta.len())
-}
-
-/// 判断路径是否为目录（供拖放时区分文件/文件夹）。
-#[tauri::command]
-fn is_dir(path: String) -> bool {
-    std::path::Path::new(&path).is_dir()
-}
-
-/// 递归列出目录下所有文件：返回 [{ rel_path, size }]，rel_path 用 "/" 分隔、
-/// 相对于 dir。供"添加文件夹"发送用（发送时再按需读文件内容）。
-#[tauri::command]
-fn list_dir_recursive(dir: String) -> Result<Vec<serde_json::Value>, String> {
-    fn walk(
-        base: &std::path::Path,
-        cur: &std::path::Path,
-        out: &mut Vec<serde_json::Value>,
-    ) -> Result<(), String> {
-        let rd = std::fs::read_dir(cur).map_err(|e| format!("读取目录失败: {e}"))?;
-        for ent in rd {
-            let ent = ent.map_err(|e| format!("读取目录项失败: {e}"))?;
-            let path = ent.path();
-            if path.is_dir() {
-                if path.is_symlink() {
-                    continue; // 跳过符号链接目录，避免循环
-                }
-                walk(base, &path, out)?;
-            } else if path.is_file() {
-                let rel = path
-                    .strip_prefix(base)
-                    .map_err(|e| format!("路径处理失败: {e}"))?
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let size = ent.metadata().map(|m| m.len()).unwrap_or(0);
-                out.push(serde_json::json!({ "rel_path": rel, "size": size }));
-            }
-        }
-        Ok(())
-    }
-    let base = std::path::PathBuf::from(&dir);
-    if !base.is_dir() {
-        return Err("不是有效目录".to_string());
-    }
-    let mut out = Vec::new();
-    walk(&base, &base, &mut out)?;
-    Ok(out)
-}
-
 #[tauri::command]
 fn write_image_clipboard(data_b64: String) -> Result<(), String> {
     use base64::Engine;
@@ -2463,6 +2359,18 @@ fn main() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
+        .on_window_event(|window, event| {
+            #[cfg(windows)]
+            if let tauri::WindowEvent::DragDrop(event) = event { native_drop::handle(window.app_handle(), window.label(), event); }
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                window.state::<online_source::OnlineSources>().remove_owner(window.label());
+                ui_events::cleanup(window);
+            }
+        })
+        .on_webview_event(|webview, event| {
+            #[cfg(not(windows))]
+            if let tauri::WebviewEvent::DragDrop(event) = event { native_drop::handle(webview.app_handle(), webview.label(), event); }
+        })
         .setup(|app| {
             // Device identity (created on first run) + mDNS discovery thread.
             let (_, cfg) = ensure_config(app.handle())?;
@@ -2493,6 +2401,8 @@ fn main() {
             app.manage(DiscoveryState { tx });
             app.manage(online_session::OnlineSessionRegistry::new());
             app.manage(online_source::OnlineSources::default());
+            app.manage(ui_events::UiListeners::default());
+            app.manage(native_drop::DropState::default());
             let source_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 loop {
@@ -2522,6 +2432,10 @@ fn main() {
             mint_token,
             online_connect,
             online_pick_source,
+            online_pick_sources,
+            online_send_registered_source,
+            ui_events::ui_listen,
+            ui_events::ui_unlisten,
             online_release_source,
             online_send_source,
             online_cancel_native,
@@ -2561,10 +2475,6 @@ fn main() {
             native_lan_runtime::native_lan_ipc_counters,
             native_lan_runtime::native_lan_try_direct_offer,
             write_image_clipboard,
-            read_file_bytes,
-            file_size,
-            list_dir_recursive,
-            is_dir,
             open_folder,
             app_version,
             get_log_dir,

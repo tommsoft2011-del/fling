@@ -79,8 +79,13 @@ const progress = (taskId: string, phase: string, extra: Record<string, unknown> 
     taskId, phase, receivedBytes: 0, savedBytes: 0, totalBytes: 0, speedBps: 0, ...extra,
   } });
 mock.module('@tauri-apps/api/core', () => ({
+  Channel: class { onmessage: ((event: any) => void) | null = null; },
   invoke: async (command: string, args?: any) => {
     calls.push({ command, args });
+    if (command === 'ui_listen') {
+      events.set(args.event, (event) => args.channel.onmessage(event));
+      return events.size;
+    }
     if (command === 'native_lan_start_mode') return { deviceId: 'a', deviceName: 'A' };
     if (command === 'native_lan_pick_source') return await nextPick;
     if (command === 'discovery_refresh') return await nextRefresh;
@@ -101,12 +106,6 @@ mock.module('@tauri-apps/api/core', () => ({
     }
     if (command === 'native_lan_ipc_counters') return { totalCalls: 0, totalBytes: 0, byType: {} };
     return undefined;
-  },
-}));
-mock.module('@tauri-apps/api/event', () => ({
-  listen: async (name: string, callback: (event: { payload: any }) => void) => {
-    events.set(name, callback);
-    return () => { events.delete(name); };
   },
 }));
 const { initLanPage } = await import('../src/lan');

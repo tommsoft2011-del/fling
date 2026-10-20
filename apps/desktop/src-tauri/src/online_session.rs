@@ -941,6 +941,21 @@ impl OnlineSession {
         emit(&self.app, &self.id, OnlineUiEvent::TransferDone { transfer_id: id, ok: false, error: Some(error.into()) });
     }
 
+    /// Batch-source migration: TS still orchestrates the legacy task envelope, but
+    /// ordinary source bytes, handles, hashes and file ACKs never cross the WebView.
+    pub async fn send_registered_source(self: &Arc<Self>, lease: SourceLease) -> Result<String, String> {
+        if self.cancelled.load(Ordering::Acquire) { return Err("已取消".into()); }
+        let session = self.clone();
+        let (manifest, file) = tokio::task::spawn_blocking(move || {
+            let mut file = lease.file;
+            let mut manifest = crate::online_transfer::build_manifest_handle(&mut file, lease.metadata.name, FileKind::File, &session.cancelled)?;
+            if manifest.size != lease.metadata.size { return Err("文件大小已改变，请重新选择".to_string()); }
+            manifest.path = lease.metadata.rel_path;
+            Ok::<_, String>((manifest, file))
+        }).await.map_err(|_| "源文件准备失败")??;
+        if self.cancelled.load(Ordering::Acquire) { return Err("已取消".into()); }
+        self.send_prepared(Arc::new(OnlineSender::from_handle(manifest, file))).await
+    }
     pub async fn send_source(self: &Arc<Self>, lease: SourceLease) -> Result<NativeTaskStatus, String> {
         let native = self.native.as_ref().ok_or("not a native single-file task")?;
         {

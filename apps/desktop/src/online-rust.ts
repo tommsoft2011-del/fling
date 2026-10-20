@@ -8,7 +8,7 @@
 // FlingRoom interface used by tasks.ts, delegating to Tauri commands.
 
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { listen } from './ui-events.js';
 import type {
   FileKind,
   FileManifest,
@@ -36,16 +36,8 @@ interface OnlineUiEvent {
 
 /** Write in-memory file bytes to a temp file so Rust can stream it. */
 async function ensureFilePath(file: FileLike): Promise<string> {
-  // Path-backed source (drag-drop via Tauri native events / folder items):
-  // hand the real disk path straight to Rust. NOTE: `file.path` is NOT a
-  // disk path — it is the in-folder relative path; the disk path rides
-  // along as `diskPath`.
-  const diskPath = (file as unknown as { diskPath?: string }).diskPath;
-  if (diskPath) return diskPath;
-  // In-memory source (file picker, HTML drag-drop, paste): the blob has no
-  // disk path. Spill it to a temp file in 4 MiB chunks over Tauri's native
-  // binary IPC (a bare Uint8Array invoke arg is sent as application/octet-stream,
-  // no JSON, no base64 on file content): frame = [u32 LE path_len][path UTF-8][chunk].
+  // Legacy memory-Blob compatibility ONLY. Ordinary disk files must use sourceId.
+  // Spill WebView-owned memory in bounded 4 MiB chunks; this is NOT Rust-owned sourcing.
   const tmp = (await invoke('online_temp_begin', { name: file.name })) as string;
   const pathBytes = new TextEncoder().encode(tmp);
   const header = new Uint8Array(4 + pathBytes.length);
@@ -269,6 +261,20 @@ export class RustFlingRoom {
     return invoke('online_send_source', { sessionId: this.requireSession(), sourceId });
   }
 
+  /** Batch ordinary-file source: only capability + session IDs cross IPC. */
+  async sendRegisteredSource(
+    source: { sourceId?: string; name: string; size: number; relPath?: string },
+    onProgress?: (sent: number, total: number, receiverSaved?: boolean) => void,
+  ): Promise<FileManifest> {
+    if (!source.sourceId) throw new Error('Missing sourceId');
+    this.activeSendProgress = onProgress ? (sent, total) => onProgress(sent, total) : null;
+    let id: string;
+    try {
+      id = await invoke<string>('online_send_registered_source', { sessionId: this.requireSession(), sourceId: source.sourceId });
+    } finally { this.activeSendProgress = null; }
+    return { id, name: source.name, size: source.size, sha256: '', chunkSize: 32 * 1024,
+      totalChunks: Math.ceil(source.size / (32 * 1024)), kind: 'file', path: source.relPath };
+  }
   async cancelNative(): Promise<void> {
     await invoke('online_cancel_native', { sessionId: this.requireSession() });
   }

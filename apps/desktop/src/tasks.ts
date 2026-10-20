@@ -1,7 +1,7 @@
 // 传输引擎：发送任务 / 接收任务 / 全局管理器
 // 一次发送动作 = 一个任务 = 独立 LiveKit 房间，任务之间互不阻塞。
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { listen } from './ui-events.js';
 import { writeText as writeClipboardText } from '@tauri-apps/plugin-clipboard-manager';
 import {
   buildManifest,
@@ -215,8 +215,6 @@ export interface ComposeItem {
   relPath?: string;
   /** 所属顶层文件夹名（用于发送框折叠显示；单文件为空） */
   folder?: string;
-  /** Tauri 下文件的绝对路径（懒加载：发送时才读文件内容，避免大文件夹提前占内存） */
-  filePath?: string;
   /** Native picker capability; no path/Blob/bytes are exposed to the WebView. */
   sourceId?: string;
 }
@@ -285,7 +283,7 @@ export class SendTask {
   readonly taskId = uid('task');
   phase: SendPhase = 'preparing';
   nativeStage?: string;
-  get nativeSingleFile(): boolean { return this.source.length === 1 && !!this.source[0]?.sourceId; }
+  get nativeSingleFile(): boolean { return this.source.length === 1 && !!this.source[0]?.sourceId && !this.source[0]?.relPath; }
   items: ItemState[];
   startedAt = Date.now();
   endedAt?: number;
@@ -802,27 +800,11 @@ export class SendTask {
           if (src.kind === 'text') {
             await this.sendTextItem(src.text ?? '', st);
           } else {
-            // Path-backed sources (file picker / drag-drop / folder items):
-            // the Rust room opens the file by path itself, so the WebView
-            // must NOT materialize the content. The old flow read the whole
-            // file through read_file_bytes into a Blob (then spilled it back
-            // to a temp file via Array.from) — fine for small files, fatal
-            // for hundreds of MB (the read/IPC conversion throws and the
-            // send dies ~3s in, before the manifest is even published).
-            let file: FileLike;
-            if (src.filePath) {
-              file = {
-                name: src.name,
-                size: src.size,
-                path: src.relPath,
-                slice: async () => {
-                  throw new Error('path-backed file: in-memory slice unavailable');
-                },
-              } as FileLike;
-              (file as unknown as { diskPath?: string }).diskPath = src.filePath;
-            } else {
+            // Ordinary files use Rust capabilities; memory Blobs remain explicitly compatible.
+            let file: FileLike | undefined;
+            if (!src.sourceId) {
               const blob = src.blob;
-              if (!blob) throw new Error('文件内容不可用');
+              if (!blob) throw new Error('兼容文件内容不可用');
               file = wrapWebFile(blob, src.name, src.relPath);
             }
             const peerTarget = this.currentPeerProgressTarget!;
@@ -854,11 +836,9 @@ export class SendTask {
             // Rust owns this online transfer and emits cumulative peer ACKs.
             // It does not expose a mid-flight relay switch, so never pretend a
             // missing TypeScript fallback method replayed the file.
-            const manifest = await this.room!.sendFile(
-              file,
-              onFileProgress,
-              src.kind,
-            );
+            const manifest = src.sourceId
+              ? await this.room!.sendRegisteredSource(src, onFileProgress)
+              : await this.room!.sendFile(file!, onFileProgress, src.kind);
             st.sha256 = manifest.sha256;
             st.mimeType = manifest.mimeType;
             // online_send_file returns only after the receiver's complete ACK.

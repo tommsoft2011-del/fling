@@ -27,7 +27,7 @@ function reportGlobalError(where: string, err: unknown): void {
 window.addEventListener('unhandledrejection', (e) => reportGlobalError('unhandledrejection', e.reason));
 window.addEventListener('error', (e) => reportGlobalError('window.onerror', e.error ?? e.message));
 import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { listen } from './ui-events.js';
 import { $, toast } from './ui.js';
 import { initNet, getDeviceName } from './net.js';
 import { manager } from './tasks.js';

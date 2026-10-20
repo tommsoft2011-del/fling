@@ -273,3 +273,52 @@ async fn p2p_cumulative_acks_allow_sending_beyond_eight_mib_window() {
     drop(receiver);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn registered_folder_layout_persists_exact_bytes_before_completion() {
+    let root = directory();
+    let data = b"folder payload";
+    let mut meta = manifest(data); meta.name = "测试.txt".into(); meta.path = Some("docs/子目录/测试.txt".into());
+    let receiver = OnlineReceiver::new(meta.clone(), &root).unwrap();
+    receiver.on_relay_chunk(0, &B64.encode(data)).await.unwrap();
+    assert!(receiver.check_complete().await.unwrap());
+    assert_eq!(std::fs::read(root.join("docs/子目录/测试.txt")).unwrap(), data);
+    assert!(receiver.is_committed());
+    assert!(!root.join(format!("docs/子目录/.{}.part", meta.id)).exists());
+    drop(receiver); std::fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn registered_folder_path_rejects_traversal_absolute_ads_and_mismatched_leaf() {
+    let root = directory();
+    for path in ["../received.bin", "/received.bin", "C:/received.bin", "docs//received.bin", "docs/../received.bin", "docs\\received.bin", "docs/other.bin", "NUL/received.bin", "docs./received.bin", "docs/ads:stream/received.bin"] {
+        let mut meta = manifest(b"x"); meta.path = Some(path.into());
+        assert!(OnlineReceiver::new(meta, &root).is_err(), "{path}");
+    }
+    assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+    std::fs::remove_dir_all(root).unwrap();
+}
+#[cfg(unix)]
+#[test]
+fn registered_folder_receive_does_not_follow_existing_symlink() {
+    let root = directory(); let outside = directory();
+    std::os::unix::fs::symlink(&outside, root.join("docs")).unwrap();
+    let mut meta = manifest(b"x"); meta.path = Some("docs/received.bin".into());
+    assert!(OnlineReceiver::new(meta, &root).is_err());
+    assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+    std::fs::remove_dir_all(root).unwrap(); std::fs::remove_dir_all(outside).unwrap();
+}
+#[cfg(windows)]
+#[test]
+fn windows_junction_is_rejected_for_source_registration_and_folder_receive() {
+    let root = directory(); let outside = directory();
+    std::fs::write(outside.join("a.bin"), b"outside").unwrap();
+    let link = root.join("docs");
+    let result = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&link).arg(&outside).output().unwrap();
+    assert!(result.status.success(), "junction fixture creation failed");
+    let sources = crate::online_source::OnlineSources::default();
+    assert!(sources.register_selection("main", Some(vec![link.clone()])).is_err());
+    let mut meta = manifest(b"x"); meta.path = Some("docs/received.bin".into());
+    assert!(OnlineReceiver::new(meta, &root).is_err());
+    assert!(!outside.join("received.bin").exists());
+    std::fs::remove_dir(link).unwrap(); std::fs::remove_dir_all(root).unwrap(); std::fs::remove_dir_all(outside).unwrap();
+}
