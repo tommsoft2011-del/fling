@@ -8,12 +8,12 @@ import {
   wrapWebFile,
   type FileReceiver,
   type FileManifest,
+  type FileLike,
   type FlingMessage,
   type OfferItem,
   type OfferMessage,
   DIRECT_PEER_PROGRESS_TIMEOUT_MS,
   FILE_STARTUP_PREPARATION_TIMEOUT_MS,
-  FILE_SOURCE_READ_TIMEOUT_MS,
   MANIFEST_PREPARATION_TIMEOUT_MS,
   peerProgressTimeoutExpired,
   runWithStageTimeout,
@@ -741,36 +741,29 @@ export class SendTask {
           if (src.kind === 'text') {
             await this.sendTextItem(src.text ?? '', st);
           } else {
-            // 文件夹/大文件可能是懒加载：发送时才从磁盘读
-            let blob = src.blob;
-            if (!blob && src.filePath) {
-              // read_file_bytes 直接返回 Uint8Array（Tauri 原生二进制，无 base64 开销）
-              const readStartedAt = performance.now();
-              log('xfer', 'native source read requested', {
-                taskId: this.taskId, source: 'native_path', expectedSize: src.size,
-              });
-              try {
-                const bytes = (await this.runStartupStage(
-                  'file_source_read',
-                  FILE_SOURCE_READ_TIMEOUT_MS,
-                  () => invoke('read_file_bytes', { path: src.filePath }),
-                )) as unknown as Uint8Array;
-                log('xfer', 'native source read returned', {
-                  taskId: this.taskId, source: 'native_path', bytes: bytes.byteLength,
-                  status: 'ok', elapsedMs: Math.round(performance.now() - readStartedAt),
-                });
-                blob = new Blob([bytes as BlobPart]);
-              } catch (error) {
-                log('xfer', 'native source read failed', {
-                  taskId: this.taskId, source: 'native_path', expectedSize: src.size,
-                  status: 'error', errorType: errorType(error),
-                  elapsedMs: Math.round(performance.now() - readStartedAt),
-                });
-                throw error;
-              }
+            // Path-backed sources (file picker / drag-drop / folder items):
+            // the Rust room opens the file by path itself, so the WebView
+            // must NOT materialize the content. The old flow read the whole
+            // file through read_file_bytes into a Blob (then spilled it back
+            // to a temp file via Array.from) — fine for small files, fatal
+            // for hundreds of MB (the read/IPC conversion throws and the
+            // send dies ~3s in, before the manifest is even published).
+            let file: FileLike;
+            if (src.filePath) {
+              file = {
+                name: src.name,
+                size: src.size,
+                path: src.relPath,
+                slice: async () => {
+                  throw new Error('path-backed file: in-memory slice unavailable');
+                },
+              } as FileLike;
+              (file as unknown as { diskPath?: string }).diskPath = src.filePath;
+            } else {
+              const blob = src.blob;
+              if (!blob) throw new Error('文件内容不可用');
+              file = wrapWebFile(blob, src.name, src.relPath);
             }
-            if (!blob) throw new Error('文件内容不可用');
-            const file = wrapWebFile(blob, src.name, src.relPath);
             const directFileTransfer = this.room?.directActive === true;
             const peerTarget = this.currentPeerProgressTarget!;
             let receiverSaved = false;
@@ -1514,8 +1507,17 @@ export class RecvTask {
         onFileManifest: (m) => this.onManifest(m),
         onFileProgress: (id, r, t) => this.onProgress(id, r, t),
         onFileRoute: (route, id) => {
-          const item = this.manifestToItem.get(id);
-          if (item) item.transport = mergeTransport(item.transport, route);
+          // Rust reports p2p-open as a session-level event (empty id);
+          // attribute the route to all items so the UI shows the ⚡ label.
+          if (id) {
+            const item = this.manifestToItem.get(id);
+            if (item) item.transport = mergeTransport(item.transport, route);
+          } else {
+            for (const item of this.manifestToItem.values()) {
+              item.transport = mergeTransport(item.transport, route);
+            }
+          }
+          this.notify();
         },
         onFileCompleteStream: (id, m, receiver) => {
           // 落盘是异步的：跟踪起来，finish(true) 需要等它们全部完成再发 task-ack

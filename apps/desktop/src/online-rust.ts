@@ -27,7 +27,11 @@ interface OnlineUiEvent {
 
 /** Write in-memory file bytes to a temp file so Rust can stream it. */
 async function ensureFilePath(file: FileLike): Promise<string> {
-  if (file.path) return file.path;
+  // Path-backed source (file picker / drag-drop): hand the real disk path
+  // straight to Rust. NOTE: `file.path` is NOT a disk path — it is the
+  // in-folder relative path; the disk path rides along as `diskPath`.
+  const diskPath = (file as unknown as { diskPath?: string }).diskPath;
+  if (diskPath) return diskPath;
   // In-memory (clipboard / drag-drop): spill to temp via Rust.
   const bytes = await file.slice(0, file.size);
   const tmp = (await invoke('write_temp_file', {
