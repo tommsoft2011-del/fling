@@ -32,7 +32,7 @@ pub fn validate(candidate: &str) -> Result<(), String> {
         || foundation.len() > 32
         || !foundation
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'_' | b'-'))
     {
         return Err(invalid());
     }
@@ -69,6 +69,8 @@ mod tests {
     #[test]
     fn valid_webrtc_candidates_include_ipv4_ipv6_tcp_and_relay() {
         for candidate in [
+            // WebRTC accepts this non-RFC foundation used by our native-handler regressions.
+            "candidate:MARKER_CANDIDATE 1 udp 2122260223 127.0.0.1 49157 typ host",
             "candidate:1 1 udp 2122260223 192.168.1.2 5000 typ host generation 0 ufrag abc network-id 1 network-cost 10",
             "candidate:2 1 UDP 2122260223 fd12::1 5000 typ host",
             "candidate:3 1 tcp 1518280447 192.168.1.2 9 typ host tcptype active",
