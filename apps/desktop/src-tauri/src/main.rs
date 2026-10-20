@@ -522,6 +522,57 @@ fn write_temp_file(_app: tauri::AppHandle, name: String, data: Vec<u8>) -> Resul
     Ok(path.to_string_lossy().to_string())
 }
 
+/// Directory that holds spilled in-memory files for Rust-side sending.
+fn fling_temp_dir() -> Result<std::path::PathBuf, String> {
+    let dir = std::env::temp_dir().join("fling-online");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create temp dir: {e}"))?;
+    Ok(dir)
+}
+
+/// Begin a chunked spill: create an empty temp file and return its path.
+/// Chunked append (below) replaces the old one-shot `write_temp_file`
+/// IPC, whose whole-file JSON payload made large files impossible.
+#[tauri::command]
+fn online_temp_begin(name: String) -> Result<String, String> {
+    let dir = fling_temp_dir()?;
+    let safe_name: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let path = dir.join(format!("{:x}-{safe_name}", rand::random::<u64>()));
+    std::fs::write(&path, b"").map_err(|e| format!("create temp file: {e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Append one base64-encoded chunk to a temp file created by
+/// `online_temp_begin`. Only paths inside the spill directory are allowed.
+#[tauri::command]
+fn online_temp_append(path: String, data_b64: String) -> Result<(), String> {
+    let dir = fling_temp_dir()?;
+    let target = std::path::PathBuf::from(&path);
+    let canonical_dir = dir.canonicalize().map_err(|e| format!("temp dir: {e}"))?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| "temp path has no parent".to_string())?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|e| format!("temp path parent: {e}"))?;
+    if canonical_parent != canonical_dir {
+        return Err("temp append path outside spill dir".to_string());
+    }
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_b64.as_bytes())
+        .map_err(|e| format!("temp chunk base64: {e}"))?;
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&target)
+        .map_err(|e| format!("open temp for append: {e}"))?;
+    f.write_all(&bytes).map_err(|e| format!("append temp: {e}"))?;
+    Ok(())
+}
+
 /// Disconnect an online session and release its resources.
 #[tauri::command]
 async fn online_disconnect(
@@ -2394,6 +2445,8 @@ fn main() {
             online_send_message,
             online_disconnect,
             write_temp_file,
+            online_temp_begin,
+            online_temp_append,
             server_url,
             pick_save_path,
             write_binary_file,

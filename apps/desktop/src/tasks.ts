@@ -869,7 +869,7 @@ export class SendTask {
         } catch (e) {
           st.status = 'error';
           st.error = (e as Error).message || '发送失败';
-          log('xfer', 'send item error', { taskId: this.taskId, size: st.size, status: 'error' });
+          log('xfer', 'send item error', { taskId: this.taskId, size: st.size, status: 'error', errMsg: String((e as Error)?.message ?? e) });
         }
         this.notify();
         this.currentSendingItem = null;

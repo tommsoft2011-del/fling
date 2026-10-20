@@ -27,17 +27,34 @@ interface OnlineUiEvent {
 
 /** Write in-memory file bytes to a temp file so Rust can stream it. */
 async function ensureFilePath(file: FileLike): Promise<string> {
-  // Path-backed source (file picker / drag-drop): hand the real disk path
-  // straight to Rust. NOTE: `file.path` is NOT a disk path — it is the
-  // in-folder relative path; the disk path rides along as `diskPath`.
+  // Path-backed source (drag-drop via Tauri native events / folder items):
+  // hand the real disk path straight to Rust. NOTE: `file.path` is NOT a
+  // disk path — it is the in-folder relative path; the disk path rides
+  // along as `diskPath`.
   const diskPath = (file as unknown as { diskPath?: string }).diskPath;
   if (diskPath) return diskPath;
-  // In-memory (clipboard / drag-drop): spill to temp via Rust.
-  const bytes = await file.slice(0, file.size);
-  const tmp = (await invoke('write_temp_file', {
-    name: file.name,
-    data: Array.from(bytes),
-  })) as string;
+  // In-memory source (file picker, HTML drag-drop, paste): the blob has no
+  // disk path. Spill it to a temp file in 4 MiB chunks — the previous
+  // implementation did Array.from(wholeFile) + one JSON IPC payload, which
+  // explodes for large files (a 745 MB file dies ~3 s in, before the
+  // manifest is even sent). Chunked base64 keeps memory bounded.
+  const tmp = (await invoke('online_temp_begin', { name: file.name })) as string;
+  const CHUNK = 4 * 1024 * 1024;
+  try {
+    for (let off = 0; off < file.size; off += CHUNK) {
+      const bytes = await file.slice(off, Math.min(off + CHUNK, file.size));
+      let bin = '';
+      const SUB = 0x8000;
+      for (let i = 0; i < bytes.length; i += SUB) {
+        bin += String.fromCharCode(...bytes.subarray(i, i + SUB));
+      }
+      await invoke('online_temp_append', { path: tmp, dataB64: btoa(bin) });
+    }
+  } catch (e) {
+    log('p2p', 'temp spill failed', { fileSize: file.size, errMsg: String(e) });
+    throw e;
+  }
+  log('p2p', 'temp spill complete', { fileSize: file.size });
   return tmp;
 }
 
