@@ -373,12 +373,20 @@ impl OnlineReceiver {
         let mut offset = 0usize;
         let mut next = *self.next_seq.lock().await;
         for index in 0..count {
-            if next + index as u32 >= self.manifest.total_chunks {
+            let chunk_seq = next + index as u32;
+            if chunk_seq >= self.manifest.total_chunks {
                 return Err("FLNG frame exceeds declared chunk count".to_string());
             }
-            let received = *self.received_bytes.lock().await;
-            let remaining = self.manifest.size.saturating_sub(received);
-            let expected = remaining.min(chunk_size) as usize;
+            // Chunks are full-size except the file's last chunk, which may
+            // be short. Compute each chunk's expected length from its
+            // absolute position in the file. (The old code derived it from
+            // the transfer-wide `received`, which never advances inside
+            // this loop — so a batch ending in a short chunk computed
+            // count*chunk_size expected bytes and the frame was rejected
+            // as having "trailing payload bytes".)
+            let chunk_start = u64::from(chunk_seq) * chunk_size;
+            let expected =
+                self.manifest.size.saturating_sub(chunk_start).min(chunk_size) as usize;
             if expected == 0 || frame.payload.len() < offset + expected {
                 return Err("FLNG payload length does not match manifest".to_string());
             }

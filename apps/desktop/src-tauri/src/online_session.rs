@@ -427,15 +427,36 @@ impl OnlineSession {
                         // Decode just the transfer id synchronously.
                         let id = match crate::native_lan::decode_direct_file_frame(&frame_bytes) {
                             Ok(Some(f)) => f.id,
-                            _ => continue,
+                            other => {
+                                emit(&app, &session_id, OnlineUiEvent::P2pLog {
+                                    message: format!(
+                                        "responder: dropped frame #{frame_count}: decode failed ({:?})",
+                                        other.as_ref().err().map(|e| e.as_str())
+                                    ),
+                                });
+                                continue;
+                            }
                         };
                         let receiver = match receivers.lock().await.get(&id).cloned() {
                             Some(r) => r,
-                            None => continue,
+                            None => {
+                                emit(&app, &session_id, OnlineUiEvent::P2pLog {
+                                    message: format!(
+                                        "responder: dropped frame #{frame_count}: unknown transfer id {}",
+                                        &id[..id.len().min(12)]
+                                    ),
+                                });
+                                continue;
+                            }
                         };
                         let next_seq = match receiver.on_p2p_frame(&frame_bytes).await {
                             Ok(n) => n,
                             Err(e) => {
+                                emit(&app, &session_id, OnlineUiEvent::P2pLog {
+                                    message: format!(
+                                        "responder: dropped frame #{frame_count}: on_p2p_frame failed: {e}"
+                                    ),
+                                });
                                 eprintln!("fling online P2P frame error: {e}");
                                 continue;
                             }
