@@ -37,7 +37,9 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
   const top = el('div', 'trow-top');
   const arrow = el('span', 'tdir', dir === 'send' ? '→' : '←');
   const peer = el('span', 'tpeer', task.peerLabel);
-  const sum = el('span', 'tsum', summarizeItems(task));
+  const nativeFile = dir === 'send' ? (task as SendTask).nativeSingleFile : (task as RecvTask).offer?.nativeSingleFile;
+  const pathLabel = task.items.some((item) => item.kind !== 'text') ? ` · ${nativeFile ? 'Rust 原生单文件' : '兼容路径'}` : '';
+  const sum = el('span', 'tsum', summarizeItems(task) + pathLabel);
   const pct = el('span', 'tpct', '');
   const closeBtn = el('button', 'x', '✕') as HTMLButtonElement;
   closeBtn.title = '取消';
@@ -196,7 +198,13 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
 
     let status: string;
     let statusCls = '';
-    if (phase === 'preparing' || phase === 'waiting') {
+    const nativeLabels: Record<string, string> = {
+      waiting: '等待对方加入…', preparing: 'Rust 正在读取并计算 SHA-256…',
+      connecting: '正在建立 P2P 直连…', finalizing: '正在校验、同步磁盘并最终确认…',
+    };
+    if (active && task.nativeStage && (nativeLabels[task.nativeStage] || (task.nativeStage === 'transferring' && (dir === 'send' ? (task as SendTask).peerDoneBytes : task.doneBytes) === 0))) {
+      status = nativeLabels[task.nativeStage] ?? '传输已开始，等待首个对端进度…';
+    } else if (phase === 'preparing' || phase === 'waiting') {
       status = dir === 'send' ? (task as SendTask).waitLabel + '…' : '连接中…';
     } else if (dir === 'recv' && (task as RecvTask).savingProgress) {
       const saving = (task as RecvTask).savingProgress!;
@@ -217,7 +225,7 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
       } else if (sendTask?.directProgressStalled && sendTask.p2p === 'open') {
         status = '直连等待对端确认，尚未切换中继';
         statusCls = 'bad';
-      } else if (idleMs > 15000 && pctNum < 100 && !(sendTask && sendTask.peerDoneBytes >= totalB)) {
+      } else if (activityBytes > 0 && idleMs > 15000 && pctNum < 100 && !(sendTask && sendTask.peerDoneBytes >= totalB)) {
         status = `⚠ 停滞 ${pctNum}%`;
         statusCls = 'bad';
       } else if (sendTask) {

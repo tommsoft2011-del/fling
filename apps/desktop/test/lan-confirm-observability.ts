@@ -22,8 +22,8 @@ for (const event of ['PeerConnectionStart', 'PeerConnectionOk', 'PeerConnectionE
 assert.match(transfer, /on_ice_gathering_state_change/);
 assert.match(transfer, /IceGatheringState::Complete[\s\S]*?flush_candidates\(\)/);
 assert.match(transfer, /candidate\(family, transport, category, rejection\);\s*if !is_local_host_candidate/);
-assert.match(transfer, /if seq == 0\s*\{\s*session\s*\.diagnostic\s*\.record\(FunnelEvent::FirstFrameSendAttempt\)/);
-assert.match(transfer, /if frame.seq == 0 && index \+ 1 == count/);
+assert.match(transfer, /if batch_seq == 0\s*\{\s*session\s*\.diagnostic\s*\.record\(FunnelEvent::FirstFrameSendAttempt\)/);
+assert.match(transfer, /if frame.seq == 0\s*\{\s*session.diagnostic.record\(FunnelEvent::FirstFrameAppendOk\)/);
 assert.match(transfer, /first_arrival.swap\(true/);
 assert.match(transfer, /config.ice_servers.clear\(\)/);
 assert.match(transfer, /ContinualGatheringPolicy::GatherOnce/);

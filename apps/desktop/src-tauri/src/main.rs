@@ -37,6 +37,8 @@ mod online_proto;
 mod online_room;
 mod online_session;
 mod online_transfer;
+mod online_source;
+mod online_native;
 // ================================================================ config ==
 
 /// 16 random bytes as lowercase hex. Generated once on first run, never rotated.
@@ -427,6 +429,9 @@ fn mint_token(app: tauri::AppHandle, room: String, identity: String) -> Result<S
 #[tauri::command]
 async fn online_connect(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    native_task: Option<online_native::NativeTaskConfig>,
+    client_session_id: Option<String>,
     registry: tauri::State<'_, online_session::OnlineSessionRegistry>,
     server_url: String,
     token: String,
@@ -434,7 +439,9 @@ async fn online_connect(
     key_context: String,
 ) -> Result<String, String> {
     let download_dir = get_download_dir(app.clone())?;
-    let id = format!("{:x}", rand::random::<u64>());
+    let id = client_session_id.unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
+    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) { return Err("invalid session id".into()); }
+    if registry.get(&id).await.is_some() { return Err("session id already exists".into()); }
     let session = online_session::OnlineSession::connect(
         app,
         id.clone(),
@@ -443,15 +450,53 @@ async fn online_connect(
         &pairing_code,
         &key_context,
         std::path::PathBuf::from(download_dir),
+        window.label().into(),
+        native_task,
     )
     .await?;
     registry.insert(id.clone(), session).await;
     Ok(id)
 }
 
+/// The only entrance to the Rust-owned disk-file path. No frontend path input.
+#[tauri::command]
+async fn online_pick_source(app: tauri::AppHandle, window: tauri::WebviewWindow) -> Result<Option<online_source::SourceMetadata>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let owner = window.label().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let chosen = app.dialog().file().set_title("选择一个文件（Rust 原生传输）").blocking_pick_file();
+        let Some(chosen) = chosen else { return Ok(None); };
+        let path = chosen.into_path().map_err(|_| "仅支持普通磁盘文件")?;
+        app.state::<online_source::OnlineSources>().register(&owner, &path).map(Some)
+    }).await.map_err(|e| format!("picker worker: {e}"))?
+}
+
+#[tauri::command]
+fn online_release_source(window: tauri::WebviewWindow, sources: tauri::State<'_, online_source::OnlineSources>, source_id: String) -> Result<(), String> {
+    sources.remove(window.label(), &source_id)
+}
+
+#[tauri::command]
+async fn online_send_source(window: tauri::WebviewWindow, sources: tauri::State<'_, online_source::OnlineSources>, registry: tauri::State<'_, online_session::OnlineSessionRegistry>, session_id: String, source_id: String) -> Result<online_native::NativeTaskStatus, String> {
+    let session = registry.get(&session_id).await.ok_or("unknown online session")?;
+    session.authorize(window.label())?;
+    let lease = sources.acquire(window.label(), &source_id)?;
+    let result = session.send_source(lease).await;
+    sources.release(window.label(), &source_id);
+    result
+}
+
+#[tauri::command]
+async fn online_cancel_native(window: tauri::WebviewWindow, registry: tauri::State<'_, online_session::OnlineSessionRegistry>, session_id: String) -> Result<(), String> {
+    let session = registry.get(&session_id).await.ok_or("unknown online session")?;
+    session.authorize(window.label())?;
+    session.cancel_native(None, true).await
+}
+
 /// Send a text message in an online session.
 #[tauri::command]
 async fn online_send_text(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, online_session::OnlineSessionRegistry>,
     session_id: String,
     text: String,
@@ -460,6 +505,8 @@ async fn online_send_text(
         .get(&session_id)
         .await
         .ok_or_else(|| "unknown online session".to_string())?;
+    session.authorize(window.label())?;
+    if session.native.is_some() { return Err("native task accepts high-level actions only".into()); }
     session.send_text(text).await
 }
 
@@ -467,6 +514,7 @@ async fn online_send_text(
 /// Progress arrives via `fling://online/event`.
 #[tauri::command]
 async fn online_send_file(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, online_session::OnlineSessionRegistry>,
     session_id: String,
     path: String,
@@ -481,6 +529,8 @@ async fn online_send_file(
         "clipboard-image" => online_proto::FileKind::ClipboardImage,
         _ => online_proto::FileKind::File,
     };
+    session.authorize(window.label())?;
+    if session.native.is_some() { return Err("native task accepts high-level actions only".into()); }
     session
         .send_file(std::path::Path::new(&path), name, file_kind)
         .await
@@ -490,6 +540,7 @@ async fn online_send_file(
 /// The message is a JSON value matching the `FlingMessage` schema.
 #[tauri::command]
 async fn online_send_message(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, online_session::OnlineSessionRegistry>,
     session_id: String,
     message: serde_json::Value,
@@ -498,6 +549,8 @@ async fn online_send_message(
         .get(&session_id)
         .await
         .ok_or_else(|| "unknown online session".to_string())?;
+    session.authorize(window.label())?;
+    if session.native.is_some() { return Err("native task accepts high-level actions only".into()); }
     let msg: online_proto::FlingMessage =
         serde_json::from_value(message).map_err(|e| format!("bad Fling message: {e}"))?;
     session.send_raw(msg).await
@@ -592,10 +645,13 @@ fn online_temp_append(request: tauri::ipc::Request<'_>) -> Result<(), String> {
 /// Disconnect an online session and release its resources.
 #[tauri::command]
 async fn online_disconnect(
+    window: tauri::WebviewWindow,
     registry: tauri::State<'_, online_session::OnlineSessionRegistry>,
     session_id: String,
 ) -> Result<(), String> {
-    if let Some(session) = registry.remove(&session_id).await {
+    if let Some(session) = registry.get(&session_id).await {
+        session.authorize(window.label())?;
+        registry.remove(&session_id).await;
         session.disconnect().await?;
     }
     Ok(())
@@ -2435,6 +2491,14 @@ fn main() {
             app.manage(native_lan_runtime::NativeLanRuntime::new());
             app.manage(DiscoveryState { tx });
             app.manage(online_session::OnlineSessionRegistry::new());
+            app.manage(online_source::OnlineSources::default());
+            let source_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    source_app.state::<online_source::OnlineSources>().purge_expired();
+                }
+            });
             if native_port != 0 {
                 if let Err(error) =
                     native_lan_runtime::start_listener(app.handle().clone(), listeners, ipv6_ready)
@@ -2456,6 +2520,10 @@ fn main() {
             save_config,
             mint_token,
             online_connect,
+            online_pick_source,
+            online_release_source,
+            online_send_source,
+            online_cancel_native,
             online_send_text,
             online_send_file,
             online_send_message,

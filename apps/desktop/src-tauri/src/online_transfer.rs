@@ -18,12 +18,12 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{Mutex, Notify};
 
 use crate::online_proto::{FileKind, FileManifest, FlingMessage};
 
@@ -50,6 +50,11 @@ const FILE_COMPLETE_TIMEOUT: Duration = Duration::from_secs(60);
 /// compute SHA-256 and the chunk count. Mirrors `buildManifest()`.
 pub fn build_manifest(path: &Path, name: String, kind: FileKind) -> Result<FileManifest, String> {
     let mut file = File::open(path).map_err(|e| format!("open file for manifest: {e}"))?;
+    build_manifest_handle(&mut file, name, kind, &AtomicBool::new(false))
+}
+
+pub fn build_manifest_handle(file: &mut File, name: String, kind: FileKind, cancelled: &AtomicBool) -> Result<FileManifest, String> {
+    file.seek(SeekFrom::Start(0)).map_err(|e| format!("rewind source: {e}"))?;
     let size = file
         .metadata()
         .map_err(|e| format!("stat file for manifest: {e}"))?
@@ -57,6 +62,7 @@ pub fn build_manifest(path: &Path, name: String, kind: FileKind) -> Result<FileM
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 128 * 1024];
     loop {
+        if cancelled.load(Ordering::Acquire) { return Err("已取消".into()); }
         let n = file.read(&mut buf).map_err(|e| format!("hash file: {e}"))?;
         if n == 0 {
             break;
@@ -65,7 +71,8 @@ pub fn build_manifest(path: &Path, name: String, kind: FileKind) -> Result<FileM
     }
     let sha256 = format!("{:x}", hasher.finalize());
     let chunk_size = NATIVE_CHUNK_SIZE as u32;
-    let total_chunks = ((size + u64::from(chunk_size) - 1) / u64::from(chunk_size)) as u32;
+    let total_chunks = u32::try_from(size.div_ceil(u64::from(chunk_size))).map_err(|_| "file too large")?;
+    file.seek(SeekFrom::Start(0)).map_err(|e| format!("rewind source: {e}"))?;
     // Transfer id: 24 hex chars (12 bytes), matching the FLNG id format.
     let mut id_bytes = [0u8; 12];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut id_bytes);
@@ -95,12 +102,18 @@ pub struct OnlineSender {
     /// Set when the receiver confirms persistence (`task-ack` / complete).
     complete_notify: Arc<Notify>,
     sent_bytes: Mutex<u64>,
+    completed: AtomicBool,
+    failed: AtomicBool,
 }
 
 impl OnlineSender {
     pub fn new(manifest: FileManifest, path: &Path) -> Result<Self, String> {
         let file = File::open(path).map_err(|e| format!("open source file: {e}"))?;
-        Ok(Self {
+        Ok(Self::from_handle(manifest, file))
+    }
+
+    pub fn from_handle(manifest: FileManifest, file: File) -> Self {
+        Self {
             manifest,
             file: Mutex::new(file),
             seq: Mutex::new(0),
@@ -108,7 +121,9 @@ impl OnlineSender {
             ack_notify: Arc::new(Notify::new()),
             complete_notify: Arc::new(Notify::new()),
             sent_bytes: Mutex::new(0),
-        })
+            completed: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+        }
     }
 
     pub fn manifest(&self) -> &FileManifest {
@@ -126,7 +141,27 @@ impl OnlineSender {
 
     /// Mark the transfer complete (receiver persisted the file).
     pub fn on_complete(&self) {
-        self.complete_notify.notify_waiters();
+        self.completed.store(true, Ordering::Release);
+        self.complete_notify.notify_one();
+    }
+
+    pub fn is_failed(&self) -> bool { self.failed.load(Ordering::Acquire) }
+
+    pub fn on_failed(&self) {
+        self.failed.store(true, Ordering::Release);
+        self.ack_notify.notify_one();
+        self.complete_notify.notify_one();
+    }
+
+    async fn wait_complete(&self) -> Result<(), String> {
+        tokio::time::timeout(FILE_COMPLETE_TIMEOUT, async {
+            loop {
+                let notified = self.complete_notify.notified();
+                if self.failed.load(Ordering::Acquire) { return Err("receiver failed transfer".into()); }
+                if self.completed.load(Ordering::Acquire) { return Ok(()); }
+                notified.await;
+            }
+        }).await.map_err(|_| "file complete ACK timeout".to_string())?
     }
 
     /// Wait until `acked >= target` or timeout. Returns true if satisfied.
@@ -134,6 +169,7 @@ impl OnlineSender {
         loop {
             let notified = self.ack_notify.notified();
             let acked = self.acked.load(std::sync::atomic::Ordering::Acquire);
+            if self.failed.load(Ordering::Acquire) { return false; }
             if acked >= target {
                 return true;
             }
@@ -157,7 +193,7 @@ impl OnlineSender {
         let transfer_id = self.manifest.id.clone();
 
         // Backpressure is polling-based (see below).
-        let mut seq_guard = self.seq.lock().await;
+        let seq_guard = self.seq.lock().await;
         let mut seq = *seq_guard;
         drop(seq_guard);
 
@@ -246,13 +282,7 @@ impl OnlineSender {
         }
 
         // Wait for the receiver's persistence confirmation.
-        if tokio::time::timeout(FILE_COMPLETE_TIMEOUT, self.complete_notify.notified())
-            .await
-            .is_err()
-        {
-            return Err("file complete ACK timeout".to_string());
-        }
-        Ok(())
+        self.wait_complete().await
     }
 
     /// Send the file via the LiveKit relay: base64 `file-chunk` messages.
@@ -311,13 +341,7 @@ impl OnlineSender {
         if digest != self.manifest.sha256 {
             return Err("sender hash mismatch after relay send".to_string());
         }
-        if tokio::time::timeout(FILE_COMPLETE_TIMEOUT, self.complete_notify.notified())
-            .await
-            .is_err()
-        {
-            return Err("file complete ACK timeout".to_string());
-        }
-        Ok(())
+        self.wait_complete().await
     }
 }
 
@@ -338,15 +362,27 @@ pub struct OnlineReceiver {
     /// opened once and dropped before the final rename.
     file: Mutex<Option<std::fs::File>>,
     complete_notify: Arc<Notify>,
+    gate: Mutex<()>,
+    cancelled: AtomicBool,
+    committed: AtomicBool,
 }
 
 impl OnlineReceiver {
     pub fn new(manifest: FileManifest, target_dir: &Path) -> Result<Self, String> {
-        let file_name = Path::new(&manifest.name)
-            .file_name()
-            .ok_or_else(|| "manifest has no file name".to_string())?;
-        let target_path = target_dir.join(file_name);
+        if manifest.id.len() != 24 || !manifest.id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("invalid transfer id".into());
+        }
+        if manifest.name.is_empty() || manifest.name.contains(['/', '\\', ':']) || matches!(manifest.name.as_str(), "." | "..") {
+            return Err("invalid file name".into());
+        }
+        if u64::from(manifest.chunk_size) != NATIVE_CHUNK_SIZE || u64::from(manifest.total_chunks) != manifest.size.div_ceil(u64::from(NATIVE_CHUNK_SIZE)) {
+            return Err("invalid manifest chunk accounting".into());
+        }
+        std::fs::create_dir_all(target_dir).map_err(|e| format!("create receive directory: {e}"))?;
+        let target_path = target_dir.join(&manifest.name);
         let temp_path = target_dir.join(format!(".{}.part", manifest.id));
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp_path)
+            .map_err(|e| format!("create receive temp: {e}"))?;
         Ok(Self {
             manifest,
             chunks: Mutex::new(HashMap::new()),
@@ -355,8 +391,11 @@ impl OnlineReceiver {
             hasher: Mutex::new(Sha256::new()),
             target_path,
             temp_path,
-            file: Mutex::new(None),
+            file: Mutex::new(Some(file)),
             complete_notify: Arc::new(Notify::new()),
+            gate: Mutex::new(()),
+            cancelled: AtomicBool::new(false),
+            committed: AtomicBool::new(false),
         })
     }
 
@@ -368,17 +407,7 @@ impl OnlineReceiver {
     async fn append_bytes(&self, bytes: &[u8]) -> Result<(), String> {
         use std::io::Write;
         let mut guard = self.file.lock().await;
-        if guard.is_none() {
-            let f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.temp_path)
-                .map_err(|e| format!("open temp file: {e}"))?;
-            *guard = Some(f);
-        }
-        guard
-            .as_mut()
-            .expect("temp file handle just opened")
+        guard.as_mut().ok_or("receive handle closed")?
             .write_all(bytes)
             .map_err(|e| format!("write temp file: {e}"))?;
         Ok(())
@@ -387,6 +416,8 @@ impl OnlineReceiver {
     /// Handle one decoded FLNG batch frame from the P2P DataChannel.
     /// Returns the new `next_seq` (for ACK decisions).
     pub async fn on_p2p_frame(&self, frame_bytes: &[u8]) -> Result<u32, String> {
+        let _gate = self.gate.lock().await;
+        if self.cancelled.load(Ordering::Acquire) || self.committed.load(Ordering::Acquire) { return Err("receive is terminal".into()); }
         let frame = decode_direct_file_frame(frame_bytes)
             .map_err(|e| format!("decode FLNG frame: {e}"))?
             .ok_or_else(|| "not a FLNG frame".to_string())?;
@@ -395,6 +426,9 @@ impl OnlineReceiver {
         }
         let chunk_size = frame.chunk_size.map(u64::from).unwrap_or(u64::from(self.manifest.chunk_size));
         let count = u64::from(frame.chunk_count);
+        if count == 0 || chunk_size != u64::from(self.manifest.chunk_size) || frame.seq != *self.next_seq.lock().await {
+            return Err("FLNG frame is not contiguous or has invalid geometry".into());
+        }
 
         // Validate the whole batch, then append contiguously.
         let mut offset = 0usize;
@@ -434,9 +468,16 @@ impl OnlineReceiver {
 
     /// Handle one base64 `file-chunk` from the relay path.
     pub async fn on_relay_chunk(&self, seq: u32, b64data: &str) -> Result<u32, String> {
+        let _gate = self.gate.lock().await;
+        if self.cancelled.load(Ordering::Acquire) || self.committed.load(Ordering::Acquire) { return Err("receive is terminal".into()); }
+        let next = *self.next_seq.lock().await;
+        if seq < next { return Ok(next); }
+        if seq >= self.manifest.total_chunks || seq.saturating_sub(next) >= SENDER_WINDOW_CHUNKS { return Err("relay sequence outside receive window".into()); }
+        let expected = self.manifest.size.saturating_sub(u64::from(seq) * u64::from(self.manifest.chunk_size)).min(u64::from(self.manifest.chunk_size)) as usize;
         let data = B64
             .decode(b64data)
             .map_err(|e| format!("decode relay chunk: {e}"))?;
+        if data.len() != expected { return Err("relay chunk length mismatch".into()); }
         let mut chunks = self.chunks.lock().await;
         let mut next: u32 = *self.next_seq.lock().await;
         let mut received: u64 = *self.received_bytes.lock().await;
@@ -463,28 +504,55 @@ impl OnlineReceiver {
     /// Check whether the transfer is complete; if so, verify the hash and
     /// move the temp file into place. Returns true when done.
     pub async fn check_complete(&self) -> Result<bool, String> {
+        let _gate = self.gate.lock().await;
+        if self.cancelled.load(Ordering::Acquire) { return Err("receive cancelled".into()); }
+        if self.committed.load(Ordering::Acquire) { return Ok(true); }
         let next = *self.next_seq.lock().await;
         let received = *self.received_bytes.lock().await;
         if next != self.manifest.total_chunks || received != self.manifest.size {
             return Ok(false);
         }
-        let digest = {
-            let hasher = self.hasher.lock().await;
-            format!("{:x}", hasher.clone().finalize())
-        };
-        if digest != self.manifest.sha256 {
-            return Err(format!(
-                "sha256 mismatch after receive (got {digest}, want {})",
-                self.manifest.sha256
-            ));
+        // Durability before integrity check and atomic publication. No final ACK
+        // is possible until this method succeeds. Read back the actual disk file.
+        use std::io::Write;
+        {
+            let mut guard = self.file.lock().await;
+            let file = guard.as_mut().ok_or("receive handle closed")?;
+            file.flush().map_err(|e| format!("flush receive: {e}"))?;
+            file.sync_all().map_err(|e| format!("sync receive: {e}"))?;
+            *guard = None;
         }
-        // Close the persistent temp handle first: Windows refuses to
-        // rename a file that is still open.
-        *self.file.lock().await = None;
-        std::fs::rename(&self.temp_path, &self.target_path)
-            .map_err(|e| format!("move received file into place: {e}"))?;
+        let mut disk = File::open(&self.temp_path).map_err(|e| format!("open for SHA verification: {e}"))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0; 128 * 1024];
+        loop {
+            let n = disk.read(&mut buffer).map_err(|e| format!("verify SHA: {e}"))?;
+            if n == 0 { break; }
+            hasher.update(&buffer[..n]);
+        }
+        drop(disk);
+        let digest = format!("{:x}", hasher.finalize());
+        if digest != self.manifest.sha256 { return Err("sha256 mismatch after receive".into()); }
+        // Same-directory hard-link is atomic and never overwrites an existing file.
+        // Existing names fail explicitly; the owner can rename/remove and retry.
+        std::fs::hard_link(&self.temp_path, &self.target_path)
+            .map_err(|e| format!("atomic no-overwrite commit: {e}"))?;
+        self.committed.store(true, Ordering::Release);
+        let _ = std::fs::remove_file(&self.temp_path);
         self.complete_notify.notify_waiters();
         Ok(true)
+    }
+
+    pub fn target_path(&self) -> &Path { &self.target_path }
+    pub fn is_committed(&self) -> bool { self.committed.load(Ordering::Acquire) }
+
+    pub async fn abort(&self) {
+        let _gate = self.gate.lock().await;
+        if self.committed.load(Ordering::Acquire) { return; }
+        self.cancelled.store(true, Ordering::Release);
+        *self.file.lock().await = None;
+        self.chunks.lock().await.clear();
+        let _ = std::fs::remove_file(&self.temp_path);
     }
 
     pub fn should_ack(&self, last_ack_seq: u32, next_seq: u32) -> bool {
@@ -493,6 +561,13 @@ impl OnlineReceiver {
 
     pub async fn received_bytes(&self) -> u64 {
         *self.received_bytes.lock().await
+    }
+}
+
+impl Drop for OnlineReceiver {
+    fn drop(&mut self) {
+        self.file.get_mut().take();
+        if !self.committed.load(Ordering::Acquire) { let _ = std::fs::remove_file(&self.temp_path); }
     }
 }
 
@@ -512,3 +587,7 @@ pub fn chunk_ack_message(
         failed: None,
     }
 }
+
+#[cfg(test)]
+#[path = "online_transfer_tests.rs"]
+mod tests;

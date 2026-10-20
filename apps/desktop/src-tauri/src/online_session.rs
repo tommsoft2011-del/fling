@@ -7,13 +7,15 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::online_crypto::derive_room_key;
+use crate::online_native::{NativeTask, NativeTaskConfig, NativeTaskStatus};
+use crate::online_source::SourceLease;
 use crate::online_p2p::{default_ice_servers, OnlineP2p};
 use crate::online_proto::{FileKind, FlingMessage};
 use crate::online_room::{OnlineRoom, OnlineRoomEvent};
@@ -85,6 +87,8 @@ enum OnlineUiEvent {
     /// The Rust session does not interpret these; tasks.ts does.
     #[serde(rename = "protocol")]
     Protocol { from: String, message: serde_json::Value },
+    #[serde(rename = "native-task")]
+    NativeTask { status: NativeTaskStatus },
 }
 
 fn emit(app: &AppHandle, session_id: &str, event: OnlineUiEvent) {
@@ -123,6 +127,12 @@ async fn should_emit_peer_progress(
 /// One online session: a LiveKit room plus its transfers.
 pub struct OnlineSession {
     id: String,
+    owner: String,
+    pub native: Option<Arc<NativeTask>>,
+    cancelled: AtomicBool,
+    cancel_notify: tokio::sync::Notify,
+    peer_present: AtomicBool,
+    peer_notify: tokio::sync::Notify,
     app: AppHandle,
     room: Arc<OnlineRoom>,
     senders: Arc<Mutex<HashMap<String, Arc<OnlineSender>>>>,
@@ -148,6 +158,8 @@ impl OnlineSession {
         pairing_code: &str,
         key_context: &str,
         download_dir: PathBuf,
+        owner: String,
+        native_config: Option<NativeTaskConfig>,
     ) -> Result<Arc<Self>, String> {
         let room_key = derive_room_key(pairing_code, key_context);
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -156,6 +168,12 @@ impl OnlineSession {
 
         let session = Arc::new(Self {
             id: id.clone(),
+            owner,
+            native: native_config.map(NativeTask::new).transpose()?.map(Arc::new),
+            cancelled: AtomicBool::new(false),
+            cancel_notify: tokio::sync::Notify::new(),
+            peer_present: AtomicBool::new(false),
+            peer_notify: tokio::sync::Notify::new(),
             app: app.clone(),
             room,
             senders: Arc::new(Mutex::new(HashMap::new())),
@@ -176,6 +194,7 @@ impl OnlineSession {
                     // Log and continue; a single bad message must not kill
                     // the session.
                     eprintln!("fling online session {}: {}", session_cb.id, e);
+                    if session_cb.native.is_some() { let _ = session_cb.cancel_native(Some(e), true).await; }
                 }
             }
         });
@@ -190,10 +209,12 @@ impl OnlineSession {
         Ok(session)
     }
 
-    async fn handle_room_event(&self, event: OnlineRoomEvent) -> Result<(), String> {
+    async fn handle_room_event(self: &Arc<Self>, event: OnlineRoomEvent) -> Result<(), String> {
         match event {
             OnlineRoomEvent::Message { from, msg } => self.handle_message(from, msg).await,
             OnlineRoomEvent::PeerJoined(identity) => {
+                self.peer_present.store(true, Ordering::Release);
+                self.peer_notify.notify_one();
                 emit(
                     &self.app,
                     &self.id,
@@ -202,6 +223,15 @@ impl OnlineSession {
                 Ok(())
             }
             OnlineRoomEvent::PeerLeft(identity) => {
+                self.peer_present.store(false, Ordering::Release);
+                if let Some(native) = &self.native {
+                    if !native.status.lock().await.terminal() { self.cancel_native(Some("对方断开连接".into()), false).await?; }
+                    self.receivers.lock().await.clear();
+                    if let Some(p2p) = self.p2p.lock().await.as_ref() { p2p.close(); }
+                    self.app.state::<OnlineSessionRegistry>().remove(&self.id).await;
+                    let room = self.room.clone();
+                    tokio::spawn(async move { let _ = room.disconnect().await; });
+                }
                 emit(
                     &self.app,
                     &self.id,
@@ -210,6 +240,7 @@ impl OnlineSession {
                 Ok(())
             }
             OnlineRoomEvent::Disconnected { reason } => {
+                if self.native.is_some() { self.cancel_native(Some(reason.clone()), false).await?; }
                 emit(&self.app, &self.id, OnlineUiEvent::Disconnected { reason });
                 Ok(())
             }
@@ -220,7 +251,7 @@ impl OnlineSession {
         }
     }
 
-    async fn handle_message(&self, from: String, msg: FlingMessage) -> Result<(), String> {
+    async fn handle_message(self: &Arc<Self>, from: String, msg: FlingMessage) -> Result<(), String> {
         // Transfer data-plane messages are handled internally by the Rust
         // engine. Task-level signaling is forwarded to the frontend
         // orchestrator (tasks.ts) via the `protocol` UI event.
@@ -253,9 +284,12 @@ impl OnlineSession {
             FlingMessage::FileManifest { manifest } => {
                 self.on_file_manifest(manifest).await?;
             }
-            FlingMessage::FileManifestAck { id, .. } => {
+            FlingMessage::FileManifestAck { id, native_single_file, .. } => {
+                if self.native.is_some() && native_single_file != Some(true) {
+                    if let Some(sender) = self.senders.lock().await.get(&id) { sender.on_failed(); }
+                }
                 if let Some(notify) = self.manifest_acks.lock().await.get(&id) {
-                    notify.notify_waiters();
+                    notify.notify_one();
                 }
             }
             FlingMessage::FileChunk { id, seq, data } => {
@@ -269,15 +303,14 @@ impl OnlineSession {
                 failed,
                 ..
             } => {
-                if failed == Some(true) {
-                    return Err(format!("receiver failed transfer {id}"));
-                }
                 if let Some(sender) = self.senders.lock().await.get(&id).cloned() {
+                    if failed == Some(true) { sender.on_failed(); return Err(format!("receiver failed transfer {id}")); }
                     sender.on_chunk_ack(next_seq);
                     let is_complete = complete == Some(true);
-                    if is_complete {
-                        sender.on_complete();
+                    if is_complete && (next_seq != sender.manifest().total_chunks || received_bytes != sender.manifest().size) {
+                        sender.on_failed(); return Err("invalid final ACK accounting".into());
                     }
+                    if is_complete { sender.on_complete(); }
                     let total_bytes = sender.manifest().size;
                     let received_bytes = received_bytes.min(total_bytes);
                     if should_emit_peer_progress(
@@ -288,6 +321,14 @@ impl OnlineSession {
                     )
                     .await
                     {
+                    if let Some(native) = &self.native {
+                        let mut status = native.status.lock().await;
+                        if !status.terminal() {
+                            status.peer_bytes = status.peer_bytes.max(received_bytes.min(status.total_bytes));
+                            if is_complete { status.saved_bytes = status.total_bytes; }
+                            emit(&self.app, &self.id, OnlineUiEvent::NativeTask { status: status.clone() });
+                        }
+                    }
                         emit(
                             &self.app,
                             &self.id,
@@ -313,9 +354,31 @@ impl OnlineSession {
                 self.on_p2p_ice(candidate).await?;
             }
             FlingMessage::TaskAck { task_id } => {
-                // Receiver confirmed persistence; complete any sender
-                // waiting on this task.
-                let _ = task_id;
+                if let Some(native) = &self.native {
+                    let status = native.status.lock().await;
+                    if status.task_id == task_id && status.direction == "sending" {
+                        native.task_acked.store(true, Ordering::Release);
+                        native.ack.notify_one();
+                    }
+                }
+            }
+            FlingMessage::TaskCancel { task_id } => {
+                if let Some(native) = &self.native {
+                    let matches = native.status.lock().await.task_id == task_id;
+                    if matches { self.cancel_native(None, false).await?; }
+                }
+            }
+            FlingMessage::TaskDone { task_id } => {
+                if let Some(native) = &self.native {
+                    let status = native.status.lock().await;
+                    if status.task_id == task_id && status.direction == "receiving" && status.stage == "done" {
+                        self.room.send(&FlingMessage::TaskAck { task_id }).await?;
+                    }
+                }
+            }
+            FlingMessage::Hello { .. } => {
+                self.peer_present.store(true, Ordering::Release);
+                self.peer_notify.notify_one();
             }
             _ => {}
         }
@@ -328,6 +391,14 @@ impl OnlineSession {
         &self,
         manifest: crate::online_proto::FileManifest,
     ) -> Result<(), String> {
+        if self.cancelled.load(Ordering::Acquire) { return Err("session cancelled".into()); }
+        if let Some(native) = &self.native {
+            let status = native.status.lock().await;
+            if status.direction != "receiving" || status.name != manifest.name || status.total_bytes != manifest.size || manifest.kind != FileKind::File {
+                return Err("manifest does not match accepted single-file offer".into());
+            }
+            if native.claimed.swap(true, Ordering::AcqRel) { return Err("single-file task already has a manifest".into()); }
+        }
         let id = manifest.id.clone();
         // Notify the frontend so it can create the transferId -> item mapping
         // for progress display. The manifest kind is an enum; convert to string.
@@ -352,12 +423,16 @@ impl OnlineSession {
         // direct frames (matching the v0.6.6 LAN engine).
         self.room
             .send(&FlingMessage::FileManifestAck {
-                id,
+                id: id.clone(),
+                native_single_file: self.native.as_ref().map(|_| true),
                 chunk_ack: Some(true),
                 binary_chunks: Some(true),
                 direct_frame_payload_bytes: Some(128 * 1024),
             })
-            .await
+            .await?;
+        let receiver = self.receivers.lock().await.get(&id).cloned().ok_or("receiver missing")?;
+        if receiver.manifest().size == 0 { self.maybe_ack(&receiver, 0).await?; }
+        Ok(())
     }
 
     /// Receiver: a relay chunk arrived.
@@ -374,63 +449,89 @@ impl OnlineSession {
         Ok(())
     }
 
-    /// Send a cumulative `file-chunk-ack` when due, and finalize on complete.
-    async fn maybe_ack(
-        &self,
-        receiver: &Arc<OnlineReceiver>,
-        next_seq: u32,
-    ) -> Result<(), String> {
+    /// Final ACKs are published only after flush, sync_all, disk SHA and
+    /// atomic no-overwrite publication. A failed publish is retried, never
+    /// silently converted into a successful task snapshot.
+    async fn maybe_ack(&self, receiver: &Arc<OnlineReceiver>, next_seq: u32) -> Result<(), String> {
         let id = receiver.manifest().id.clone();
-        let last_ack = *self.receiver_last_ack.lock().await.get(&id).unwrap_or(&0);
         let received_bytes = receiver.received_bytes().await;
-        let complete = receiver.check_complete().await?;
-        if complete || receiver.should_ack(last_ack, next_seq) {
-            self.receiver_last_ack.lock().await.insert(id.clone(), next_seq);
-            self.room
-                .send(&chunk_ack_message(receiver, next_seq, received_bytes, complete))
-                .await?;
-            if complete {
-                let _ = should_emit_peer_progress(
-                    &self.peer_progress_ui,
-                    &id,
-                    received_bytes,
-                    true,
-                )
-                .await;
-                emit(
-                    &self.app,
-                    &self.id,
-                    OnlineUiEvent::TransferDone {
-                        transfer_id: id,
-                        ok: true,
-                        error: None,
-                    },
-                );
-            } else {
-                emit(
-                    &self.app,
-                    &self.id,
-                    OnlineUiEvent::Progress {
-                        transfer_id: id,
-                        sent_bytes: received_bytes,
-                        total_bytes: receiver.manifest().size,
-                        direction: "receiving".to_string(),
-                    },
-                );
+        if self.cancelled.load(Ordering::Acquire) { receiver.abort().await; return Err("session cancelled".into()); }
+        if self.native.is_some() && received_bytes == receiver.manifest().size { self.native_stage("finalizing").await; }
+        let complete = match receiver.check_complete().await {
+            Ok(complete) => complete,
+            Err(error) => { self.fail_receive(receiver, &error).await; return Err(error); }
+        };
+        let due = should_emit_peer_progress(&self.peer_progress_ui, &id, received_bytes, complete).await;
+        if !complete {
+            if let Some(native) = &self.native {
+                let mut status = native.status.lock().await;
+                if !status.terminal() {
+                    status.local_bytes = received_bytes;
+                    status.stage = "transferring".into();
+                    if due { emit(&self.app, &self.id, OnlineUiEvent::NativeTask { status: status.clone() }); }
+                }
             }
         }
+        let last_ack = *self.receiver_last_ack.lock().await.get(&id).unwrap_or(&0);
+        if complete {
+            let mut published = false;
+            let mut publish_error = String::new();
+            for attempt in 0..3 {
+                let result = async {
+                    self.room.send(&chunk_ack_message(receiver, next_seq, received_bytes, true)).await?;
+                    if let Some(native) = &self.native {
+                        let task_id = native.status.lock().await.task_id.clone();
+                        self.room.send(&FlingMessage::TaskAck { task_id }).await?;
+                    }
+                    Ok::<(), String>(())
+                }.await;
+                match result { Ok(()) => { published = true; break; }, Err(error) => { publish_error = error; } }
+                if attempt < 2 { tokio::time::sleep(Duration::from_millis(500)).await; }
+            }
+            if !published {
+                if let Some(native) = &self.native {
+                    let mut status = native.status.lock().await;
+                    if !status.terminal() {
+                        status.stage = "error".into(); status.saved_path = Some(receiver.target_path().to_string_lossy().into_owned());
+                        status.error = Some(format!("文件已保存，但最终确认发送失败：{publish_error}"));
+                        emit(&self.app, &self.id, OnlineUiEvent::NativeTask { status: status.clone() });
+                    }
+                }
+                return Err(publish_error);
+            }
+            if let Some(native) = &self.native {
+                let mut status = native.status.lock().await;
+                if !status.terminal() {
+                    status.local_bytes = received_bytes; status.saved_bytes = received_bytes;
+                    status.sha256 = Some(receiver.manifest().sha256.clone());
+                    status.saved_path = Some(receiver.target_path().to_string_lossy().into_owned());
+                    status.stage = "done".into();
+                    emit(&self.app, &self.id, OnlineUiEvent::NativeTask { status: status.clone() });
+                }
+                // Retain committed metadata for idempotent final ACK replay.
+                // It is released on peer departure/disconnect, not by the UI.
+            } else { self.receivers.lock().await.remove(&id); }
+            emit(&self.app, &self.id, OnlineUiEvent::TransferDone { transfer_id: id.clone(), ok: true, error: None });
+        } else if receiver.should_ack(last_ack, next_seq) {
+            self.room.send(&chunk_ack_message(receiver, next_seq, received_bytes, false)).await?;
+            if due { emit(&self.app, &self.id, OnlineUiEvent::Progress { transfer_id: id.clone(), sent_bytes: received_bytes, total_bytes: receiver.manifest().size, direction: "receiving".into() }); }
+        }
+        self.receiver_last_ack.lock().await.insert(id, next_seq);
         Ok(())
     }
 
     /// Receiver: a P2P offer arrived. Become the responder.
-    async fn on_p2p_offer(&self, sdp: String) -> Result<(), String> {
+    async fn on_p2p_offer(self: &Arc<Self>, sdp: String) -> Result<(), String> {
+        if self.cancelled.load(Ordering::Acquire) { return Err("session cancelled".into()); }
+        if self.native.is_some() { self.native_stage("connecting").await; }
         let t0 = std::time::Instant::now();
         emit(&self.app, &self.id, OnlineUiEvent::P2pLog {
             message: format!("on_p2p_offer: received offer sdp_len={}", sdp.len()),
         });
         // TODO: read TURN config; for now use STUN defaults.
         let ice_servers = default_ice_servers(None, None, None);
-        let (p2p, ice_rx, answer_sdp) = OnlineP2p::accept_offer(ice_servers, &sdp).await.map_err(|e| {
+        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (p2p, ice_rx, answer_sdp) = OnlineP2p::accept_offer(ice_servers, &sdp, frame_tx).await.map_err(|e| {
             emit(&self.app, &self.id, OnlineUiEvent::P2pLog {
                 message: format!("on_p2p_offer: accept_offer FAILED: {}", e),
             });
@@ -464,16 +565,13 @@ impl OnlineSession {
         let app = self.app.clone();
         let room = self.room.clone();
         // We need &self in the async pump; clone the Arcs we need.
+        let session = self.clone();
         let receivers = self.receivers.clone();
-        let receiver_last_ack = self.receiver_last_ack.clone();
-        let peer_progress_ui = self.peer_progress_ui.clone();
         tokio::spawn(async move {
             // Register the message handler BEFORE wait_open(): libwebrtc drops
             // messages received before on_message is set, so the handler must
             // be attached as soon as the DataChannel is created (via
             // on_data_channel), not after it opens.
-            let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-            p2p.set_message_handler(frame_tx);
             let wait_t0 = std::time::Instant::now();
             match p2p.wait_open().await {
                 Ok(_dc) => {
@@ -534,6 +632,10 @@ impl OnlineSession {
                                 continue;
                             }
                         };
+                        if receiver.is_committed() {
+                            let _ = session.maybe_ack(&receiver, receiver.manifest().total_chunks).await;
+                            continue;
+                        }
                         let next_seq = match receiver.on_p2p_frame(&frame_bytes).await {
                             Ok(n) => n,
                             Err(e) => {
@@ -542,69 +644,12 @@ impl OnlineSession {
                                         "responder: dropped frame #{frame_count}: on_p2p_frame failed: {e}"
                                     ),
                                 });
-                                eprintln!("fling online P2P frame error: {e}");
+                                session.fail_receive(&receiver, &e).await;
                                 continue;
                             }
                         };
-                        // ACK + finalize, mirroring maybe_ack.
-                        let last_ack =
-                            *receiver_last_ack.lock().await.get(&id).unwrap_or(&0);
-                        let received_bytes = receiver.received_bytes().await;
-                        let complete = match receiver.check_complete().await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                eprintln!("fling online receive finalize error: {e}");
-                                continue;
-                            }
-                        };
-                        if complete || receiver.should_ack(last_ack, next_seq) {
-                            receiver_last_ack.lock().await.insert(id.clone(), next_seq);
-                            let _ = room
-                                .send(&crate::online_transfer::chunk_ack_message(
-                                    &receiver,
-                                    next_seq,
-                                    received_bytes,
-                                    complete,
-                                ))
-                                .await;
-                            if complete {
-                                let _ = should_emit_peer_progress(
-                                    &peer_progress_ui,
-                                    &id,
-                                    received_bytes,
-                                    true,
-                                )
-                                .await;
-                                let _ = app.emit(
-                                    "fling://online/event",
-                                    serde_json::json!({
-                                        "session": session_id,
-                                        "event": {
-                                            "kind": "transfer-done",
-                                            "transfer_id": id,
-                                            "ok": true,
-                                        },
-                                    }),
-                                );
-                            } else if should_emit_peer_progress(
-                                &peer_progress_ui,
-                                &id,
-                                received_bytes,
-                                false,
-                            )
-                            .await
-                            {
-                                emit(
-                                    &app,
-                                    &session_id,
-                                    OnlineUiEvent::Progress {
-                                        transfer_id: id,
-                                        sent_bytes: received_bytes,
-                                        total_bytes: receiver.manifest().size,
-                                        direction: "receiving".to_string(),
-                                    },
-                                );
-                            }
+                        if let Err(error) = session.maybe_ack(&receiver, next_seq).await {
+                            emit(&app, &session_id, OnlineUiEvent::P2pLog { message: format!("receive failed: {error}") });
                         }
                     }
                     let _ = room;
@@ -640,6 +685,12 @@ impl OnlineSession {
         kind: FileKind,
     ) -> Result<String, String> {
         let manifest = build_manifest(path, name, kind)?;
+        let sender = Arc::new(OnlineSender::new(manifest, path)?);
+        self.send_prepared(sender).await
+    }
+
+    async fn send_prepared(self: &Arc<Self>, sender: Arc<OnlineSender>) -> Result<String, String> {
+        let manifest = sender.manifest();
         let transfer_id = manifest.id.clone();
         emit(
             &self.app,
@@ -649,7 +700,6 @@ impl OnlineSession {
                 total_bytes: manifest.size,
             },
         );
-        let sender = Arc::new(OnlineSender::new(manifest, path)?);
         self.senders
             .lock()
             .await
@@ -675,7 +725,9 @@ impl OnlineSession {
             return Err("file manifest ACK timeout".to_string());
         }
         self.manifest_acks.lock().await.remove(&transfer_id);
+        if sender.is_failed() { return Err("对方不支持 0.6.29 原生单文件确认，请两端使用此测试版本".into()); }
 
+        if self.native.is_some() { self.native_stage("connecting").await; }
         // 2. P2P attempt (initiator).
         let ice_servers = default_ice_servers(None, None, None);
         let p2p_t0 = std::time::Instant::now();
@@ -735,7 +787,22 @@ impl OnlineSession {
         let app = self.app.clone();
         let session_id = self.id.clone();
         let tid = transfer_id.clone();
+        let native = self.native.clone();
+        let last_native_emit = std::sync::Mutex::new(Instant::now() - Duration::from_secs(1));
         let on_progress = move |sent: u64, total: u64| {
+            if let Some(native) = &native {
+                if let Ok(mut status) = native.status.try_lock() {
+                    if !status.terminal() {
+                        status.local_bytes = sent;
+                        status.stage = if sent == total { "finalizing" } else { "transferring" }.into();
+                        let mut last = last_native_emit.lock().unwrap();
+                        if last.elapsed() >= Duration::from_millis(300) || sent == total {
+                            *last = Instant::now();
+                            emit(&app, &session_id, OnlineUiEvent::NativeTask { status: status.clone() });
+                        }
+                    }
+                }
+            }
             emit(
                 &app,
                 &session_id,
@@ -762,6 +829,8 @@ impl OnlineSession {
                     on_progress,
                 )
                 .await
+        } else if self.native.is_some() {
+            Err("未能建立直连；原生单文件测试路径不会静默改走 Blob 或中继，请重试".into())
         } else {
             // Relay path: base64 chunks over LiveKit. The engine emits
             // (seq, b64) pairs into a channel; a forwarder publishes them.
@@ -827,6 +896,117 @@ impl OnlineSession {
         result.map(|_| transfer_id)
     }
 
+    pub fn authorize(&self, owner: &str) -> Result<(), String> {
+        if self.owner != owner { return Err("online session unauthorized".into()); }
+        Ok(())
+    }
+
+    pub async fn native_stage(&self, stage: &str) {
+        if let Some(native) = &self.native {
+            let mut status = native.status.lock().await;
+            if !status.terminal() {
+                status.stage = stage.into();
+                emit(&self.app, &self.id, OnlineUiEvent::NativeTask { status: status.clone() });
+            }
+        }
+    }
+
+    async fn fail_receive(&self, receiver: &Arc<OnlineReceiver>, error: &str) {
+        receiver.abort().await;
+        let id = receiver.manifest().id.clone();
+        let _ = self.room.send(&FlingMessage::FileChunkAck { id: id.clone(), next_seq: 0, received_bytes: 0, ack_id: None, complete: None, failed: Some(true) }).await;
+        self.receivers.lock().await.remove(&id);
+        self.receiver_last_ack.lock().await.remove(&id);
+        if let Some(native) = &self.native {
+            let mut status = native.status.lock().await;
+            if !status.terminal() { status.stage = "error".into(); status.error = Some(error.into()); emit(&self.app, &self.id, OnlineUiEvent::NativeTask { status: status.clone() }); }
+        }
+        emit(&self.app, &self.id, OnlineUiEvent::TransferDone { transfer_id: id, ok: false, error: Some(error.into()) });
+    }
+
+    pub async fn send_source(self: &Arc<Self>, lease: SourceLease) -> Result<NativeTaskStatus, String> {
+        let native = self.native.as_ref().ok_or("not a native single-file task")?;
+        {
+            let status = native.status.lock().await;
+            if status.direction != "sending" || status.name != lease.metadata.name || status.total_bytes != lease.metadata.size { return Err("source does not match task".into()); }
+        }
+        if native.claimed.swap(true, Ordering::AcqRel) { return Err("native task already started".into()); }
+        let result = async {
+            tokio::time::timeout(Duration::from_secs(300), async {
+                loop {
+                    let notified = self.peer_notify.notified();
+                    if self.peer_present.load(Ordering::Acquire) { break; }
+                    if self.cancelled.load(Ordering::Acquire) { return Err("已取消".to_string()); }
+                    tokio::select! { _ = notified => {}, _ = self.cancel_notify.notified() => return Err("已取消".to_string()) }
+                }
+                Ok(())
+            }).await.map_err(|_| "等待对方加入超时".to_string())??;
+            self.native_stage("preparing").await;
+            let cancel = native.source_cancelled.clone();
+            let (manifest, file) = tokio::task::spawn_blocking(move || {
+                let mut file = lease.file;
+                let manifest = crate::online_transfer::build_manifest_handle(&mut file, lease.metadata.name, FileKind::File, &cancel)?;
+                Ok::<_, String>((manifest, file))
+            }).await.map_err(|e| format!("hash worker failed: {e}"))??;
+            {
+                let mut status = native.status.lock().await;
+                if manifest.size != status.total_bytes { return Err("文件大小已改变，请重新选择".into()); }
+                status.sha256 = Some(manifest.sha256.clone());
+            }
+            if self.cancelled.load(Ordering::Acquire) { return Err("已取消".into()); }
+            let sender = Arc::new(OnlineSender::from_handle(manifest, file));
+            tokio::select! {
+                result = self.send_prepared(sender) => { result?; }
+                _ = self.cancel_notify.notified() => { return Err("已取消".into()); }
+            }
+            self.room.send(&FlingMessage::TaskDone { task_id: native.status.lock().await.task_id.clone() }).await?;
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let notified = native.ack.notified();
+                    if native.task_acked.load(Ordering::Acquire) { return Ok(()); }
+                    if self.cancelled.load(Ordering::Acquire) { return Err("已取消".to_string()); }
+                    tokio::select! { _ = notified => {}, _ = self.cancel_notify.notified() => return Err("已取消".to_string()) }
+                }
+            }).await.map_err(|_| "最终任务确认超时".to_string())??;
+            Ok::<(), String>(())
+        }.await;
+        self.senders.lock().await.clear();
+        self.manifest_acks.lock().await.clear();
+        self.peer_progress_ui.lock().await.clear();
+        let mut status = native.status.lock().await;
+        if !status.terminal() {
+            match result {
+                Ok(()) => { status.stage = "done".into(); status.local_bytes = status.total_bytes; status.peer_bytes = status.total_bytes; status.saved_bytes = status.total_bytes; }
+                Err(error) => { status.stage = if self.cancelled.load(Ordering::Acquire) { "cancelled" } else { "error" }.into(); status.error = Some(error); }
+            }
+        }
+        emit(&self.app, &self.id, OnlineUiEvent::NativeTask { status: status.clone() });
+        Ok(status.clone())
+    }
+
+    pub async fn cancel_native(&self, error: Option<String>, notify_peer: bool) -> Result<(), String> {
+        if let Some(native) = &self.native {
+            if native.status.lock().await.terminal() { return Ok(()); }
+            native.cancel_source();
+        }
+        self.cancelled.store(true, Ordering::Release);
+        self.cancel_notify.notify_one();
+        let receivers: Vec<_> = self.receivers.lock().await.drain().map(|(_, receiver)| receiver).collect();
+        for receiver in receivers { receiver.abort().await; }
+        for sender in self.senders.lock().await.values() { sender.on_failed(); }
+        if let Some(p2p) = self.p2p.lock().await.as_ref() { p2p.close(); }
+        if let Some(native) = &self.native {
+            let mut status = native.status.lock().await;
+            if !status.terminal() {
+                status.stage = if error.is_some() { "error" } else { "cancelled" }.into();
+                status.error = error;
+                emit(&self.app, &self.id, OnlineUiEvent::NativeTask { status: status.clone() });
+            }
+            if notify_peer { self.room.send(&FlingMessage::TaskCancel { task_id: status.task_id.clone() }).await?; }
+        }
+        Ok(())
+    }
+
     pub async fn send_text(&self, text: String) -> Result<(), String> {
         let id = format!("{:x}", rand::random::<u64>());
         self.room.send(&FlingMessage::Text { id, text }).await
@@ -839,6 +1019,7 @@ impl OnlineSession {
     }
 
     pub async fn disconnect(&self) -> Result<(), String> {
+        self.cancel_native(None, false).await?;
         if let Some(p2p) = self.p2p.lock().await.as_ref() {
             p2p.close();
         }

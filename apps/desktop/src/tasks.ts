@@ -41,7 +41,7 @@ import { P2PLink, type P2PState } from './p2p.js';
 import { mergePeerProgress } from './peer-progress.js';
 import { log, flushLogs, type LogTag } from './log.js';
 import { notifyTaskDone } from './notify.js';
-import type { RustFlingRoom } from './online-rust.js';
+import type { RustFlingRoom, NativeTaskStatus } from './online-rust.js';
 
 export type ItemKind = 'text' | 'file' | 'clipboard-image';
 
@@ -217,6 +217,8 @@ export interface ComposeItem {
   folder?: string;
   /** Tauri 下文件的绝对路径（懒加载：发送时才读文件内容，避免大文件夹提前占内存） */
   filePath?: string;
+  /** Native picker capability; no path/Blob/bytes are exposed to the WebView. */
+  sourceId?: string;
 }
 
 export type SendTarget =
@@ -282,6 +284,8 @@ export type SendPhase = 'preparing' | 'waiting' | 'sending' | 'done' | 'error' |
 export class SendTask {
   readonly taskId = uid('task');
   phase: SendPhase = 'preparing';
+  nativeStage?: string;
+  get nativeSingleFile(): boolean { return this.source.length === 1 && !!this.source[0]?.sourceId; }
   items: ItemState[];
   startedAt = Date.now();
   endedAt?: number;
@@ -507,6 +511,32 @@ export class SendTask {
     }
   }
 
+  private applyNativeStatus(status: NativeTaskStatus): void {
+    if (status.taskId !== this.taskId) return;
+    this.nativeStage = status.stage;
+    const item = this.items[0];
+    item.doneBytes = status.localBytes;
+    item.sha256 = status.sha256;
+    item.saveBytes = status.savedBytes;
+    item.status = status.stage === 'done' ? 'done' : ['error', 'cancelled'].includes(status.stage) ? 'error' : 'active';
+    item.error = status.error;
+    if (status.peerBytes > this.peerDoneBytes) {
+      const now = Date.now();
+      if (this.lastPeerSpeedAt > 0 && now > this.lastPeerSpeedAt) this.peerSpeedBps = (status.peerBytes - this.peerDoneBytes) * 1000 / (now - this.lastPeerSpeedAt);
+      this.lastPeerSpeedAt = now;
+      this.lastPeerProgressAt = now;
+    }
+    this.peerDoneBytes = status.peerBytes;
+    this.peerSavedBytes = status.peerBytes; // cumulative append ACK, not durable completion
+    this.peerTotalBytes = status.totalBytes;
+    this.phase = status.stage === 'done' ? 'done' : status.stage === 'error' ? 'error' : status.stage === 'cancelled' ? 'cancelled' : status.stage === 'waiting' ? 'waiting' : status.stage === 'preparing' ? 'preparing' : 'sending';
+    this.currentFileFinalizing = status.stage === 'finalizing';
+    this.error = status.error;
+    if (!this.active) this.endedAt = Date.now();
+    this.trackSpeed(status.localBytes);
+    this.notify();
+  }
+
   async run(): Promise<void> {
     try {
       const taskRoom = newTaskRoomName();
@@ -524,6 +554,7 @@ export class SendTask {
         fromDeviceId: getDeviceId(),
         taskRoom,
         taskKey,
+        nativeSingleFile: this.nativeSingleFile || undefined,
         // LiveKit 单包 64KB 上限：文件多了 items 必须截断（1232 个文件时曾报
         // "cannot publish data packet larger than 64000 bytes"），只保留前 30 个做预览；
         // 缺的条目由 manifest 到达时补建，totalFileItems 单独统计文件 manifest 数。
@@ -534,11 +565,16 @@ export class SendTask {
       };
 
       // 1. 建任务房间（发送方先进）
-      const spec =
+      const spec: import('./net.js').RoomSpec =
         this.target.type === 'nearby'
           ? nearbyTaskSpecWithRoom(taskRoom, taskKey)
           : { roomName: taskRoom, keyMaterial: normalizeCode(this.target.code), keyContext: KEY_CTX.room };
+      if (this.nativeSingleFile) {
+        const source = this.source[0]!;
+        spec.nativeTask = { taskId: this.taskId, direction: 'sending', name: source.name, size: source.size };
+      }
       this.room = await connectFlingRoom(spec, {
+        onNativeTask: (status) => this.applyNativeStatus(status),
         onPeerJoined: () => this.onPeer(),
         onPeerLeft: () => {
           // 接收方离开：ack 可能还在路上，给 3 秒宽限期，超时才判失败
@@ -677,13 +713,14 @@ export class SendTask {
             this.p2p = nextP2p as typeof this.p2p;
             this.notify();
           }
+          if (this.nativeSingleFile) this.items[0]!.transport = route;
           if (this.currentSendingItem) {
             this.currentSendingItem.transport = mergeTransport(this.currentSendingItem.transport, route);
           }
         },
         onLog: (tag, msg) => log(tag as LogTag, `[room] ${msg}`),
       });
-      if (this.cancelled) return;
+      if (this.cancelled) { await this.room.cancelNative().catch(() => {}); this.closeRooms(); return; }
 
       // 2. 投递 offer
       this.phase = 'waiting';
@@ -694,6 +731,17 @@ export class SendTask {
         await this.announceInLobby(offer, this.target.code);
       }
       if (this.cancelled) return;
+
+      if (this.nativeSingleFile) {
+        // A single high-level command. Rust waits for the peer, hashes the
+        // retained handle, connects P2P, transfers and owns both final ACKs.
+        const status = await this.room.sendNativeSource(this.source[0]!.sourceId!);
+        this.applyNativeStatus(status);
+        this.stopAnnounce();
+        await this.archive();
+        this.closeRooms();
+        return;
+      }
 
       // 3. 等对方加入（5 分钟超时）
       await new Promise<void>((resolve, reject) => {
@@ -1281,6 +1329,13 @@ export class SendTask {
         }
       } catch { /* 尽力 */ }
     };
+    if (this.nativeSingleFile && this.room) {
+      const room = this.room;
+      // Offer delivery/withdrawal is a high-level action; task terminal state
+      // still comes from Rust, including cancellation while waiting for a peer.
+      void Promise.all([room.cancelNative().catch((error) => log('task', 'native cancel failed', { error: errText(error) })), withdraw()]);
+      return;
+    }
     void withdraw().finally(() => {
       this.phase = 'cancelled';
       this.endedAt = Date.now();
@@ -1365,6 +1420,7 @@ export interface PendingOffer {
 export class RecvTask {
   readonly taskId: string;
   phase: RecvPhase = 'receiving';
+  nativeStage?: string;
   items: ItemState[];
   startedAt = Date.now();
   endedAt?: number;
@@ -1496,6 +1552,28 @@ export class RecvTask {
     }
   }
 
+  private applyNativeStatus(status: NativeTaskStatus): void {
+    if (status.taskId !== this.taskId || !this.offer.nativeSingleFile) return;
+    this.nativeStage = status.stage;
+    const item = this.items[0]!;
+    item.doneBytes = status.localBytes;
+    item.saveBytes = status.stage === 'done' ? status.totalBytes : status.localBytes;
+    item.savedPath = status.savedPath;
+    item.sha256 = status.sha256;
+    item.status = status.stage === 'done' ? 'done' : ['error', 'cancelled'].includes(status.stage) ? 'error' : 'active';
+    item.error = status.error;
+    this.phase = status.stage === 'done' ? 'done' : status.stage === 'error' ? 'error' : status.stage === 'cancelled' ? 'cancelled' : 'receiving';
+    this.error = status.error;
+    this.trackSpeed();
+    this.notify();
+    if (!this.active && !this.finished) {
+      this.finished = true;
+      this.endedAt = Date.now();
+      void this.archive();
+      // Do not close here: Rust still owns the final file/task ACK handshake.
+    }
+  }
+
   async run(): Promise<void> {
     try {
       this.savedDir = await manager.getDownloadDir();
@@ -1505,10 +1583,26 @@ export class RecvTask {
         via: this.via,
         items: this.items.map((i) => ({ kind: i.kind, name: i.name, size: i.size })),
       });
-      const spec =
+      const spec: import('./net.js').RoomSpec =
         this.via === 'nearby'
           ? nearbyTaskSpecWithRoom(this.offer.taskRoom, this.offer.taskKey)
           : remoteTaskSpecWithRoom(this.offer.taskRoom, this.code ?? '');
+      if (this.offer.nativeSingleFile) {
+        const item = this.offer.items[0];
+        if (this.offer.items.length !== 1 || item?.kind !== 'file') throw new Error('原生路径仅支持一个普通文件');
+        spec.nativeTask = { taskId: this.taskId, direction: 'receiving', name: item.name, size: item.size };
+        this.nativeStage = 'waiting';
+        this.room = await connectFlingRoom(spec, {
+          onNativeTask: (status) => this.applyNativeStatus(status),
+          onFileRoute: (route) => { this.p2p = route === 'p2p' ? 'open' : 'failed'; this.items[0]!.transport = route; this.notify(); },
+          onLog: (tag, msg) => log(tag as LogTag, `[native] ${msg}`),
+        });
+        if (this.cancelled) {
+          try { await this.room.cancelNative(); } finally { await this.closeRoom(); }
+        }
+        this.notify();
+        return;
+      }
       this.room = await connectFlingRoom(spec, {
         onText: (t) => this.onTextPart(t),
         onFileManifest: (m) => this.onManifest(m),
@@ -2011,6 +2105,12 @@ export class RecvTask {
     if (!this.active) return;
     log('task', 'receiver cancellation requested', { taskId: this.taskId, phase: this.phase, receivedBytes: this.items.reduce((sum, item) => sum + item.doneBytes, 0), savedBytes: this.items.reduce((sum, item) => sum + (item.saveBytes ?? 0), 0) });
     this.cancelled = true;
+    if (this.offer.nativeSingleFile) {
+      const room = this.room;
+      if (room) { try { await room.cancelNative(); } finally { await this.closeRoom(); } }
+      // If connect is pending, run() receives this.cancelled and owns teardown.
+      return;
+    }
     // 先告诉发送方"我取消了"再拆连接；flush 保证取消信令发出去，
     // 否则发送方等 ack 超时（以前还会误标"成功"）。
     try {

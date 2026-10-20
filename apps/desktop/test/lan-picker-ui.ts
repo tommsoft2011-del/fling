@@ -36,7 +36,11 @@ class Element {
   focus(options?: { preventScroll?: boolean }): void { this.preventedFocusScroll = options?.preventScroll ?? false; dom.activeElement = this; }
   click(): void { this.lastActivation = this.onclick?.(); }
 }
-const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+// The dedicated LAN page is retired in the production shell. Keep its
+// legacy controller regression against a frozen historical DOM, not production UI.
+const productionHtml = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+assert.doesNotMatch(productionHtml, /id="lanPickSource"/);
+const html = readFileSync(new URL('./fixtures/legacy-lan.html', import.meta.url), 'utf8');
 const stylesheet = readFileSync(new URL('../src/style.css', import.meta.url), 'utf8');
 const feedback = html.match(/<aside class="lan-feedback"[^>]*>([\s\S]*?)<\/aside>/)![0];
 assert.match(feedback, /id="lanStatus"[^>]*role="status"/);

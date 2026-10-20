@@ -197,10 +197,13 @@ impl OnlineP2p {
     pub async fn accept_offer(
         ice_servers: Vec<IceServer>,
         offer_sdp: &str,
+        frame_tx: mpsc::UnboundedSender<Vec<u8>>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Option<String>>, String), String> {
         let (ice_tx, ice_rx) = mpsc::unbounded_channel();
         let (open_tx, open_rx) = mpsc::unbounded_channel();
         let link = Self::new_common(ice_servers, ice_tx, open_tx.clone(), open_rx)?;
+
+        link.set_message_handler(frame_tx);
 
         // The responder's DataChannel arrives via on_data_channel.
         let link_open_tx = link.open_tx.clone();

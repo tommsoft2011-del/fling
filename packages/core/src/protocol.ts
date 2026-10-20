@@ -163,6 +163,8 @@ export interface OfferMessage {
   totalFileItems?: number;
   /** 全部条目总字节数（items 被截断时预览用） */
   totalBytes?: number;
+  /** Rust-owned native disk-file test path (exactly one ordinary file). */
+  nativeSingleFile?: boolean;
 }
 
 export type FlingMessage =

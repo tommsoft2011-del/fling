@@ -10,7 +10,7 @@ import {
   normalizeCode,
   type FlingRoomEvents,
 } from '@fling/core';
-import type { RustFlingRoom } from './online-rust.js';
+import type { RustFlingRoom, NativeRoomEvents } from './online-rust.js';
 
 export { inboxRoomName, lobbyNameForCode, newTaskRoomName, newTaskKey, normalizeCode };
 
@@ -79,6 +79,7 @@ export const KEY_CTX = {
 } as const;
 
 export interface RoomSpec {
+  nativeTask?: { taskId: string; direction: 'sending' | 'receiving'; name: string; size: number };
   roomName: string;
   keyMaterial: string;
   keyContext: string;
@@ -115,7 +116,7 @@ export function nearbyTaskSpecWithRoom(taskRoom: string, taskKeyB64: string): Ro
   return { roomName: taskRoom, keyMaterial: taskKeyB64, keyContext: KEY_CTX.task };
 }
 
-export async function connectFlingRoom(spec: RoomSpec, events: FlingRoomEvents): Promise<RustFlingRoom> {
+export async function connectFlingRoom(spec: RoomSpec, events: NativeRoomEvents): Promise<RustFlingRoom> {
   // WebRTC is deprecated in the WebView. Signaling and the data plane both
   // live in Rust (online_session.rs); this returns a Rust-backed room.
   const { connectRustRoom } = await import('./online-rust.js');

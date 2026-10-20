@@ -73,6 +73,8 @@ pub enum FlingMessage {
     #[serde(rename = "file-manifest-ack", rename_all = "camelCase")]
     FileManifestAck {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_single_file: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         chunk_ack: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -103,6 +105,8 @@ pub enum FlingMessage {
         from_device_id: String,
         task_room: String,
         task_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_single_file: Option<bool>,
         items: Vec<OfferItem>,
         #[serde(skip_serializing_if = "Option::is_none")]
         total_items: Option<u32>,
@@ -162,6 +166,7 @@ mod tests {
         // file-manifest-ack with capabilities, as the TS sender emits it.
         let msg = FlingMessage::FileManifestAck {
             id: "abc123".to_string(),
+            native_single_file: None,
             chunk_ack: Some(true),
             binary_chunks: Some(true),
             direct_frame_payload_bytes: Some(131072),

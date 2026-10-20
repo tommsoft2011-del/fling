@@ -78,3 +78,7 @@ assert.match(pairReportSignature, /ui_attempt:\s*Option<u32>/);
 assert.match(pairReportSignature, /attempt:\s*Option<u64>/);
 
 console.log(`LAN IPC contract passed: ${commands.length} allowed command call sites, ${events.length} allowed event listeners; no file payload APIs.`);
+
+// The existing Windows diagnostic job executes this boundary gate. Include
+// the new online native-file regressions without changing any workflow file.
+await import('./online-native');

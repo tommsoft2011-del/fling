@@ -6,6 +6,7 @@ import { $, el, fmtSize, toast, uid, utf8bytes } from './ui.js';
 import { manager, type ComposeItem, type SendTarget } from './tasks.js';
 import { createTaskRow, type CardHandle } from './taskcard.js';
 import { normalizeCode } from '@fling/core';
+import { NativeSourcePicker, type NativeSourceMetadata } from './native-source-picker.js';
 
 let clipItems: ComposeItem[] = []; // 输入框里的剪贴板图片（chip）
 let fileItems: ComposeItem[] = []; // 下方文件列表里的文件
@@ -134,6 +135,21 @@ export function initSendPage(): void {
     refreshSendBtn();
   }).catch(() => { /* 非 Tauri 环境忽略 */ });
 
+  // Intercept the ordinary-file input only in Tauri. Browser / paste /
+  // drag/drop / clipboard stay on the explicitly legacy compatibility path.
+  const nativePicker = new NativeSourcePicker(() => invoke<NativeSourceMetadata | null>('online_pick_source'));
+  $('#fileInput').addEventListener('click', (event) => {
+    if (!isTauri) return;
+    event.preventDefault();
+    void nativePicker.pick()
+      .then((source) => {
+        if (!source) return; // cancel is not an error and does not alter selection
+        fileItems.push({ uid: uid('c'), kind: 'file', ...source });
+        renderFileList(); refreshSendBtn();
+      })
+      .catch((error) => toast(`选择文件失败，可重新选择：${error}`, true));
+  });
+
   ($('#fileInput') as HTMLInputElement).addEventListener('change', (e) => {
     const files = (e.target as HTMLInputElement).files;
     if (files) {
@@ -145,6 +161,7 @@ export function initSendPage(): void {
 
   // --- 添加文件夹：Tauri 用系统对话框多选；纯浏览器用 webkitdirectory 兜底 ---
   ($('#clearFilesBtn') as HTMLButtonElement).onclick = () => {
+    for (const item of fileItems) if (item.sourceId) void invoke('online_release_source', { sourceId: item.sourceId });
     fileItems.length = 0;
     renderFileList();
     refreshSendBtn();
@@ -334,7 +351,8 @@ function addClipItem(blob: Blob): void {
 function removeFileItem(uid_: string): void {
   const i = fileItems.findIndex((c) => c.uid === uid_);
   if (i >= 0) {
-    fileItems.splice(i, 1);
+    const [item] = fileItems.splice(i, 1);
+    if (item?.sourceId) void invoke('online_release_source', { sourceId: item.sourceId }).catch(() => {});
     renderFileList();
     refreshSendBtn();
   }
@@ -440,7 +458,7 @@ function renderFileList(): void {
   const total = fileItems.reduce((a, c) => a + c.size, 0);
   const fh = $('#fileCountHint');
   if (fh) fh.textContent =
-    fileItems.length > 0 ? `${fileItems.length} 个文件 · 共 ${fmtSize(total)}` : '';
+    fileItems.length > 0 ? `${fileItems.length} 个文件 · 共 ${fmtSize(total)} · ${fileItems.every((item) => item.sourceId) ? 'Rust 原生单文件' : '含兼容路径'}` : '';
   ($('#clearFilesBtn') as HTMLButtonElement).hidden = fileItems.length === 0;
 }
 
@@ -470,6 +488,10 @@ function snapshotItems(): ComposeItem[] {
 
 /** 点击发送：快照 → 建任务 → 立即清空发送框（目标保留，方便连发） */
 function doSend(items: ComposeItem[], target: SendTarget): void {
+  if (items.some((item) => item.sourceId) && (items.length !== 1 || items[0]?.kind !== 'file')) {
+    toast('0.6.29 原生测试路径一次只支持一个普通文件；请移除其他内容后发送', true);
+    return;
+  }
   try {
     manager.startSend(items, target);
   } catch (e) {

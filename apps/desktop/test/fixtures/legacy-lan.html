@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Fling</title>
+  </head>
+  <body>
+    <div id="app">
+      <!-- 明确选择在线或仅局域网；LAN 路径不启动在线初始化。 -->
+      <div class="screen active" id="modeScreen">
+        <div class="center mode-card">
+          <h1><span class="logo">Fling</span></h1>
+          <p class="sub">选择工作模式</p>
+          <button class="primary mode-button" id="chooseOnline">在线模式</button>
+          <button class="ghostbtn mode-button" id="chooseLan">仅局域网测试（可断网）</button>
+          <p class="hint">仅局域网模式不会连接云端。配对前请核对两台设备显示的短码。</p>
+        </div>
+      </div>
+
+      <!-- 首次设置：服务器配置 -->
+      <div class="screen" id="setupScreen">
+        <div class="center">
+          <h1><span class="logo">Fling</span> 设置</h1>
+          <p class="sub">填一次就行，key / secret 只存在本机</p>
+          <div class="field"><label>Server URL</label><input id="cfgUrl" placeholder="wss://rtc.syncpage.app" /></div>
+          <div class="field"><label>API key</label><input id="cfgKey" placeholder="devkey_…" /></div>
+          <div class="field"><label>API secret</label><input id="cfgSecret" type="password" placeholder="只存本机，不上传" /></div>
+          <button class="primary" id="saveCfg">保存并进入</button>
+          <div id="setupErr" class="err"></div>
+        </div>
+      </div>
+
+      <!-- Rust-owned, offline-capable LAN test console -->
+      <div class="screen" id="lanScreen">
+        <header class="lan-head">
+          <div>
+            <h1>仅局域网测试</h1>
+            <div class="hint" id="lanDeviceLine">正在启动本机局域网服务…</div>
+          </div>
+          <button class="ghostbtn" id="lanExit">退出测试模式</button>
+        </header>
+        <aside class="lan-feedback" aria-label="当前任务状态">
+          <div id="lanStatus" class="lan-status" role="status" aria-live="polite" aria-atomic="true">尚未开始传输</div>
+        </aside>
+        <main class="lan-content">
+          <section class="card">
+            <div class="row lan-discovery-row">
+              <div class="card-t">附近设备</div>
+              <button class="ghostbtn" id="lanRefreshPeers" type="button" aria-describedby="lanRefreshStatus">重新搜索附近设备</button>
+            </div>
+            <div class="hint">只显示本地网络中发现的设备；此模式不会自动回退到云端。</div>
+            <div id="lanPeerStatus" class="lan-status" role="status" aria-live="polite">正在发现设备…</div>
+            <div id="lanRefreshStatus" class="hint" role="status" aria-live="polite" aria-atomic="true">找不到对方时可重新搜索附近设备，无需重启应用。</div>
+            <select id="lanPeerSelect" class="textinput" aria-label="选择目标设备">
+              <option value="">等待附近设备…</option>
+            </select>
+          </section>
+          <section class="card">
+            <div class="card-t">发送文件</div>
+            <div class="row lan-source-row">
+              <button class="ghostbtn" id="lanPickSource">在本机选择文件</button>
+              <span id="lanSourceInfo" class="hint" role="status" aria-live="polite">尚未选择文件</span>
+            </div>
+            <button class="primary" id="lanSend" aria-describedby="lanSendReason" disabled>请求发送</button>
+            <div id="lanSendReason" class="hint lan-send-reason" role="status" aria-live="polite">请选择附近设备和文件</div>
+          </section>
+          <section class="card">
+            <div class="card-t">当前传输</div>
+            <div id="lanTasks"><div class="empty">暂无局域网任务</div></div>
+          </section>
+          <section class="card" id="lanHistorySection" hidden>
+            <div class="card-t">历史记录</div>
+            <div id="lanHistory"></div>
+          </section>
+          <details class="card" id="lanDiagnostics">
+            <summary id="lanDiagnosticsToggle">诊断信息</summary>
+            <div class="card-t">本地发现与配对日志</div>
+            <div id="lanLogDisclosure" class="hint">日志仅在本机生成，包含本机和对端电脑名称、构建与系统版本、搜索与配对阶段、数量、本地尝试序号、耗时和失败类别，设有大小上限；不记录 IP/MAC、文件信息、短码、密钥、内容或原始会话/传输 ID，不会自动上传。</div>
+            <div id="lanLogEvidenceNote" class="hint">日志只反映应用层观察和处理，不能证明报文实际进出网卡；该层证据仍需抓包。缓存记录不等于本轮收到新的网络响应。</div>
+            <div id="lanDiscoveryPhases" class="hint">尚无本轮阶段统计；有效服务、LAN 可用设备、成功提交的界面事件与实际可选条目数会分别记录。</div>
+            <div class="row lan-source-row">
+              <button class="ghostbtn" id="lanExportDiscoveryLog" type="button" aria-describedby="lanLogDisclosure lanLogEvidenceNote lanExportStatus">导出诊断日志</button>
+              <span id="lanExportStatus" class="hint" role="status" aria-live="polite" aria-atomic="true">手动选择保存位置后导出。</span>
+            </div>
+            <div class="card-t">WebView IPC 计数</div>
+            <div class="hint">只统计类型与字节数；文件帧和逐帧 ACK 不经过此 IPC。</div>
+            <div class="row lan-counter-row">
+              <button class="ghostbtn" id="lanRefreshCounters">刷新计数</button>
+              <span id="lanCounterSummary" class="hint">尚无统计</span>
+            </div>
+            <pre id="lanCounters">尚无统计</pre>
+          </details>
+        </main>
+      </div>
+
+      <!-- 主界面 -->
+      <div class="screen" id="mainScreen">
+        <nav id="sideNav">
+          <div class="brand">Fling</div>
+          <button data-page="send" class="active">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
+            发送<span class="badge" id="badgeSend" hidden></span>
+          </button>
+          <button data-page="recv">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>
+            接收<span class="badge" id="badgeRecv" hidden></span>
+          </button>
+          <button data-page="hist">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>
+            历史
+          </button>
+          <button data-page="settings">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg>
+            设置
+          </button>
+          <div class="nav-foot" id="myDeviceLine">…</div>
+        </nav>
+
+        <main id="pageHost">
+          <!-- 发送 -->
+          <section class="page active" id="page-send">
+            <h2>发送</h2>
+            <div class="sendwrap">
+              <div class="sendmain">
+                <div id="composeBox" tabindex="0">
+                  <div id="chipRow"></div>
+                  <textarea id="composeText" rows="2" placeholder="输入文字，或 Ctrl+V 粘贴…"></textarea>
+                  <div class="compose-hint"><span class="hint" id="composeHint"></span></div>
+                </div>
+                <div id="fileListWrap">
+                  <div id="fileDropHint" hidden><span>松开鼠标添加文件</span></div>
+                  <div class="filelist-head"><span class="hint" id="fileCountHint"></span><button id="clearFilesBtn" class="linkbtn" hidden>清空</button></div>
+                  <div id="fileList"><div class="empty">还没有文件 — 点「添加文件」，或把文件拖到这里</div></div>
+                  <div class="compose-actions">
+                    <label class="filebtn">＋ 添加文件<input type="file" id="fileInput" multiple hidden /></label>
+                    <button class="filebtn" id="addFolderBtn" type="button">＋ 添加文件夹</button>
+                    <input type="file" id="folderInput" webkitdirectory hidden />
+                    <span class="hint">把文件拖到上方文件区域即可添加</span>
+                  </div>
+                </div>
+                <div class="devsec-label">设备 <span class="hint">点击选择目标，再点下方发送</span></div>
+                <div class="devtiles">
+                  <div id="nearbyTiles" class="tiles-flow"></div>
+                  <button class="devtile pair" id="pairTile" title="输入配对码，添加远程设备">
+                    <div class="pic">🔗</div>
+                    <div class="dname">远程配对</div>
+                    <div class="psub">点击输入配对码</div>
+                  </button>
+                </div>
+              </div>
+              <div class="sendbar">
+                <button id="sendBtn" class="primary big" disabled>发送</button>
+              </div>
+              <div id="taskDrawer">
+                <div id="taskStrip"><span>传输任务</span> <span class="cnt" id="taskCount" hidden></span><span class="mini" id="taskMini"></span></div>
+                <div id="taskRows"></div>
+              </div>
+            </div>
+          </section>
+
+          <!-- 接收 -->
+          <section class="page" id="page-recv">
+            <h2>接收</h2>
+            <div class="waitanim">
+              <div class="rings"><span></span><span></span><span></span><div class="core">⬇</div></div>
+              <div class="wt">正在等待接收…</div>
+              <div class="hint">对方可通过附近设备或配对码向你发送</div>
+            </div>
+            <div class="recv-actions">
+              <button id="pairRecvBtn" class="nbtn">🔗 配对码接收</button>
+            </div>
+            <div class="ghead">等待确认 <span class="cnt" id="pendingCount" hidden></span></div>
+            <div class="group"><div id="pendingList"><div class="empty">暂无待确认的传输</div></div></div>
+            <div id="recvDrawer">
+              <div id="recvStrip"><span>接收任务</span> <span class="cnt" id="recvCount" hidden></span><span class="mini" id="recvMini"></span></div>
+              <div id="recvTaskList">
+                <div class="group"><div id="recvRows"><div class="empty">暂无正在接收的任务</div></div></div>
+              </div>
+            </div>
+          </section>
+
+          <!-- 历史 -->
+          <section class="page" id="page-hist">
+            <h2>历史</h2>
+            <div class="filters" id="histFilters">
+              <button data-f="all" class="active">全部</button>
+              <button data-f="send">我发送的</button>
+              <button data-f="recv">我接收的</button>
+              <button data-f="clip">剪贴板</button>
+              <input id="histSearch" class="textinput hist-search" placeholder="搜索文件名 / 文本内容…" />
+            </div>
+            <div id="histList"></div>
+          </section>
+
+          <!-- 设置 -->
+          <section class="page" id="page-settings">
+            <h2>设置</h2>
+            <div class="card row">
+              <div>
+                <div class="card-t">允许附近的设备发现我</div>
+                <div class="hint">关闭后，附近设备列表里看不到这台电脑（不影响配对码）</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="discoverToggle" checked /><span></span></label>
+            </div>
+            <div class="card row">
+              <div>
+                <div class="card-t">传输完成时系统通知</div>
+                <div class="hint">发送/接收完成或失败时弹出系统通知</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="notifyToggle" checked /><span></span></label>
+            </div>
+            <div class="card">
+              <div class="card-t">设备名称</div>
+              <div class="hint">附近的设备会看到这个名字</div>
+              <div class="row" style="margin-top:8px">
+                <input id="deviceNameInput" class="textinput" maxlength="64" />
+                <button class="ghostbtn" id="saveDeviceName">保存</button>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-t">接收目录</div>
+              <div class="hint">收到的文件自动保存在这里</div>
+              <div class="row" style="margin-top:8px">
+                <input id="downloadDirInput" class="textinput" readonly />
+                <button class="ghostbtn" id="pickDownloadDir">选择文件夹</button>
+                <button class="ghostbtn" id="openDownloadDir">打开</button>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-t">界面风格</div>
+              <div class="seg" id="themeSeg">
+                <button data-theme="light">浅色</button>
+                <button data-theme="dark">深色</button>
+                <button data-theme="system">跟随系统</button>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-t">诊断日志</div>
+              <div class="hint">记录传输过程（不含文件内容），出问题时把当天日志发给开发者分析</div>
+              <div class="row" style="margin-top:8px">
+                <button class="ghostbtn" id="openLogDir">打开日志目录</button>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-t">关于</div>
+              <div class="hint" id="aboutLine">Fling</div>
+              <div class="linkrow"><button class="linkbtn" id="editServerBtn">修改服务器设置</button></div>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <div id="toasts"></div>
+
+    <div id="lanPairModal" class="modal" hidden>
+      <div class="modal-box">
+        <h3>核对局域网配对短码</h3>
+        <p class="hint" id="lanPairPeer">正在连接设备…</p>
+        <p class="hint">双方都需要确认：请当面或通过电话比较两台设备显示的短码，一致后双方分别输入对方短码并确认。输入只在本机核对，不会发送给对方。</p>
+        <div class="lan-code-line" aria-hidden="true">本机短码：<strong id="lanPairCode">•••• ••••</strong></div>
+        <span id="lanPairCodeSpoken" class="lan-sr-only" role="status" aria-live="polite" aria-atomic="true"></span>
+        <input id="lanPeerCode" class="textinput big-code" maxlength="10" placeholder="输入对方显示的 8 位短码" autocomplete="off" />
+        <div class="modal-actions">
+          <button class="ghostbtn" id="lanPairReject">拒绝并取消</button>
+          <button class="primary" id="lanPairAccept">短码一致，确认</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="lanFileModal" class="modal" hidden>
+      <div class="modal-box">
+        <h3>接收局域网文件</h3>
+        <p class="hint" id="lanIncomingInfo">等待文件信息…</p>
+        <div class="modal-actions">
+          <button class="ghostbtn" id="lanFileReject">拒绝</button>
+          <button class="primary" id="lanFileAccept">接受并保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 配对码接收弹窗（接收页） -->
+    <div id="recvPairModal" class="modal" hidden>
+      <div class="modal-box">
+        <h3>配对码接收</h3>
+        <p class="hint">输入对方告诉你的配对码，开始等待对方的传输请求</p>
+        <input id="recvPairCodeInput" class="textinput big-code" maxlength="8" placeholder="8 位配对码" autocomplete="off" />
+        <div class="modal-actions">
+          <button class="ghostbtn" id="recvPairCancel">取消</button>
+          <button class="primary" id="recvPairOk">开始等待</button>
+        </div>
+      </div>
+    </div>
+    <!-- 远程配对弹窗（发送页） -->
+    <div id="pairModal" class="modal" hidden>
+      <div class="modal-box">
+        <h3>远程配对</h3>
+        <p class="hint">和对方输入相同的配对码，确认后会加入设备列表</p>
+        <input id="pairCodeInput" class="textinput big-code" maxlength="8" placeholder="K7Q2M9X4" autocomplete="off" />
+        <div class="modal-actions">
+          <button class="ghostbtn" id="pairCancel">取消</button>
+          <button class="primary" id="pairOk">确定</button>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

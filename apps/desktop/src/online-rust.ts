@@ -1,7 +1,9 @@
 // Rust-backed online room: replaces the TypeScript FlingRoom +
 // livekit-client + RTCPeerConnection for online transfers.
 //
-// The WebView only displays; signaling and the data plane both live in
+// Native disk-file tasks only pass opaque sourceId + display metadata.
+// Legacy Blob compatibility below still spills WebView-owned bytes; it is NOT Rust-only.
+// Online signaling and the data plane live in
 // Rust (online_session.rs). This class implements the subset of the
 // FlingRoom interface used by tasks.ts, delegating to Tauri commands.
 
@@ -16,6 +18,13 @@ import type { FileLike } from '@fling/core';
 import { log } from './log.js';
 import { KEY_CTX, mintToken } from './net.js';
 import type { RoomSpec } from './net.js';
+
+export interface NativeTaskStatus {
+  taskId: string; direction: 'sending' | 'receiving'; stage: string;
+  name: string; totalBytes: number; localBytes: number; peerBytes: number;
+  savedBytes: number; sha256?: string; savedPath?: string; error?: string;
+}
+export type NativeRoomEvents = FlingRoomEvents & { onNativeTask?: (status: NativeTaskStatus) => void };
 
 interface OnlineUiEvent {
   session: string;
@@ -70,37 +79,50 @@ async function ensureFilePath(file: FileLike): Promise<string> {
 
 export class RustFlingRoom {
   private sessionId: string | null = null;
+  private nativeTask = false;
   private unlisten: (() => void) | null = null;
-  private events: FlingRoomEvents;
+  private events: NativeRoomEvents;
   /** FlingRoom compat: whether a direct P2P path is active. */
   directActive = false;
   /** Live progress callback of the currently sending file (set BEFORE
    * the blocking invoke, since Rust emits progress DURING the transfer). */
   private activeSendProgress: ((sent: number, total: number) => void) | null = null;
 
-  constructor(events: FlingRoomEvents) {
+  constructor(events: NativeRoomEvents) {
     this.events = events;
   }
 
   async connect(spec: RoomSpec, serverUrl: string): Promise<void> {
+    this.nativeTask = !!spec.nativeTask;
     const token = await mintToken(spec.roomName);
-    this.sessionId = (await invoke('online_connect', {
-      serverUrl,
-      token,
-      pairingCode: spec.keyMaterial,
-      keyContext: spec.keyContext,
-    })) as string;
-
+    // Subscribe first, with a client-generated correlation ID: fast peers must
+    // not race listener registration after online_connect has already returned.
+    this.sessionId = crypto.randomUUID().replaceAll('-', '');
     this.unlisten = await listen<OnlineUiEvent>('fling://online/event', (e) => {
       if (e.payload.session !== this.sessionId) return;
       this.dispatch(e.payload.event);
     });
+    try {
+      await invoke('online_connect', {
+        serverUrl, token, pairingCode: spec.keyMaterial, keyContext: spec.keyContext,
+        clientSessionId: this.sessionId, nativeTask: spec.nativeTask ?? null,
+      });
+    } catch (error) {
+      this.unlisten?.(); this.unlisten = null; this.sessionId = null;
+      throw error;
+    }
   }
 
   private dispatch(ev: OnlineUiEvent['event']): void {
     const events = this.events;
+    // Native tasks never let legacy TS protocol handlers decide completion,
+    // cancellation or byte accounting. Render Rust snapshots only.
+    if (this.nativeTask && !['native-task', 'p2p', 'p2p-log', 'peer', 'disconnected'].includes(ev.kind)) return;
     try {
       switch (ev.kind) {
+        case 'native-task':
+          events.onNativeTask?.(ev.status as NativeTaskStatus);
+          break;
         case 'text':
           events.onText?.(ev.text as string, ev.from as string);
           break;
@@ -241,6 +263,14 @@ export class RustFlingRoom {
   private requireSession(): string {
     if (!this.sessionId) throw new Error('online session not connected');
     return this.sessionId;
+  }
+
+  async sendNativeSource(sourceId: string): Promise<NativeTaskStatus> {
+    return invoke('online_send_source', { sessionId: this.requireSession(), sourceId });
+  }
+
+  async cancelNative(): Promise<void> {
+    await invoke('online_cancel_native', { sessionId: this.requireSession() });
   }
 
   async sendText(text: string): Promise<void> {
@@ -386,7 +416,7 @@ export class RustFlingRoom {
  */
 export async function connectRustRoom(
   spec: RoomSpec,
-  events: FlingRoomEvents,
+  events: NativeRoomEvents,
   serverUrl: string,
 ): Promise<RustFlingRoom> {
   const room = new RustFlingRoom(events);
