@@ -18,7 +18,7 @@ assert.equal(calls, 4, 'concurrent picker invocation must be ignored');
 next = async () => ({ sourceId: 'retry-id', name: 'again.bin', size: 0 });
 assert.equal((await picker.pick())?.sourceId, 'retry-id');
 console.log('ok - native picker mock: cancel, error, success, concurrent guard and retry');
-const read = (file: string) => readFileSync(new URL(file, import.meta.url), 'utf8');
+const read = (file: string) => readFileSync(new URL(file, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const tasks = read('../src/tasks.ts');
 const bridge = read('../src/online-rust.ts');
 const main = read('../src-tauri/src/main.rs');
