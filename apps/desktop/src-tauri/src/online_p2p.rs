@@ -6,8 +6,9 @@
 //! file bytes flow over the direct `fling-file` RTCDataChannel using the
 //! same FLNG binary frames as the LAN path.
 //!
-//! If the handshake fails or the channel drops, the caller falls back to
-//! the LiveKit relay path (per-chunk routing), mirroring the TypeScript.
+//! Configured TURN may carry this encrypted DataChannel. The caller decides
+//! whether file relay is supported; native single-file tasks do not silently
+//! switch to LiveKit file relay when connection establishment fails.
 
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -21,14 +22,13 @@ use livekit::webrtc::{
         RtcConfiguration,
     },
     session_description::{SdpType, SessionDescription},
+    stats::{IceCandidatePairState, IceCandidateType, RtcStats},
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 
-/// Default STUN servers, matching `DEFAULT_ICE_SERVERS` in `p2p.ts`.
-/// No TURN here by default: when a direct path can't be built we fall back
-/// to the LiveKit relay instead of paying for a TURN server. A configured
-/// TURN (config.json `turn_url`/`turn_username`/`turn_password`) is appended.
+/// Remote online ICE only: default STUN plus a complete, validated TURN
+/// configuration. Pure LAN never calls this function.
 pub fn default_ice_servers(
     turn_url: Option<&str>,
     turn_username: Option<&str>,
@@ -46,16 +46,97 @@ pub fn default_ice_servers(
             password: String::new(),
         },
     ];
-    if let Some(url) = turn_url {
-        if !url.trim().is_empty() {
+    if let (Some(url), Some(username), Some(password)) = (turn_url, turn_username, turn_password) {
+        let url = url.trim();
+        if valid_turn_url(url)
+            && !username.trim().is_empty()
+            && !password.trim().is_empty()
+            && !username.contains(['\r', '\n', '\0'])
+            && !password.contains(['\r', '\n', '\0'])
+        {
             servers.push(IceServer {
-                urls: vec![url.trim().to_string()],
-                username: turn_username.unwrap_or_default().to_string(),
-                password: turn_password.unwrap_or_default().to_string(),
+                urls: vec![url.to_string()],
+                username: username.to_string(),
+                password: password.to_string(),
             });
         }
     }
     servers
+}
+
+fn valid_turn_url(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("turn:")
+        .or_else(|| url.strip_prefix("turns:"))
+    else {
+        return false;
+    };
+    !rest.is_empty()
+        && !rest.contains('@')
+        && !rest.contains('#')
+        && !rest.contains(['\r', '\n', '\0', ' ', '\t'])
+        && !rest.starts_with('/')
+}
+
+/// Returns true only when an SDP candidate has an exact `typ relay` token pair.
+pub fn has_relay_candidate(sdp: &str) -> bool {
+    sdp.lines().any(|line| {
+        let tokens: Vec<&str> = line.split_ascii_whitespace().collect();
+        tokens.windows(2).any(|pair| pair == ["typ", "relay"])
+    })
+}
+
+fn classify_stats(stats: &[RtcStats]) -> Option<&'static str> {
+    use livekit::webrtc::stats::IceCandidatePairState::Succeeded;
+    for transport in stats {
+        let RtcStats::Transport(transport) = transport else {
+            continue;
+        };
+        let pair_id = &transport.transport.selected_candidate_pair_id;
+        if pair_id.is_empty() {
+            continue;
+        }
+        let Some(pair) = stats.iter().find_map(|s| match s {
+            RtcStats::CandidatePair(p) if p.rtc.id == *pair_id => Some(&p.candidate_pair),
+            _ => None,
+        }) else {
+            continue;
+        };
+        if pair.state != Some(Succeeded) {
+            continue;
+        }
+        let local = stats.iter().find_map(|s| match s {
+            RtcStats::LocalCandidate(c) if c.rtc.id == pair.local_candidate_id => {
+                c.local_candidate.candidate_type
+            }
+            _ => None,
+        });
+        let remote = stats.iter().find_map(|s| match s {
+            RtcStats::RemoteCandidate(c) if c.rtc.id == pair.remote_candidate_id => {
+                c.remote_candidate.candidate_type
+            }
+            _ => None,
+        });
+        if local.is_none() || remote.is_none() {
+            continue;
+        }
+        return Some(
+            if local == Some(IceCandidateType::Relay) || remote == Some(IceCandidateType::Relay) {
+                "relay_established"
+            } else if matches!(
+                local,
+                Some(IceCandidateType::Host | IceCandidateType::Srflx)
+            ) && matches!(
+                remote,
+                Some(IceCandidateType::Host | IceCandidateType::Srflx)
+            ) {
+                "direct_established"
+            } else {
+                continue;
+            },
+        );
+    }
+    None
 }
 
 pub const P2P_DC_LABEL: &str = "fling-file";
@@ -112,7 +193,7 @@ impl OnlineP2p {
         let factory = PeerConnectionFactory::default();
         let peer = factory
             .create_peer_connection(config)
-            .map_err(|e| format!("create P2P PeerConnection: {e}"))?;
+            .map_err(|_| "create P2P PeerConnection failed".to_string())?;
 
         // Forward gathered ICE candidates to the signaling channel.
         let ice_tx_cb = ice_tx.clone();
@@ -208,26 +289,27 @@ impl OnlineP2p {
         // The responder's DataChannel arrives via on_data_channel.
         let link_open_tx = link.open_tx.clone();
         let link_msg_handler = link.msg_handler.clone();
-        link.peer.on_data_channel(Some(Box::new(move |dc: DataChannel| {
-            // Attach early message handler BEFORE Open, so libwebrtc doesn't
-            // drop frames that arrive before the handler is registered.
-            if let Some(tx) = link_msg_handler.lock().unwrap().clone() {
-                let tx_clone = tx.clone();
-                dc.on_message(Some(Box::new(move |msg| {
-                    if msg.binary {
-                        let _ = tx_clone.send(msg.data.to_vec());
+        link.peer
+            .on_data_channel(Some(Box::new(move |dc: DataChannel| {
+                // Attach early message handler BEFORE Open, so libwebrtc doesn't
+                // drop frames that arrive before the handler is registered.
+                if let Some(tx) = link_msg_handler.lock().unwrap().clone() {
+                    let tx_clone = tx.clone();
+                    dc.on_message(Some(Box::new(move |msg| {
+                        if msg.binary {
+                            let _ = tx_clone.send(msg.data.to_vec());
+                        }
+                    })));
+                }
+                // Wire open-state delivery like the initiator path.
+                let open_tx = link_open_tx.clone();
+                let dc_for_open = dc.clone();
+                dc.on_state_change(Some(Box::new(move |state| {
+                    if state == DataChannelState::Open {
+                        let _ = open_tx.send(dc_for_open.clone());
                     }
                 })));
-            }
-            // Wire open-state delivery like the initiator path.
-            let open_tx = link_open_tx.clone();
-            let dc_for_open = dc.clone();
-            dc.on_state_change(Some(Box::new(move |state| {
-                if state == DataChannelState::Open {
-                    let _ = open_tx.send(dc_for_open.clone());
-                }
             })));
-        })));
 
         let offer = SessionDescription::parse(offer_sdp, SdpType::Offer)
             .map_err(|e| format!("parse P2P offer: {e}"))?;
@@ -312,6 +394,23 @@ impl OnlineP2p {
         *self.state.lock().await
     }
 
+    /// Determine the selected ICE route only after the DataChannel is open.
+    /// Stats are never logged or exposed, and collection is bounded.
+    pub async fn route_state(&self) -> Option<&'static str> {
+        if *self.state.lock().await != P2pState::Open {
+            return None;
+        }
+        if self.peer.connection_state()
+            != livekit::webrtc::peer_connection::PeerConnectionState::Connected
+        {
+            return None;
+        }
+        match tokio::time::timeout(Duration::from_secs(2), self.peer.get_stats()).await {
+            Ok(Ok(stats)) => classify_stats(&stats),
+            _ => None,
+        }
+    }
+
     fn wire_data_channel(&self, dc: DataChannel) {
         // Attach early message handler BEFORE the channel opens, so no
         // frames are dropped by libwebrtc (it doesn't queue pre-handler msgs).
@@ -328,5 +427,161 @@ impl OnlineP2p {
 
     pub fn close(&self) {
         self.peer.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use livekit::webrtc::stats::dictionaries;
+    use livekit::webrtc::stats::{
+        CandidatePairStats, LocalCandidateStats, RemoteCandidateStats, TransportStats,
+    };
+
+    fn stats(
+        pair_state: Option<IceCandidatePairState>,
+        local: Option<IceCandidateType>,
+        remote: Option<IceCandidateType>,
+        selected: bool,
+    ) -> Vec<RtcStats> {
+        let mut out = vec![
+            RtcStats::Transport(TransportStats {
+                rtc: dictionaries::RtcStats {
+                    id: "transport".into(),
+                    ..Default::default()
+                },
+                transport: dictionaries::TransportStats {
+                    selected_candidate_pair_id: if selected { "pair" } else { "other" }.into(),
+                    ..Default::default()
+                },
+            }),
+            RtcStats::CandidatePair(CandidatePairStats {
+                rtc: dictionaries::RtcStats {
+                    id: "pair".into(),
+                    ..Default::default()
+                },
+                candidate_pair: dictionaries::CandidatePairStats {
+                    local_candidate_id: "local".into(),
+                    remote_candidate_id: "remote".into(),
+                    state: pair_state,
+                    ..Default::default()
+                },
+            }),
+        ];
+        if let Some(t) = local {
+            out.push(RtcStats::LocalCandidate(LocalCandidateStats {
+                rtc: dictionaries::RtcStats {
+                    id: "local".into(),
+                    ..Default::default()
+                },
+                local_candidate: dictionaries::IceCandidateStats {
+                    candidate_type: Some(t),
+                    ..Default::default()
+                },
+            }));
+        }
+        if let Some(t) = remote {
+            out.push(RtcStats::RemoteCandidate(RemoteCandidateStats {
+                rtc: dictionaries::RtcStats {
+                    id: "remote".into(),
+                    ..Default::default()
+                },
+                remote_candidate: dictionaries::IceCandidateStats {
+                    candidate_type: Some(t),
+                    ..Default::default()
+                },
+            }));
+        }
+        out
+    }
+
+    #[test]
+    fn turn_validation_and_credentials() {
+        assert_eq!(
+            default_ice_servers(Some("turn:host:3478"), Some("u"), Some("p")).len(),
+            3
+        );
+        for url in [
+            "https://host",
+            "turn://user@host",
+            "turn:user:pass@host",
+            "turn:/path",
+            "turn:host\nInjected",
+        ] {
+            assert_eq!(
+                default_ice_servers(Some(url), Some("u"), Some("p")).len(),
+                2,
+                "{url}"
+            );
+        }
+        assert_eq!(
+            default_ice_servers(Some("turn:host"), Some("u"), None).len(),
+            2
+        );
+        assert_eq!(
+            default_ice_servers(Some("turn:host"), Some(" "), Some("p")).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn route_classifies_only_selected_succeeded_pair() {
+        assert_eq!(
+            classify_stats(&stats(
+                Some(IceCandidatePairState::Succeeded),
+                Some(IceCandidateType::Relay),
+                Some(IceCandidateType::Host),
+                true
+            )),
+            Some("relay_established")
+        );
+        assert_eq!(
+            classify_stats(&stats(
+                Some(IceCandidatePairState::Succeeded),
+                Some(IceCandidateType::Host),
+                Some(IceCandidateType::Srflx),
+                true
+            )),
+            Some("direct_established")
+        );
+        assert_eq!(
+            classify_stats(&stats(
+                Some(IceCandidatePairState::Succeeded),
+                Some(IceCandidateType::Relay),
+                Some(IceCandidateType::Host),
+                false
+            )),
+            None
+        );
+        assert_eq!(
+            classify_stats(&stats(
+                Some(IceCandidatePairState::Failed),
+                Some(IceCandidateType::Relay),
+                Some(IceCandidateType::Host),
+                true
+            )),
+            None
+        );
+        assert_eq!(
+            classify_stats(&stats(
+                Some(IceCandidatePairState::Succeeded),
+                Some(IceCandidateType::Relay),
+                None,
+                true
+            )),
+            None
+        );
+        assert_eq!(classify_stats(&[]), None);
+    }
+
+    #[test]
+    fn relay_sdp_requires_token_pair() {
+        assert!(has_relay_candidate(
+            "a=candidate:1 1 udp 1 1.2.3.4 9 typ relay raddr 0.0.0.0 rport 0"
+        ));
+        assert!(!has_relay_candidate(
+            "a=candidate:1 1 udp 1 1.2.3.4 9 typ host"
+        ));
+        assert!(!has_relay_candidate("a=x relay typ host"));
     }
 }

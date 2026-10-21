@@ -612,17 +612,20 @@ async function main(): Promise<void> {
   done = freshBox();
   let lossScheduled = false;
   const droppedBefore = tB.droppedPublishes;
-  const lostAckSend = roomA.sendFile(fileLike('lost-progress-ack.bin', 100_000), () => {
+  // Receiver progress precedes ACK enqueue; sender progress can race the final ACK.
+  eventsB.onFileProgress = () => {
     if (!lossScheduled) {
       tB.dropNextPublish = true;
       lossScheduled = true;
     }
-  });
+  };
+  const lostAckSend = roomA.sendFile(fileLike('lost-progress-ack.bin', 100_000));
   for (let i = 0; i < 200 && !done.cur; i++) {
     wire();
     await new Promise((r) => setTimeout(r, 5));
   }
   await lostAckSend;
+  eventsB.onFileProgress = undefined;
   check(lossScheduled && tB.droppedPublishes === droppedBefore + 1, 'simulated receiver progress ACK is lost');
   check(done.cur?.bytes.length === 100_000, 'later final ACK confirms saved file after a lost progress ACK');
 

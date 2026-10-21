@@ -283,6 +283,7 @@ export class SendTask {
   readonly taskId = uid('task');
   phase: SendPhase = 'preparing';
   nativeStage?: string;
+  nativeRoute?: 'direct' | 'relay';
   get nativeSingleFile(): boolean { return this.source.length === 1 && !!this.source[0]?.sourceId && !this.source[0]?.relPath; }
   items: ItemState[];
   startedAt = Date.now();
@@ -517,7 +518,9 @@ export class SendTask {
     item.sha256 = status.sha256;
     item.saveBytes = status.savedBytes;
     item.status = status.stage === 'done' ? 'done' : ['error', 'cancelled'].includes(status.stage) ? 'error' : 'active';
-    item.error = status.error;
+    item.error = status.error?.startsWith('CONNECTION_FAILED:')
+      ? `连接未建立：${status.error.slice('CONNECTION_FAILED:'.length).trim()}。可重试。`
+      : status.error;
     if (status.peerBytes > this.peerDoneBytes) {
       const now = Date.now();
       if (this.lastPeerSpeedAt > 0 && now > this.lastPeerSpeedAt) this.peerSpeedBps = (status.peerBytes - this.peerDoneBytes) * 1000 / (now - this.lastPeerSpeedAt);
@@ -529,7 +532,9 @@ export class SendTask {
     this.peerTotalBytes = status.totalBytes;
     this.phase = status.stage === 'done' ? 'done' : status.stage === 'error' ? 'error' : status.stage === 'cancelled' ? 'cancelled' : status.stage === 'waiting' ? 'waiting' : status.stage === 'preparing' ? 'preparing' : 'sending';
     this.currentFileFinalizing = status.stage === 'finalizing';
-    this.error = status.error;
+    this.error = status.error?.startsWith('CONNECTION_FAILED:')
+      ? `连接未建立：${status.error.slice('CONNECTION_FAILED:'.length).trim()}。可重试。`
+      : status.error;
     if (!this.active) this.endedAt = Date.now();
     this.trackSpeed(status.localBytes);
     this.notify();
@@ -568,11 +573,14 @@ export class SendTask {
           ? nearbyTaskSpecWithRoom(taskRoom, taskKey)
           : { roomName: taskRoom, keyMaterial: normalizeCode(this.target.code), keyContext: KEY_CTX.room };
       if (this.nativeSingleFile) {
+        this.nativeStage = 'connecting';
+        this.notify();
         const source = this.source[0]!;
         spec.nativeTask = { taskId: this.taskId, direction: 'sending', name: source.name, size: source.size };
       }
       this.room = await connectFlingRoom(spec, {
         onNativeTask: (status) => this.applyNativeStatus(status),
+        onNativeRoute: (route) => { this.nativeRoute = route; this.notify(); },
         onPeerJoined: () => this.onPeer(),
         onPeerLeft: () => {
           // 接收方离开：ack 可能还在路上，给 3 秒宽限期，超时才判失败
@@ -919,12 +927,16 @@ export class SendTask {
       this.closeRooms();
     } catch (e) {
       const errMsg = typeof e === 'string' ? e : (e as Error)?.message || String(e);
+      const connectionFailure = errMsg.startsWith('CONNECTION_FAILED:');
+      const userError = connectionFailure
+        ? `连接未建立：${errMsg.slice('CONNECTION_FAILED:'.length).trim()}。可重试。`
+        : errMsg;
       log('task', 'send failed', { taskId: this.taskId, error: errMsg });
       if (this.cancelled) {
         this.phase = 'cancelled';
       } else {
         this.phase = 'error';
-        this.error = errMsg || '发送失败';
+        this.error = userError || '发送失败';
         for (const it of this.items) {
           if (it.status !== 'done') {
             it.status = 'error';
@@ -1401,6 +1413,7 @@ export class RecvTask {
   readonly taskId: string;
   phase: RecvPhase = 'receiving';
   nativeStage?: string;
+  nativeRoute?: 'direct' | 'relay';
   items: ItemState[];
   startedAt = Date.now();
   endedAt?: number;
@@ -1541,9 +1554,13 @@ export class RecvTask {
     item.savedPath = status.savedPath;
     item.sha256 = status.sha256;
     item.status = status.stage === 'done' ? 'done' : ['error', 'cancelled'].includes(status.stage) ? 'error' : 'active';
-    item.error = status.error;
+    item.error = status.error?.startsWith('CONNECTION_FAILED:')
+      ? `连接未建立：${status.error.slice('CONNECTION_FAILED:'.length).trim()}。可重试。`
+      : status.error;
     this.phase = status.stage === 'done' ? 'done' : status.stage === 'error' ? 'error' : status.stage === 'cancelled' ? 'cancelled' : 'receiving';
-    this.error = status.error;
+    this.error = status.error?.startsWith('CONNECTION_FAILED:')
+      ? `连接未建立：${status.error.slice('CONNECTION_FAILED:'.length).trim()}。可重试。`
+      : status.error;
     this.trackSpeed();
     this.notify();
     if (!this.active && !this.finished) {
@@ -1571,9 +1588,10 @@ export class RecvTask {
         const item = this.offer.items[0];
         if (this.offer.items.length !== 1 || item?.kind !== 'file') throw new Error('原生路径仅支持一个普通文件');
         spec.nativeTask = { taskId: this.taskId, direction: 'receiving', name: item.name, size: item.size };
-        this.nativeStage = 'waiting';
+        this.nativeStage = 'connecting';
         this.room = await connectFlingRoom(spec, {
           onNativeTask: (status) => this.applyNativeStatus(status),
+        onNativeRoute: (route) => { this.nativeRoute = route; this.notify(); },
           onFileRoute: (route) => { this.p2p = route === 'p2p' ? 'open' : 'failed'; this.items[0]!.transport = route; this.notify(); },
           onLog: (tag, msg) => log(tag as LogTag, `[native] ${msg}`),
         });
@@ -1626,7 +1644,10 @@ export class RecvTask {
       this.notify();
     } catch (e) {
       this.phase = 'error';
-      this.error = (e as Error).message || '接收失败';
+      const errMsg = typeof e === 'string' ? e : (e as Error)?.message || String(e);
+      this.error = errMsg.startsWith('CONNECTION_FAILED:')
+        ? `连接未建立：${errMsg.slice('CONNECTION_FAILED:'.length).trim()}。可重试。`
+        : errMsg || '接收失败';
       for (const it of this.items) {
         if (it.status !== 'done') {
           it.status = 'error';

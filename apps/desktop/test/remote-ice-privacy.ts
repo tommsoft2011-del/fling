@@ -1,0 +1,25 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+const read = (name: string) => readFileSync(new URL(name, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+const main = read('../src-tauri/src/main.rs');
+const session = read('../src-tauri/src/online_session.rs');
+const net = read('../src/net.ts');
+const lan = read('../src-tauri/src/native_lan_transfer.rs');
+const configBoundary = main.slice(main.indexOf('fn get_config('), main.indexOf('/// Load the config'));
+assert.match(configBoundary, /Ok\(Some\(config_for_webview\(cfg\)\)\)/);
+for (const field of ['turn_url', 'turn_username', 'turn_password']) {
+  assert.match(configBoundary, new RegExp(`cfg\\.${field} = None;`));
+}
+assert.doesNotMatch(net, /turn_url|turn_username|turn_password|setCustomIceServers|turnHost/);
+const connect = main.slice(main.indexOf('async fn online_connect('), main.indexOf('/// The only entrance'));
+assert.match(connect, /effective_config\(&app\)/);
+assert.match(connect, /online_p2p::default_ice_servers\(/);
+assert.match(connect, /cfg\.turn_url\.as_deref\(\), cfg\.turn_username\.as_deref\(\), cfg\.turn_password\.as_deref\(\)/);
+assert.equal((session.match(/let ice_servers = self\.ice_servers\.clone\(\);/g) ?? []).length, 2);
+assert.doesNotMatch(session, /default_ice_servers\(None, None, None\)|falling back to relay|using relay/);
+assert.match(session, /CONNECTION_FAILED:/);
+assert.match(session, /state: "fallback_requested"/);
+assert.match(session, /p2p\.route_state\(\)\.await/);
+assert.match(lan, /config\.ice_servers\.clear\(\)/);
+assert.doesNotMatch(lan, /default_ice_servers|online_p2p::|LiveKit::|OnlineRoom/);
+console.log('PASS remote ICE: native configuration injected on both roles; TURN never loaded into WebView; LAN host-only boundary preserved.');

@@ -24,7 +24,10 @@ export interface NativeTaskStatus {
   name: string; totalBytes: number; localBytes: number; peerBytes: number;
   savedBytes: number; sha256?: string; savedPath?: string; error?: string;
 }
-export type NativeRoomEvents = FlingRoomEvents & { onNativeTask?: (status: NativeTaskStatus) => void };
+export type NativeRoomEvents = FlingRoomEvents & {
+  onNativeTask?: (status: NativeTaskStatus) => void;
+  onNativeRoute?: (route: 'direct' | 'relay') => void;
+};
 
 interface OnlineUiEvent {
   session: string;
@@ -162,12 +165,21 @@ export class RustFlingRoom {
           } as never, String(ev.from ?? ''));
           break;
         case 'p2p':
-          this.directActive = ev.state === 'open';
-          if (ev.state === 'open') {
-            events.onFileRoute?.('p2p', '');
-          } else if (ev.state === 'failed') {
-            // So tasks can mark their P2P state as failed (card shows 中转).
+          // Native signals candidate/fallback intent separately from confirmed route.
+          // Only relay_established is evidence that selected TURN's DataChannel opened.
+          if (ev.state === 'relay_established') {
+            this.directActive = true;
+            events.onNativeRoute?.('relay');
             events.onFileRoute?.('relay', '');
+          } else if (ev.state === 'direct_established' || ev.state === 'open') {
+            this.directActive = true;
+            if (ev.state === 'direct_established') events.onNativeRoute?.('direct');
+            events.onFileRoute?.('p2p', '');
+          } else if (ev.state === 'relay_candidate' || ev.state === 'fallback_requested') {
+            // ICE/TURN candidate selection and fallback request are not an open DataChannel.
+          } else if (ev.state === 'failed') {
+            // Direct failure is not proof that an alternate DataChannel opened.
+            this.directActive = false;
           }
           break;
         case 'p2p-log':

@@ -16,10 +16,14 @@ use tokio::sync::{mpsc, Mutex};
 use crate::online_crypto::derive_room_key;
 use crate::online_native::{NativeTask, NativeTaskConfig, NativeTaskStatus};
 use crate::online_source::SourceLease;
-use crate::online_p2p::{default_ice_servers, OnlineP2p};
+use crate::online_p2p::{has_relay_candidate, OnlineP2p};
 use crate::online_proto::{FileKind, FlingMessage};
 use crate::online_room::{OnlineRoom, OnlineRoomEvent};
 use crate::online_transfer::{build_manifest, chunk_ack_message, OnlineReceiver, OnlineSender};
+
+fn connection_failure() -> &'static str {
+    "CONNECTION_FAILED: 未能建立安全连接，文件尚未开始传输；此路径不支持自动文件中继，请点击重试"
+}
 
 /// How long to wait for a manifest ACK.
 const MANIFEST_ACK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -156,6 +160,8 @@ pub struct OnlineSession {
     /// Last ACKed seq per receiver (to throttle `file-chunk-ack`).
     receiver_last_ack: Arc<Mutex<HashMap<String, u32>>>,
     p2p: Mutex<Option<Arc<OnlineP2p>>>,
+    // Remote online only. Never serialized or logged; LAN has its own transport.
+    ice_servers: Vec<livekit::webrtc::peer_connection_factory::IceServer>,
     pending_ice: Mutex<Vec<String>>,
     download_dir: PathBuf,
     /// Notified when a `file-manifest-ack` arrives, keyed by transfer id.
@@ -176,6 +182,7 @@ impl OnlineSession {
         download_dir: PathBuf,
         owner: String,
         native_config: Option<NativeTaskConfig>,
+        ice_servers: Vec<livekit::webrtc::peer_connection_factory::IceServer>,
     ) -> Result<Arc<Self>, String> {
         let room_key = derive_room_key(pairing_code, key_context);
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -196,6 +203,7 @@ impl OnlineSession {
             receivers: Arc::new(Mutex::new(HashMap::new())),
             receiver_last_ack: Arc::new(Mutex::new(HashMap::new())),
             p2p: Mutex::new(None),
+            ice_servers,
             pending_ice: Mutex::new(Vec::new()),
             download_dir,
             manifest_acks: Arc::new(Mutex::new(HashMap::new())),
@@ -545,8 +553,7 @@ impl OnlineSession {
         emit(&self.app, &self.id, OnlineUiEvent::P2pLog {
             message: format!("on_p2p_offer: received offer sdp_len={}", sdp.len()),
         });
-        // TODO: read TURN config; for now use STUN defaults.
-        let ice_servers = default_ice_servers(None, None, None);
+        let ice_servers = self.ice_servers.clone();
         let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (p2p, ice_rx, answer_sdp) = OnlineP2p::accept_offer(ice_servers, &sdp, frame_tx).await.map_err(|e| {
             emit(&self.app, &self.id, OnlineUiEvent::P2pLog {
@@ -562,9 +569,11 @@ impl OnlineSession {
 
         // Forward our ICE candidates.
         let room = self.room.clone();
+        let ice_session = self.clone();
         tokio::spawn(async move {
             let mut ice_rx = ice_rx;
             while let Some(candidate) = ice_rx.recv().await {
+                ice_session.note_relay_candidate(candidate.as_deref());
                 let _ = room.send(&FlingMessage::P2pIce { candidate }).await;
             }
         });
@@ -598,13 +607,7 @@ impl OnlineSession {
                     // Surface the P2P state to the UI (⚡ label): the sender
                     // emits this from send_file, the responder must too.
                     emit(&app, &session_id, OnlineUiEvent::P2p { state: "open".to_string() });
-                    let _ = app.emit(
-                        "fling://online/event",
-                        serde_json::json!({
-                            "session": session_id,
-                            "event": { "kind": "p2p", "state": "open" },
-                        }),
-                    );
+                    session.observe_route(p2p.clone());
                     // Pump: on_message (native thread, attached early by
                     // OnlineP2p) -> channel -> async task that routes frames
                     // to receivers and ACKs.
@@ -676,15 +679,52 @@ impl OnlineSession {
                         message: format!("responder: wait_open FAILED after {}ms: {}", wait_t0.elapsed().as_millis(), e),
                     });
                     emit(&app, &session_id, OnlineUiEvent::P2p { state: "failed".to_string() });
-                    eprintln!("fling online P2P responder failed: {e}");
+                    emit(&app, &session_id, OnlineUiEvent::P2p { state: "fallback_requested".into() });
+                    p2p.close();
+                    // No file frames arrived: this is a recoverable connection failure,
+                    // not a file-transfer failure or a successful relay takeover.
+                    if session.native.is_some() {
+                        let _ = session.cancel_native(Some(connection_failure().into()), false).await;
+                    }
+                    eprintln!("fling online P2P responder connection failed");
                 }
             }
         });
         Ok(())
     }
 
+    fn note_relay_candidate(&self, candidate: Option<&str>) {
+        if candidate.is_some_and(has_relay_candidate) {
+            emit(&self.app, &self.id, OnlineUiEvent::P2p { state: "relay_candidate".into() });
+        }
+    }
+
+    fn observe_route(self: &Arc<Self>, p2p: Arc<OnlineP2p>) {
+        let session = self.clone();
+        tokio::spawn(async move {
+            let mut previous = None;
+            // Route confirmation is advisory and never delays file frames. Continue
+            // observing while connected so a real ICE pair switch is also reflected.
+            loop {
+                if session.cancelled.load(Ordering::Acquire) { break; }
+                if let Some(native) = &session.native {
+                    if native.status.lock().await.terminal() { break; }
+                }
+                if p2p.state().await != crate::online_p2p::P2pState::Open { break; }
+                if let Some(route) = p2p.route_state().await {
+                    if previous != Some(route) {
+                        emit(&session.app, &session.id, OnlineUiEvent::P2p { state: route.into() });
+                        previous = Some(route);
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+
     /// Handle a remote ICE candidate (or buffer it if the PC isn't ready).
     async fn on_p2p_ice(&self, candidate: Option<String>) -> Result<(), String> {
+        self.note_relay_candidate(candidate.as_deref());
         if let Some(p2p) = self.p2p.lock().await.as_ref() {
             p2p.add_remote_ice(candidate).await?;
         } else if let Some(c) = candidate {
@@ -694,7 +734,7 @@ impl OnlineSession {
     }
 
     /// Sender: transmit one file. Builds the manifest, exchanges it, tries
-    /// P2P, falls back to relay. Mirrors `SendTask` + `FlingRoom.sendFile()`.
+    /// P2P with optional configured TURN. Native single-file never falls back to LiveKit file relay.
     pub async fn send_file(
         self: &Arc<Self>,
         path: &Path,
@@ -746,7 +786,7 @@ impl OnlineSession {
 
         if self.native.is_some() { self.native_stage("connecting").await; }
         // 2. P2P attempt (initiator).
-        let ice_servers = default_ice_servers(None, None, None);
+        let ice_servers = self.ice_servers.clone();
         let p2p_t0 = std::time::Instant::now();
         let p2p_result = OnlineP2p::start_initiator(ice_servers).await;
         let use_p2p = match p2p_result {
@@ -757,9 +797,11 @@ impl OnlineSession {
                 let p2p = Arc::new(p2p);
                 *self.p2p.lock().await = Some(p2p.clone());
                 let room = self.room.clone();
+                let ice_session = self.clone();
                 tokio::spawn(async move {
                     let mut ice_rx = ice_rx;
                     while let Some(candidate) = ice_rx.recv().await {
+                        ice_session.note_relay_candidate(candidate.as_deref());
                         let _ = room.send(&FlingMessage::P2pIce { candidate }).await;
                     }
                 });
@@ -782,24 +824,30 @@ impl OnlineSession {
                             message: format!("initiator: wait_open OK, elapsed_ms={}", wait_t0.elapsed().as_millis()),
                         });
                         emit(&self.app, &self.id, OnlineUiEvent::P2p { state: "open".to_string() });
+                        self.observe_route(p2p.clone());
                         Some((p2p, dc))
                     }
                     Err(e) => {
+                        p2p.close();
                         emit(&self.app, &self.id, OnlineUiEvent::P2pLog {
-                            message: format!("initiator: wait_open FAILED after {}ms, falling back to relay: {}", wait_t0.elapsed().as_millis(), e),
+                            message: format!("initiator: wait_open FAILED after {}ms, fallback requested; relay not established: {}", wait_t0.elapsed().as_millis(), e),
                         });
-                        eprintln!("fling online P2P initiator failed, falling back to relay: {e}");
+                        eprintln!("fling online P2P initiator failed; relay not established");
                         emit(&self.app, &self.id, OnlineUiEvent::P2p { state: "failed".to_string() });
                         None
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("fling online P2P setup failed, using relay: {e}");
+            Err(_e) => {
+                eprintln!("fling online P2P setup failed; relay not established");
+                emit(&self.app, &self.id, OnlineUiEvent::P2p { state: "failed".into() });
                 None
             }
         };
 
+        if use_p2p.is_none() {
+            emit(&self.app, &self.id, OnlineUiEvent::P2p { state: "fallback_requested".into() });
+        }
         // 3. Transfer.
         let app = self.app.clone();
         let session_id = self.id.clone();
@@ -847,7 +895,7 @@ impl OnlineSession {
                 )
                 .await
         } else if self.native.is_some() {
-            Err("未能建立直连；原生单文件测试路径不会静默改走 Blob 或中继，请重试".into())
+            Err(connection_failure().into())
         } else {
             // Relay path: base64 chunks over LiveKit. The engine emits
             // (seq, b64) pairs into a channel; a forwarder publishes them.

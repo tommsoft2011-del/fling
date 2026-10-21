@@ -183,7 +183,15 @@ fn get_config(app: tauri::AppHandle) -> Result<Option<FlingConfig>, String> {
     {
         return Ok(None);
     }
-    Ok(Some(cfg))
+    Ok(Some(config_for_webview(cfg)))
+}
+
+/// TURN secrets are native-only, including when get_config is used by settings.
+fn config_for_webview(mut cfg: FlingConfig) -> FlingConfig {
+    cfg.turn_url = None;
+    cfg.turn_username = None;
+    cfg.turn_password = None;
+    cfg
 }
 
 /// Load the config, creating it (device identity only) on first run.
@@ -445,6 +453,12 @@ async fn online_connect(
     let id = client_session_id.unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
     if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) { return Err("invalid session id".into()); }
     if registry.get(&id).await.is_some() { return Err("session id already exists".into()); }
+    // Snapshot the effective local/remote/embedded TURN configuration in Rust.
+    // Never pass these credentials through IPC or diagnostics.
+    let cfg = effective_config(&app)?;
+    let ice_servers = online_p2p::default_ice_servers(
+        cfg.turn_url.as_deref(), cfg.turn_username.as_deref(), cfg.turn_password.as_deref(),
+    );
     let session = online_session::OnlineSession::connect(
         app,
         id.clone(),
@@ -455,6 +469,7 @@ async fn online_connect(
         std::path::PathBuf::from(download_dir),
         window.label().into(),
         native_task,
+        ice_servers,
     )
     .await?;
     registry.insert(id.clone(), session).await;
@@ -2493,6 +2508,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webview_config_never_serializes_turn_credentials() {
+        let mut cfg = default_config();
+        cfg.turn_url = Some("turn:private.example:3478".into());
+        cfg.turn_username = Some("secret-turn-user".into());
+        cfg.turn_password = Some("secret-turn-pass".into());
+        let value = serde_json::to_string(&config_for_webview(cfg)).unwrap();
+        for forbidden in ["turn_url", "turn_username", "turn_password", "private.example", "secret-turn-user", "secret-turn-pass"] {
+            assert!(!value.contains(forbidden));
+        }
+    }
 
     #[test]
     fn raw_append_ipc_accepts_binary_and_rejects_json_missing_headers_and_oversize() {

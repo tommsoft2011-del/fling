@@ -43,7 +43,14 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
   const pct = el('span', 'tpct', '');
   const closeBtn = el('button', 'x', '✕') as HTMLButtonElement;
   closeBtn.title = '取消';
-  top.append(arrow, peer, sum, pct, closeBtn);
+  const retryBtn = el('button', 'retry-failed', '重试连接') as HTMLButtonElement;
+  retryBtn.type = 'button';
+  retryBtn.hidden = true;
+  retryBtn.onclick = (e) => {
+    e.stopPropagation();
+    void import('./tasks.js').then(({ manager }) => manager.retryFailed(task.taskId));
+  };
+  top.append(arrow, peer, sum, pct, retryBtn, closeBtn);
   // 发送端主进度采用接收端累计 ACK；本机 send() 速率不冒充对端进度。
   const bars = el('div', 'trow-bars');
   const totalRow = el('div', 'tbar-row');
@@ -109,6 +116,10 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
         const progressLine = (label: string, bytes: number, complete: boolean) => {
           const percent = progressPercent(it.totalBytes, bytes, complete);
           const line = el('div', 'tdetail-file-progress');
+          if (bytes === 0 && !complete) {
+            line.append(el('span', 'tfile', '等待接收进度'));
+            return line;
+          }
           const bar = el('div', 'pbar thin');
           const fill = el('div', 'pfill');
           fill.style.width = percent + '%';
@@ -177,20 +188,22 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
         totalB = pt;
       }
     }
-    const pctNum = phase === 'done' ? 100 : totalB > 0 ? Math.min(100, Math.round((doneB / totalB) * 100)) : 0;
+    const hasProgress = doneB > 0 || phase === 'done';
+    bars.hidden = !hasProgress;
+    const pctNum = phase === 'done' ? 100 : totalB > 0 && hasProgress ? Math.min(100, Math.round((doneB / totalB) * 100)) : 0;
     totalFill.style.width = pctNum + '%';
     totalBar.classList.toggle('live', active && (phase === 'sending' || (phase as string) === 'receiving'));
     // 右上角总百分比
-    pct.textContent = pctNum + '%';
+    pct.textContent = hasProgress ? pctNum + '%' : '';
 
     const sendTaskForEta = dir === 'send' ? task as SendTask : undefined;
     const etaSpeed = sendTaskForEta ? sendTaskForEta.peerRateBps : task.speedBps;
     const remainingSeconds = estimateRemainingSeconds(totalB, doneB, etaSpeed);
-    if (active && remainingSeconds !== null) {
+    if (active && hasProgress && remainingSeconds !== null) {
       const sec = remainingSeconds;
       eta.textContent = '剩余 ' + (sec >= 3600 ? `${Math.floor(sec / 3600)}:${String(Math.floor(sec / 60) % 60).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`
         : sec >= 60 ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}` : `${sec}秒`);
-    } else if (active && sendTaskForEta && sendTaskForEta.peerDoneBytes < totalB) {
+    } else if (active && sendTaskForEta && sendTaskForEta.peerDoneBytes < totalB && sendTaskForEta.peerDoneBytes > 0) {
       eta.textContent = '等待对端进度';
     } else {
       eta.textContent = '';
@@ -200,7 +213,7 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
     let statusCls = '';
     const nativeLabels: Record<string, string> = {
       waiting: '等待对方加入…', preparing: 'Rust 正在读取并计算 SHA-256…',
-      connecting: '正在建立 P2P 直连…', finalizing: '正在校验、同步磁盘并最终确认…',
+      connecting: '正在建立安全连接…', relay_candidate: '正在建立安全连接…', fallback_requested: '正在建立安全连接…', finalizing: '正在校验、同步磁盘并最终确认…',
     };
     if (active && task.nativeStage && (nativeLabels[task.nativeStage] || (task.nativeStage === 'transferring' && (dir === 'send' ? (task as SendTask).peerDoneBytes : task.doneBytes) === 0))) {
       status = nativeLabels[task.nativeStage] ?? '传输已开始，等待首个对端进度…';
@@ -228,6 +241,8 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
       } else if (activityBytes > 0 && idleMs > 15000 && pctNum < 100 && !(sendTask && sendTask.peerDoneBytes >= totalB)) {
         status = `⚠ 停滞 ${pctNum}%`;
         statusCls = 'bad';
+      } else if (!hasProgress) {
+        status = task.nativeStage === 'connecting' ? '正在建立安全连接…' : '等待首个真实进度…';
       } else if (sendTask) {
         status = `对端累计确认 ${pctNum}%` + (effSpeed > 0 ? ` · ${fmtSpeed(effSpeed)}` : '');
       } else {
@@ -238,6 +253,7 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
       statusCls = 'ok';
     } else if (phase === 'error') {
       status = '✗ ' + (task.error ?? '失败');
+      if (dir === 'recv' && task.error?.includes('连接未建立')) status += '，请让发送方重试';
       statusCls = 'bad';
     } else if (phase === 'cancelled') {
       status = '已取消';
@@ -249,6 +265,7 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
     }
     pct.textContent = status;
     pct.className = 'tpct ' + statusCls;
+    retryBtn.hidden = !(dir === 'send' && phase === 'error' && task.error?.includes('连接未建立'));
     sum.textContent = summarizeItems(task) + ` · ${fmtSize(totalB)}`;
     // 进行中显示取消按钮；失败/完成/取消后显示为消除按钮（之前 error 状态按钮隐藏，失败任务卡死消不掉）
     closeBtn.style.visibility = 'visible';
@@ -260,11 +277,12 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
 
     // P2P 直连标记（紧凑：加到 peer 后）
     const p2p = task.p2p;
-    peer.textContent = task.peerLabel + (p2p === 'open' ? ' ⚡' : p2p === 'failed' ? ' (中转)' : '');
-    peer.title = p2p === 'open' ? 'P2P 直连' : p2p === 'failed' ? '经服务器中转' : p2p === 'connecting' ? '正在建立直连…' : '';
+    const relayEstablished = task.nativeRoute === 'relay';
+    peer.textContent = task.peerLabel + (relayEstablished ? ' · 备用连接已建立' : task.nativeRoute === 'direct' ? ' · 直连已建立' : '');
+    peer.title = relayEstablished ? 'Rust 已确认选中 TURN 中继且安全数据通道已打开' : task.nativeRoute === 'direct' ? 'Rust 已确认直连通道' : active ? '正在建立安全连接' : '';
 
     // 完成/失败/取消/拒绝后 5s 自动淡出
-    if ((phase === 'done' || phase === 'error' || phase === 'cancelled' || (phase as string) === 'rejected') && !dismissTimer) {
+    if ((phase === 'done' || (phase === 'error' && !task.error?.includes('连接未建立')) || phase === 'cancelled' || (phase as string) === 'rejected') && !dismissTimer) {
       dismissTimer = setTimeout(() => {
         root.classList.add('fading');
         setTimeout(() => {

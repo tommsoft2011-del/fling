@@ -23,31 +23,7 @@ export async function initNet(): Promise<void> {
   const info = (await invoke('get_device_info')) as { device_id: string; device_name: string };
   deviceId = info.device_id;
   deviceName = info.device_name;
-  // 配置文件里有 TURN 就追加到 ICE 列表（STUN 之后）
-  try {
-    const cfg = (await invoke('get_config')) as {
-      turn_url?: string; turn_username?: string; turn_password?: string;
-    } | null;
-    if (cfg?.turn_url) {
-      const { setCustomIceServers, DEFAULT_ICE_SERVERS } = await import('./p2p.js');
-      setCustomIceServers([
-        ...DEFAULT_ICE_SERVERS,
-        {
-          urls: cfg.turn_url,
-          username: cfg.turn_username ?? '',
-          credential: cfg.turn_password ?? '',
-        },
-      ]);
-      // 诊断：只记 TURN 主机（不记用户名/密码），确认配置真的进了 ICE 列表
-      const host = /^(?:turns?:)?([^/:;]+)/.exec(cfg.turn_url)?.[1] ?? '?';
-      log('p2p', 'ice servers: STUN x2 + TURN', { turnHost: host });
-    } else {
-      log('p2p', 'ice servers: STUN x2 only (no TURN configured)', {});
-    }
-  } catch {
-    /* 无 TURN 配置就只用 STUN */
-    log('p2p', 'ice servers: STUN x2 only (get_config failed)', {});
-  }
+  // Online TURN configuration stays in Rust; LAN remains native host-only.
 }
 
 export function getDeviceId(): string {
