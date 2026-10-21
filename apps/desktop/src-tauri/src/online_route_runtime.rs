@@ -14,6 +14,7 @@ const EFFECT_LIMIT: Duration = Duration::from_secs(2);
 /// proof that the remote peer received Abort.
 pub trait EffectExecutor: Send + 'static {
     fn execute<'a>(&'a mut self, effect: Effect) -> EffectFuture<'a>;
+    fn effect_failed(&self, _effect: &Effect, _timed_out: bool) {}
 }
 
 #[derive(Clone)]
@@ -29,8 +30,11 @@ enum Command {
 }
 
 async fn execute_bounded(executor: &mut impl EffectExecutor, effect: Effect) -> Result<(), String> {
-    tokio::time::timeout(EFFECT_LIMIT, executor.execute(effect))
-        .await.map_err(|_| "route effect timed out".to_string())?
+    let result=tokio::time::timeout(EFFECT_LIMIT, executor.execute(effect.clone())).await;
+    match result {
+        Ok(result)=>{if result.is_err() {executor.effect_failed(&effect,false);} result}
+        Err(_)=>{executor.effect_failed(&effect,true);Err("route effect timed out".into())}
+    }
 }
 
 impl RouteRuntime {

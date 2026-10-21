@@ -1,5 +1,6 @@
 //! Rust-owned online direct-first transport. The UI never sees SDP, ICE or frames.
 //! Uses the same RouteHandler as deterministic protocol tests, with real native PCs.
+use crate::connection_diagnostics::{Diagnostics as ConnectionDiagnostics, Observer, Stage, Outcome, Reason, control_stage};
 use crate::online_p2p::{IceMode, OnlineP2p, P2pState, SignalingIceCandidate};
 use crate::online_route_choice::{Effect, Envelope, Epoch, Event, Fence, Path, Phase, Role, RouteHandler};
 use crate::online_route_runtime::{EffectExecutor, EffectFuture, RouteRuntime};
@@ -33,20 +34,22 @@ struct CandidateStore {
     bound: HashMap<Path, String>, buckets: HashMap<(Path, String), HashSet<String>>, count: usize,
 }
 impl CandidateStore {
-    fn insert(&mut self, path: Path, ufrag: &str, candidate: &str) -> bool {
-        if ufrag.is_empty() || ufrag.len() > 256 || candidate.len() > 4096 || self.count >= 256
-            || self.bound.get(&path).is_some_and(|v| v != ufrag) { return false; }
-        let Ok(sig) = serde_json::from_str::<SignalingIceCandidate>(candidate) else { return false; };
-        if crate::ice_syntax::validate(&sig.candidate).is_err() { return false; }
-        let tokens: Vec<_> = sig.candidate.split_ascii_whitespace().collect();
-        if tokens.windows(2).any(|p| p[0] == "ufrag" && p[1] != ufrag) { return false; }
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
-            if value.get("usernameFragment").and_then(|v|v.as_str()).is_some_and(|v|v != ufrag) { return false; }
+    #[cfg(test)]
+    fn insert(&mut self,path:Path,ufrag:&str,candidate:&str)->bool {self.admit(path,ufrag,candidate).is_ok()}
+    fn admit(&mut self, path: Path, ufrag: &str, candidate: &str) -> Result<(),Reason> {
+        if ufrag.is_empty() || ufrag.len()>256 || candidate.len()>4096 || self.count>=256 {return Err(Reason::Bounds);}
+        if self.bound.get(&path).is_some_and(|v|v!=ufrag) {return Err(Reason::Generation);}
+        let sig=serde_json::from_str::<SignalingIceCandidate>(candidate).map_err(|_|Reason::Malformed)?;
+        crate::ice_syntax::validate(&sig.candidate).map_err(|_|Reason::InvalidSyntax)?;
+        let tokens:Vec<_>=sig.candidate.split_ascii_whitespace().collect();
+        if tokens.windows(2).any(|p|p[0]=="ufrag" && p[1]!=ufrag) {return Err(Reason::UfragMismatch);}
+        if let Ok(value)=serde_json::from_str::<serde_json::Value>(candidate) {
+            if value.get("usernameFragment").and_then(|v|v.as_str()).is_some_and(|v|v!=ufrag) {return Err(Reason::UfragMismatch);}
         }
-        let key = (path, ufrag.to_owned());
-        if !self.buckets.contains_key(&key) && self.buckets.len() >= 8 { return false; }
-        if !self.buckets.entry(key).or_default().insert(candidate.to_owned()) { return false; }
-        self.count += 1; true
+        let key=(path,ufrag.to_owned());
+        if !self.buckets.contains_key(&key) && self.buckets.len()>=8 {return Err(Reason::BucketLimit);}
+        if !self.buckets.entry(key).or_default().insert(candidate.to_owned()) {return Err(Reason::Duplicate);}
+        self.count+=1;Ok(())
     }
     fn bind(&mut self, path: Path, ufrag: &str) -> Result<Vec<String>, String> {
         if self.bound.get(&path).is_some_and(|v| v != ufrag) { return Err("conflicting remote SDP ufrag".into()); }
@@ -71,6 +74,7 @@ pub fn sdp_ufrag(sdp: &str) -> Result<String, String> {
 }
 
 pub struct DirectAttempt {
+    diagnostics: Arc<ConnectionDiagnostics>,
     pub capability: Capability,
     role: Role, servers: Vec<IceServer>, send: SignalSender,
     runtime: OnceLock<RouteRuntime>, peers: Mutex<HashMap<Path, Peer>>,
@@ -81,6 +85,16 @@ pub struct DirectAttempt {
 }
 struct Executor(Weak<DirectAttempt>);
 impl EffectExecutor for Executor {
+    fn effect_failed(&self,effect:&Effect,timed_out:bool) {
+        if let Some(attempt)=self.0.upgrade() {
+            let (path,stage)=match effect {
+                Effect::Send(e)=>(e.fence.path,control_stage(e.message).unwrap_or(Stage::ControlReceive)),
+                Effect::FirstFramePermit(f)=>(f.path,Stage::FirstFramePermit),
+                _=>(Path::Direct,Stage::AttemptEnd),
+            };
+            attempt.diagnostics.scope(path).note(stage,Outcome::Failed,if timed_out {Reason::Timeout}else{Reason::OperationFailed});
+        }
+    }
     fn execute<'a>(&'a mut self, effect: Effect) -> EffectFuture<'a> {
         Box::pin(async move {
             let Some(attempt) = self.0.upgrade() else { return Err("attempt released".into()); };
@@ -100,12 +114,15 @@ impl EffectExecutor for Executor {
                             return Err("selected path no longer READY at commit/start".into());
                         }
                     }
-                    (attempt.send)(Signal::Control(envelope)).await?;
+                    let scope=attempt.diagnostics.scope(envelope.fence.path);
+                    if let Some(stage)=control_stage(envelope.message) {scope.run(stage,(attempt.send)(Signal::Control(envelope))).await?;}
+                    else {(attempt.send)(Signal::Control(envelope)).await?;}
                     if envelope.message == crate::online_route_choice::Wire::StartAck && attempt.role == Role::Receiver {
                         let _ = attempt.events.try_send(TransportEvent::Started(envelope.fence));
                     }
                 },
                 Effect::CreateTurnPeerConnection(_) => {
+                    attempt.diagnostics.scope(Path::Turn).note(Stage::TurnDecision,Outcome::Ok,Reason::None);
                     let _=attempt.events.try_send(TransportEvent::TurnStarted);
                     attempt.turn_allowed.store(true, Ordering::Release);
                     let task=attempt.clone();
@@ -124,6 +141,7 @@ impl EffectExecutor for Executor {
                     if !link.ready_proof(&dc).await.valid(fence.path) {
                         return Err("selected channel no longer READY at START_ACK".into());
                     }
+                    attempt.diagnostics.scope(fence.path).note(Stage::FirstFramePermit,Outcome::Ok,Reason::None);
                     *attempt.permit.lock().await=Some(fence); attempt.changed.notify_waiters();
                 }
                 Effect::CloseUnselected(path) => {
@@ -143,11 +161,16 @@ impl EffectExecutor for Executor {
     }
 }
 impl DirectAttempt {
+    #[cfg(test)]
     pub fn new(role: Role, capability: Capability, servers: Vec<IceServer>, send: SignalSender)
         -> (Arc<Self>, mpsc::Receiver<TransportEvent>) {
+        Self::new_observed(role,capability,servers,send,Arc::new(|_|{}))
+    }
+    pub fn new_observed(role:Role,capability:Capability,servers:Vec<IceServer>,send:SignalSender,observer:Observer) -> (Arc<Self>,mpsc::Receiver<TransportEvent>) {
+        let diagnostics=ConnectionDiagnostics::new(role,observer);
         let (events,rx)=mpsc::channel(32);
         let (terminal_notice,_)=watch::channel(false);
-        let attempt=Arc::new(Self { capability, role, servers, send, runtime: OnceLock::new(),
+        let attempt=Arc::new(Self { diagnostics, capability, role, servers, send, runtime: OnceLock::new(),
             peers:Mutex::new(HashMap::new()),creating:Mutex::new(HashSet::new()), candidates:Mutex::new(CandidateStore::default()),
             pending_turn:Mutex::new(None),turn_allowed:AtomicBool::new(false),terminal:AtomicBool::new(false),terminal_notice,
             permit:Mutex::new(None),changed:Notify::new(),events,failure:Mutex::new(None) });
@@ -171,14 +194,15 @@ impl DirectAttempt {
         if path==Path::Turn && !self.turn_allowed.load(Ordering::Acquire) { return Err("TURN before cutoff".into()); }
         if !self.creating.lock().await.insert(path) { return Ok(()); }
         let mode=if path==Path::Direct {IceMode::Direct}else{IceMode::Turn};
-        let (link,ice,sdp)=crate::online_setup::bounded_initial_effect(OnlineP2p::start_initiator_mode(self.servers.clone(),mode)).await?;
+        let scope=self.diagnostics.scope(path);
+        let (link,ice,sdp)=scope.bounded(Stage::OfferSetup,OnlineP2p::start_initiator_observed(self.servers.clone(),mode,Some(scope.clone()))).await?;
         let origin=link.gathering_origin();let ufrag=sdp_ufrag(&sdp)?;
         if self.terminal.load(Ordering::Acquire) {link.close();return Err("terminal attempt".into());}
         let link=Arc::new(link);
         self.peers.lock().await.insert(path,Peer { link:link.clone(),dc:None,remote_sdp:None,remote_ufrag:None,local_sdp:sdp.clone(),local_ufrag:ufrag.clone() });
         if path==Path::Direct {self.runtime().dispatch_gathering_started(self.capability.epoch,origin).await?;}
         // Offer publication must complete before forwarding its candidates.
-        crate::online_setup::bounded_initial_effect((self.send)(Signal::Description {fence:self.fence(path),answer:false,ufrag:ufrag.clone(),sdp})).await?;
+        scope.bounded(Stage::OfferSend,(self.send)(Signal::Description {fence:self.fence(path),answer:false,ufrag:ufrag.clone(),sdp})).await?;
         self.forward_ice(path,ufrag,ice);
         self.watch_peer(path,link,None);
         Ok(())
@@ -186,15 +210,22 @@ impl DirectAttempt {
     pub async fn receive(self:&Arc<Self>,signal:Signal) -> Result<(),String> {
         if self.terminal.load(Ordering::Acquire) {return Ok(());}
         let result=match signal {
-            Signal::Control(envelope) => self.runtime().dispatch(Event::Wire(envelope)).await.map(|_|()),
+            Signal::Control(envelope) => {
+                let scope=self.diagnostics.scope(envelope.fence.path);
+                if let Some(stage)=control_stage(envelope.message) {scope.note(stage,Outcome::Observed,if self.matches(envelope.fence) || (envelope.fence.epoch==self.capability.epoch && envelope.fence.seq==1) {Reason::None}else{Reason::StaleFence});}
+                scope.run(Stage::ControlReceive,async {self.runtime().dispatch(Event::Wire(envelope)).await.map(|_|())}).await
+            },
             Signal::Ice {fence,ufrag,candidate} => {
-                if !self.matches(fence) {return Ok(());}
+                let scope=self.diagnostics.scope(fence.path);
+                if !self.matches(fence) {scope.note(Stage::IceValidate,Outcome::Rejected,Reason::StaleFence);return Ok(());}
                 let mut candidates=self.candidates.lock().await;
-                if !candidates.insert(fence.path,&ufrag,&candidate) {return Ok(());}
+                let admission=candidates.admit(fence.path,&ufrag,&candidate);
+                if let Err(reason)=admission {scope.note(Stage::IceValidate,Outcome::Rejected,reason);return Ok(());}
+                scope.note(Stage::IceValidate,Outcome::Ok,Reason::None);
                 let bound=candidates.bound.get(&fence.path).is_some_and(|u|u==&ufrag);drop(candidates);
                 if bound {
                     let link=self.peers.lock().await.get(&fence.path).map(|p|p.link.clone());
-                    if let Some(link)=link {crate::online_setup::bounded_initial_effect(link.add_remote_ice(Some(candidate))).await?;}
+                    if let Some(link)=link {scope.bounded(Stage::IceAdd,link.add_remote_ice(Some(candidate))).await?;}
                 }
                 Ok(())
             }
@@ -206,7 +237,8 @@ impl DirectAttempt {
     async fn description(self:&Arc<Self>,signal:Signal) -> Result<(),String> {
         let Signal::Description {fence,answer,ufrag,sdp}=signal else {return Ok(());};
         if !self.matches(fence) {return Ok(());}
-        if sdp_ufrag(&sdp)?!=ufrag {return Err("SDP ufrag envelope mismatch".into());}
+        let scope=self.diagnostics.scope(fence.path);
+        scope.run(Stage::DescriptionValidate,async {if sdp_ufrag(&sdp)?!=ufrag {return Err("SDP ufrag envelope mismatch".into());} Ok(())}).await?;
         if fence.path==Path::Turn && !self.turn_allowed.load(Ordering::Acquire) {
             if !answer && self.role==Role::Receiver {
                 let mut pending=self.pending_turn.lock().await;
@@ -223,7 +255,7 @@ impl DirectAttempt {
                 if let Some(old)=&peer.remote_sdp {return if old==&sdp {Ok(())}else{Err("conflicting answer".into())};}
                 peer.link.clone()
             };
-            crate::online_setup::bounded_initial_effect(link.handle_answer(&sdp)).await?;
+            scope.bounded(Stage::AnswerSetup,link.handle_answer(&sdp)).await?;
             let mut peers=self.peers.lock().await;
             let peer=peers.get_mut(&path).ok_or("closed peer")?;
             peer.remote_sdp=Some(sdp);peer.remote_ufrag=Some(ufrag.clone());drop(peers);
@@ -234,25 +266,25 @@ impl DirectAttempt {
                 if let Some(peer)=peers.get(&path) {
                     if peer.remote_sdp.as_ref()!=Some(&sdp) {return Err("conflicting offer".into());}
                     let reply=Signal::Description {fence,answer:true,ufrag:peer.local_ufrag.clone(),sdp:peer.local_sdp.clone()};drop(peers);
-                    return crate::online_setup::bounded_initial_effect((self.send)(reply)).await;
+                    return scope.bounded(Stage::AnswerSend,(self.send)(reply)).await;
                 }
             }
             if !self.creating.lock().await.insert(path) {return Ok(());}
             let (frames_tx,frames_rx)=mpsc::channel(32);
             let mode=if path==Path::Direct {IceMode::Direct}else{IceMode::Turn};
-            let (link,ice,local_sdp)=crate::online_setup::bounded_initial_effect(OnlineP2p::accept_offer_mode(self.servers.clone(),mode,&sdp,frames_tx)).await?;
+            let (link,ice,local_sdp)=scope.bounded(Stage::AnswerSetup,OnlineP2p::accept_offer_observed(self.servers.clone(),mode,&sdp,frames_tx,Some(scope.clone()))).await?;
             let origin=link.gathering_origin();let local_ufrag=sdp_ufrag(&local_sdp)?;
             if self.terminal.load(Ordering::Acquire) {link.close();return Err("terminal attempt".into());}
             let link=Arc::new(link);
             self.peers.lock().await.insert(path,Peer {link:link.clone(),dc:None,remote_sdp:Some(sdp),remote_ufrag:Some(ufrag.clone()),local_sdp:local_sdp.clone(),local_ufrag:local_ufrag.clone()});
             if path==Path::Direct {self.runtime().dispatch_gathering_started(self.capability.epoch,origin).await?;}
-            crate::online_setup::bounded_initial_effect((self.send)(Signal::Description {fence,answer:true,ufrag:local_ufrag.clone(),sdp:local_sdp})).await?;
+            scope.bounded(Stage::AnswerSend,(self.send)(Signal::Description {fence,answer:true,ufrag:local_ufrag.clone(),sdp:local_sdp})).await?;
             self.forward_ice(path,local_ufrag,ice);
             self.watch_peer(path,link,Some(frames_rx));
         }
         let pending=self.candidates.lock().await.bind(path,&ufrag)?;
         let link=self.peers.lock().await.get(&path).map(|p|p.link.clone());
-        if let Some(link)=link {for candidate in pending {crate::online_setup::bounded_initial_effect(link.add_remote_ice(Some(candidate))).await?;}}
+        if let Some(link)=link {for candidate in pending {scope.bounded(Stage::IceAdd,link.add_remote_ice(Some(candidate))).await?;}}
         Ok(())
     }
     fn forward_ice(self:&Arc<Self>,path:Path,ufrag:String,mut rx:mpsc::UnboundedReceiver<Option<String>>) {
@@ -262,19 +294,33 @@ impl DirectAttempt {
                 let Some(task)=task.upgrade() else {break;};
                 if task.terminal.load(Ordering::Acquire) {break;}
                 let Some(candidate)=candidate else {continue;};
-                if let Err(e)=crate::online_setup::bounded_initial_effect((task.send)(Signal::Ice {fence:task.fence(path),ufrag:ufrag.clone(),candidate})).await {
+                if let Err(e)=task.diagnostics.scope(path).bounded(Stage::IceSend,(task.send)(Signal::Ice {fence:task.fence(path),ufrag:ufrag.clone(),candidate})).await {
                     task.fail(e).await;break;
                 }
             }
         });
     }
     fn watch_peer(self:&Arc<Self>,path:Path,link:Arc<OnlineP2p>,frames:Option<mpsc::Receiver<Vec<u8>>>) {
+        let monitor=Arc::downgrade(self);let observed_link=link.clone();
+        tokio::spawn(async move {
+            loop {
+                let Some(task)=monitor.upgrade() else {break;};
+                if task.terminal.load(Ordering::Acquire) || !task.peers.lock().await.get(&path).is_some_and(|p|Arc::ptr_eq(&p.link,&observed_link)) {break;}
+                let scope=task.diagnostics.scope(path);drop(task);
+                let summary=observed_link.diagnostic_pair_state().await;
+                let Some(task)=monitor.upgrade() else {break;};
+                if task.terminal.load(Ordering::Acquire) {break;}
+                scope.pair(summary);drop(task);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
         let weak=Arc::downgrade(self);
         tokio::spawn(async move {
             let dc=match link.wait_open().await {Ok(dc)=>dc,Err(_)=>{
                 if let Some(task)=weak.upgrade() {let _=task.runtime().dispatch(Event::PathFailed {epoch:task.capability.epoch,path}).await;} return;
             }};
             let Some(task)=weak.upgrade() else {link.close();return;};
+            task.diagnostics.scope(path).note(Stage::ChannelOpen,Outcome::Ok,Reason::None);
             if task.terminal.load(Ordering::Acquire) {link.close();return;}
             if let Some(peer)=task.peers.lock().await.get_mut(&path) {peer.dc=Some(dc.clone());}else{return;}
             if let Some(mut frames)=frames {
@@ -302,6 +348,7 @@ impl DirectAttempt {
                 }
                 let proof=link.ready_proof(&dc).await;
                 if proof.valid(path) {
+                    task.diagnostics.scope(path).note(Stage::ReadyProof,Outcome::Ok,Reason::None);
                     if task.runtime().dispatch(Event::OwnReady {epoch:task.capability.epoch,path,proof}).await.is_err() {break;}
                 }
                 drop(task);tokio::time::sleep(Duration::from_millis(40)).await;
@@ -338,7 +385,10 @@ impl DirectAttempt {
     pub fn is_terminal(&self) -> bool {self.terminal.load(Ordering::Acquire)}
     pub fn terminal_watch(&self) -> watch::Receiver<bool> {self.terminal_notice.subscribe()}
     pub fn block_frames(&self) {
-        self.terminal.store(true,Ordering::Release);
+        if !self.terminal.swap(true,Ordering::AcqRel) {
+            self.diagnostics.scope(Path::Direct).note(Stage::AttemptEnd,Outcome::Observed,Reason::None);
+            self.diagnostics.flush();
+        }
         self.terminal_notice.send_replace(true);
     }
     pub async fn fail(&self,error:String) {
@@ -360,6 +410,19 @@ impl DirectAttempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn candidate_rejection_categories_preserve_strict_filters() {
+        let mut store=CandidateStore::default();
+        assert_eq!(store.admit(Path::Turn,"","{}"),Err(Reason::Bounds));
+        assert_eq!(store.admit(Path::Turn,"abc","not-json"),Err(Reason::Malformed));
+        assert_eq!(store.admit(Path::Turn,"abc",r#"{"candidate":"secret"}"#),Err(Reason::InvalidSyntax));
+        let candidate=serde_json::json!({"candidate":"candidate:1 1 udp 1 127.0.0.1 9 typ host ufrag abc"}).to_string();
+        assert_eq!(store.admit(Path::Direct,"wrong",&candidate),Err(Reason::UfragMismatch));
+        assert_eq!(store.admit(Path::Direct,"abc",&candidate),Ok(()));
+        assert_eq!(store.admit(Path::Direct,"abc",&candidate),Err(Reason::Duplicate));
+        store.bind(Path::Direct,"abc").unwrap();
+        assert_eq!(store.admit(Path::Direct,"old",&candidate),Err(Reason::Generation));
+    }
     #[test]
     fn sdp_and_candidate_generation_fences() {
         assert_eq!(sdp_ufrag("v=0\r\na=ice-ufrag:abc\r\n").unwrap(),"abc");
@@ -392,7 +455,8 @@ mod native_tests {
     async fn actual_native_peers_require_ready_commit_start_ack_before_frame() {
         let capability=Capability::fresh();
         let (stx,mut srx)=mpsc::unbounded_channel();let (rtx,mut rrx)=mpsc::unbounded_channel();
-        let (s,_sevents)=DirectAttempt::new(Role::Sender,capability,vec![],sender(stx));
+        let observed=Arc::new(std::sync::Mutex::new(Vec::new()));let captured=observed.clone();
+        let (s,_sevents)=DirectAttempt::new_observed(Role::Sender,capability,vec![],sender(stx),Arc::new(move |e|captured.lock().unwrap().push(serde_json::to_value(e).unwrap())));
         let (r,mut revents)=DirectAttempt::new(Role::Receiver,capability,vec![],sender(rtx));
         r.expect_offer(Instant::now()).await.unwrap();
         let rtask=r.clone();let sr=tokio::spawn(async move {while let Some(signal)=srx.recv().await {rtask.receive(signal).await.unwrap();}});
@@ -409,6 +473,13 @@ mod native_tests {
             loop {match revents.recv().await.unwrap() {TransportEvent::Frame{fence,bytes}=>break(fence,bytes),TransportEvent::Started(_)=>{},TransportEvent::TurnStarted=>panic!("successful Direct must not start TURN"),TransportEvent::Failed(e)=>panic!("{e}")}}
         }).await.unwrap();
         assert_eq!(frame,(fence,b"actual-native-frame".to_vec()));
+        {
+            let events=observed.lock().unwrap();
+            for stage in ["peer_create","channel_create","offer_create","offer_set","offer_send","answer_apply","channel_wait","channel_open","ready_proof","prepare","commit","start","first_frame_permit"] {
+                assert!(events.iter().any(|e|e["stage"]==stage && e["outcome"]=="ok"),"missing production diagnostic: {stage}");
+            }
+            assert!(events.iter().any(|e|e["stage"]=="pair_observe" && e["pair"]["selected"]==true));
+        }
         let old=Fence {epoch:Epoch{generation:0,..capability.epoch},..fence};
         assert!(!s.confirm_ack(old,100).await);assert!(s.confirm_ack(fence,23).await);
         assert_eq!(s.runtime().snapshot().await.unwrap().2,23);
@@ -436,6 +507,17 @@ mod native_tests {
 #[cfg(test)]
 mod terminal_notice_tests {
     use super::*;
+    #[tokio::test]
+    async fn terminal_flush_reports_exact_ice_totals_once_outside_frame_queue() {
+        let saved=Arc::new(std::sync::Mutex::new(Vec::new()));let captured=saved.clone();
+        let send:SignalSender=Arc::new(|_|Box::pin(async{Ok(())}));
+        let (route,_events)=DirectAttempt::new_observed(Role::Sender,Capability::fresh(),vec![],send,Arc::new(move |e|captured.lock().unwrap().push(serde_json::to_value(e).unwrap())));
+        for _ in 0..3 {route.diagnostics.scope(Path::Turn).note(Stage::IceValidate,Outcome::Rejected,Reason::InvalidSyntax);}
+        route.block_frames();route.block_frames();
+        let events=saved.lock().unwrap();
+        assert_eq!(events.iter().filter(|e|e["stage"]=="ice_validate" && e["count"]==3).count(),1);
+        assert_eq!(events.iter().filter(|e|e["stage"]=="attempt_end").count(),1);
+    }
     #[tokio::test]
     async fn full_frame_event_queue_cannot_drop_terminal_fact() {
         let cap=Capability::fresh();

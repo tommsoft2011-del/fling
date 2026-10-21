@@ -33,6 +33,7 @@ mod native_lan;
 mod native_lan_runtime;
 mod online_crypto;
 mod online_diagnostics;
+mod connection_diagnostics;
 mod online_p2p;
 mod online_proto;
 mod online_room;

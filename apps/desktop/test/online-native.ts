@@ -49,8 +49,9 @@ const fencedAck = /async fn fenced_ack[\s\S]*?async fn install_route/.exec(sessi
 assert.match(fencedAck, /current_fence[\s\S]*?ok_or[\s\S]*?chunk_ack_message/);
 assert.match(fencedAck, /\*route_fence=Some\(fence\)/);
 const sendPrepared = /async fn send_prepared[\s\S]*?pub fn authorize/.exec(session)?.[0] ?? '';
-assert.ok(sendPrepared.indexOf('route.wait_selected().await?') >= 0);
-assert.ok(sendPrepared.indexOf('sender.send_via_p2p(') > sendPrepared.indexOf('route.wait_selected().await?'));
+const selectedWait = 'route.wait_selected().await.map_err(|_|crate::connection_diagnostics::connection_failure())?';
+assert.ok(sendPrepared.indexOf(selectedWait) >= 0, 'selected wait must sanitize errors before entering the native task UI');
+assert.ok(sendPrepared.indexOf('sender.send_via_p2p(') > sendPrepared.indexOf(selectedWait));
 assert.match(sendPrepared, /gate.is_terminal\(\)/);
 assert.match(session, /route.confirm_ack\(fence, received_bytes\)[\s\S]*?sender.on_chunk_ack/);
 assert.match(session, /if !msg.webview_intent\(\)/);

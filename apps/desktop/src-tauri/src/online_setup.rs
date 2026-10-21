@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
-const INITIAL_EFFECT_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const INITIAL_EFFECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A failure bound, never a gathering/route-selection clock. Publication errors
 /// and ambiguous timed-out sends are terminal locally, not a relay trigger.

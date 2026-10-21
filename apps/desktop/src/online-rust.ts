@@ -16,6 +16,7 @@ import type {
 } from '@fling/core';
 import type { FileLike } from '@fling/core';
 import { log } from './log.js';
+import { safeConnectionDiagnostic } from './connection-diagnostics.js';
 import { safeRouteDiagnostic, type NativeRoute } from './route-diagnostics.js';
 import { KEY_CTX, mintToken } from './net.js';
 import type { RoomSpec } from './net.js';
@@ -113,7 +114,7 @@ export class RustFlingRoom {
     const events = this.events;
     // Native tasks never let legacy TS protocol handlers decide completion,
     // cancellation or byte accounting. Render Rust snapshots only.
-    if (this.nativeTask && !['native-task', 'p2p', 'p2p-log', 'path-diagnostic', 'peer', 'disconnected'].includes(ev.kind)) return;
+    if (this.nativeTask && !['native-task', 'p2p', 'p2p-log', 'path-diagnostic', 'connection-diagnostic', 'peer', 'disconnected'].includes(ev.kind)) return;
     try {
       switch (ev.kind) {
         case 'native-task':
@@ -185,6 +186,11 @@ export class RustFlingRoom {
             events.onNativeRoute?.(undefined);
           }
           break;
+        case 'connection-diagnostic': {
+          const summary = safeConnectionDiagnostic(ev.summary);
+          if (summary) log('p2p', 'connection diagnostic', summary);
+          break;
+        }
         case 'path-diagnostic': {
           const summary = safeRouteDiagnostic(ev.summary);
           if (summary) log('p2p', 'path diagnostic', summary);

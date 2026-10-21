@@ -11,6 +11,7 @@
 //! switch to LiveKit file relay when connection establishment fails.
 
 use std::sync::{Arc, Mutex as StdMutex};
+use crate::connection_diagnostics::{Scope, Stage, Outcome, Reason};
 use std::time::{Duration, Instant};
 
 use livekit::webrtc::{
@@ -197,6 +198,7 @@ pub enum P2pState {
 /// A direct P2P link. The initiator creates the offer; the responder
 /// answers. Both sides feed remote ICE candidates via `add_remote_ice`.
 pub struct OnlineP2p {
+    diagnostics: Option<Scope>,
     gathering_origin: Option<Instant>,
     channel_closed: Arc<std::sync::atomic::AtomicBool>,
     peer: livekit::webrtc::peer_connection::PeerConnection,
@@ -221,15 +223,18 @@ impl OnlineP2p {
         open_tx: mpsc::UnboundedSender<DataChannel>,
         open_rx: mpsc::UnboundedReceiver<DataChannel>,
     ) -> Result<Self, String> {
-        Self::new_mode(ice_servers, IceMode::Legacy, ice_tx, open_tx, open_rx)
+        Self::new_mode(ice_servers, IceMode::Legacy, ice_tx, open_tx, open_rx, None)
     }
 
-    fn new_mode(ice_servers: Vec<IceServer>, mode: IceMode, ice_tx: mpsc::UnboundedSender<Option<String>>, open_tx: mpsc::UnboundedSender<DataChannel>, open_rx: mpsc::UnboundedReceiver<DataChannel>) -> Result<Self, String> {
-        let config = mode_configuration(ice_servers, mode)?;
+    fn new_mode(ice_servers: Vec<IceServer>, mode: IceMode, ice_tx: mpsc::UnboundedSender<Option<String>>, open_tx: mpsc::UnboundedSender<DataChannel>, open_rx: mpsc::UnboundedReceiver<DataChannel>, diagnostics: Option<Scope>) -> Result<Self, String> {
+        let mut phase = diagnostics.as_ref().map(|d| d.begin(Stage::PeerCreate));
+        let config = mode_configuration(ice_servers, mode).map_err(|e| {if let Some(g)=phase.take() {g.finish(Outcome::Failed,Reason::OperationFailed);} e})?;
         let factory = PeerConnectionFactory::default();
         let peer = factory
             .create_peer_connection(config)
-            .map_err(|_| "create P2P PeerConnection failed".to_string())?;
+            .map_err(|_| {if let Some(g)=phase.take() {g.finish(Outcome::Failed,Reason::OperationFailed);} "create P2P PeerConnection failed".to_string()})?;
+
+        if let Some(phase) = phase {phase.finish(Outcome::Ok, Reason::None);}
 
         // Forward gathered ICE candidates to the signaling channel.
         let ice_tx_cb = ice_tx.clone();
@@ -248,6 +253,7 @@ impl OnlineP2p {
         let state = Arc::new(Mutex::new(P2pState::Connecting));
 
         Ok(Self {
+            diagnostics,
             gathering_origin: None,
             channel_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             peer,
@@ -259,6 +265,9 @@ impl OnlineP2p {
             msg_handler: Arc::new(StdMutex::new(None)),
         })
     }
+
+    fn phase(&self, stage: Stage) -> Option<crate::connection_diagnostics::Guard> {self.diagnostics.as_ref().map(|d|d.begin(stage))}
+    fn phase_ok(guard: Option<crate::connection_diagnostics::Guard>) {if let Some(g)=guard {g.finish(Outcome::Ok,Reason::None);}}
 
     /// Set the message handler BEFORE the DataChannel is created/opened.
     /// The handler will be attached as soon as the channel exists, preventing
@@ -290,30 +299,39 @@ impl OnlineP2p {
     }
 
     pub async fn start_initiator_mode(ice_servers: Vec<IceServer>, mode: IceMode) -> Result<(Self, mpsc::UnboundedReceiver<Option<String>>, String), String> {
+        Self::start_initiator_observed(ice_servers, mode, None).await
+    }
+    pub async fn start_initiator_observed(ice_servers: Vec<IceServer>, mode: IceMode, diagnostics: Option<Scope>) -> Result<(Self, mpsc::UnboundedReceiver<Option<String>>, String), String> {
         let (ice_tx, ice_rx) = mpsc::unbounded_channel();
         let (open_tx, open_rx) = mpsc::unbounded_channel();
-        let mut link = Self::new_mode(ice_servers, mode, ice_tx, open_tx.clone(), open_rx)?;
+        let mut link = Self::new_mode(ice_servers, mode, ice_tx, open_tx.clone(), open_rx, diagnostics)?;
 
+        let mut phase = link.phase(Stage::ChannelCreate);
         let dc = link
             .peer
             .create_data_channel(
                 P2P_DC_LABEL,
                 livekit::webrtc::data_channel::DataChannelInit::default(),
             )
-            .map_err(|e| format!("create P2P DataChannel: {e}"))?;
+            .map_err(|e| {if let Some(g)=phase.take() {g.finish(Outcome::Failed,Reason::OperationFailed);} format!("create P2P DataChannel: {e}")})?;
+        Self::phase_ok(phase);
         link.wire_data_channel(dc);
 
+        let mut phase = link.phase(Stage::OfferCreate);
         let offer = link
             .peer
             .create_offer(OfferOptions::default())
             .await
-            .map_err(|e| format!("create P2P offer: {e}"))?;
+            .map_err(|e| {if let Some(g)=phase.take() {g.finish(Outcome::Failed,Reason::OperationFailed);} format!("create P2P offer: {e}")})?;
+        Self::phase_ok(phase);
         let sdp = offer.to_string();
+        let mut phase = link.phase(Stage::OfferSet);
         link.peer
             .set_local_description(offer)
             .await
-            .map_err(|e| format!("set P2P local offer: {e}"))?;
+            .map_err(|e| {if let Some(g)=phase.take() {g.finish(Outcome::Failed,Reason::OperationFailed);} format!("set P2P local offer: {e}")})?;
         link.gathering_origin = Some(Instant::now());
+        Self::phase_ok(phase);
         Ok((link, ice_rx, sdp))
     }
 
@@ -328,9 +346,12 @@ impl OnlineP2p {
     }
 
     pub async fn accept_offer_mode(ice_servers: Vec<IceServer>, mode: IceMode, offer_sdp: &str, frame_tx: mpsc::Sender<Vec<u8>>) -> Result<(Self, mpsc::UnboundedReceiver<Option<String>>, String), String> {
+        Self::accept_offer_observed(ice_servers, mode, offer_sdp, frame_tx, None).await
+    }
+    pub async fn accept_offer_observed(ice_servers: Vec<IceServer>, mode: IceMode, offer_sdp: &str, frame_tx: mpsc::Sender<Vec<u8>>, diagnostics: Option<Scope>) -> Result<(Self, mpsc::UnboundedReceiver<Option<String>>, String), String> {
         let (ice_tx, ice_rx) = mpsc::unbounded_channel();
         let (open_tx, open_rx) = mpsc::unbounded_channel();
-        let mut link = Self::new_mode(ice_servers, mode, ice_tx, open_tx.clone(), open_rx)?;
+        let mut link = Self::new_mode(ice_servers, mode, ice_tx, open_tx.clone(), open_rx, diagnostics)?;
 
         link.set_message_handler(frame_tx);
 
@@ -338,8 +359,10 @@ impl OnlineP2p {
         let link_open_tx = link.open_tx.clone();
         let link_msg_handler = link.msg_handler.clone();
         let link_closed = link.channel_closed.clone();
+        let link_diagnostics = link.diagnostics.clone();
         link.peer
             .on_data_channel(Some(Box::new(move |dc: DataChannel| {
+                if let Some(d)=&link_diagnostics {d.note(Stage::ChannelCreate,Outcome::Started,Reason::None);}
                 // Attach early message handler BEFORE Open, so libwebrtc doesn't
                 // drop frames that arrive before the handler is registered.
                 if let Some(tx) = link_msg_handler.lock().unwrap().clone() {
@@ -361,37 +384,51 @@ impl OnlineP2p {
                         let _ = open_tx.send(dc_for_open.clone());
                     }
                 })));
+                if let Some(d)=&link_diagnostics {d.note(Stage::ChannelCreate,Outcome::Ok,Reason::None);}
             })));
 
+        let mut phase=link.phase(Stage::OfferParse);
         let offer = SessionDescription::parse(offer_sdp, SdpType::Offer)
-            .map_err(|e| format!("parse P2P offer: {e}"))?;
+            .map_err(|e| {if let Some(g)=phase.take() {g.finish(Outcome::Failed,Reason::OperationFailed);} format!("parse P2P offer: {e}")})?;
+        Self::phase_ok(phase);
+        let mut phase=link.phase(Stage::OfferApply);
         link.peer
             .set_remote_description(offer)
             .await
-            .map_err(|e| format!("set P2P remote offer: {e}"))?;
+            .map_err(|e| {if let Some(g)=phase.take() {g.finish(Outcome::Failed,Reason::OperationFailed);} format!("set P2P remote offer: {e}")})?;
+        Self::phase_ok(phase);
+        let mut phase=link.phase(Stage::AnswerCreate);
         let answer = link
             .peer
             .create_answer(livekit::webrtc::peer_connection::AnswerOptions::default())
             .await
-            .map_err(|e| format!("create P2P answer: {e}"))?;
+            .map_err(|e| {if let Some(g)=phase.take() {g.finish(Outcome::Failed,Reason::OperationFailed);} format!("create P2P answer: {e}")})?;
+        Self::phase_ok(phase);
         let sdp = answer.to_string();
+        let mut phase=link.phase(Stage::AnswerSet);
         link.peer
             .set_local_description(answer)
             .await
-            .map_err(|e| format!("set P2P local answer: {e}"))?;
+            .map_err(|e| {if let Some(g)=phase.take() {g.finish(Outcome::Failed,Reason::OperationFailed);} format!("set P2P local answer: {e}")})?;
         link.gathering_origin = Some(Instant::now());
+        Self::phase_ok(phase);
         Ok((link, ice_rx, sdp))
     }
 
     /// Initiator: apply the responder's answer. Mirrors the `p2p-answer`
     /// branch of `P2PLink.handleSignal()`.
     pub async fn handle_answer(&self, answer_sdp: &str) -> Result<(), String> {
+        let mut phase=self.phase(Stage::AnswerParse);
         let answer = SessionDescription::parse(answer_sdp, SdpType::Answer)
-            .map_err(|e| format!("parse P2P answer: {e}"))?;
-        self.peer
+            .map_err(|e| {if let Some(g)=phase.take() {g.finish(Outcome::Failed,Reason::OperationFailed);} format!("parse P2P answer: {e}")})?;
+        Self::phase_ok(phase);
+        let phase=self.phase(Stage::AnswerApply);
+        let result=self.peer
             .set_remote_description(answer)
             .await
-            .map_err(|e| format!("set P2P remote answer: {e}"))
+            .map_err(|e| format!("set P2P remote answer: {e}"));
+        if result.is_ok() {Self::phase_ok(phase);} else if let Some(g)=phase {g.finish(Outcome::Failed,Reason::OperationFailed);}
+        result
     }
 
     /// Add a remote ICE candidate from a `p2p-ice` signal. `None` marks
@@ -423,17 +460,21 @@ impl OnlineP2p {
     /// Returns the open channel, or an error on timeout/failure so the
     /// caller can fall back to the relay path.
     pub async fn wait_open(&self) -> Result<DataChannel, String> {
+        let phase=self.phase(Stage::ChannelWait);
         let mut rx = self.open_rx.lock().await;
         match tokio::time::timeout(P2P_CONNECT_TIMEOUT, rx.recv()).await {
             Ok(Some(dc)) => {
+                Self::phase_ok(phase);
                 *self.state.lock().await = P2pState::Open;
                 Ok(dc)
             }
             Ok(None) => {
+                if let Some(g)=phase {g.finish(Outcome::Failed,Reason::PeerClosed);}
                 *self.state.lock().await = P2pState::Failed;
                 Err("P2P DataChannel closed before open".to_string())
             }
             Err(_) => {
+                if let Some(g)=phase {g.finish(Outcome::Failed,Reason::Timeout);}
                 *self.state.lock().await = P2pState::Failed;
                 Err(format!(
                     "P2P handshake timed out after {}s",
@@ -457,6 +498,7 @@ impl OnlineP2p {
     pub async fn ready_proof(&self, dc: &DataChannel) -> crate::online_route_choice::ReadyProof {
         use crate::online_diagnostics::{Candidate, PairState, Route};
         let observation = self.route_state().await;
+        if let Some(d)=&self.diagnostics {d.pair(observation.summary.clone());}
         let s = observation.summary;
         crate::online_route_choice::ReadyProof {
             dc_open: dc.state() == DataChannelState::Open,
@@ -465,6 +507,14 @@ impl OnlineP2p {
             succeeded: s.pair_state == PairState::Succeeded,
             known: s.local_type != Candidate::Unknown && s.remote_type != Candidate::Unknown,
             relay: s.route == Route::TurnRelay,
+        }
+    }
+
+    /// Advisory only: pre-open ICE stats must NEVER authorize READY or frames.
+    pub async fn diagnostic_pair_state(&self) -> crate::online_diagnostics::RouteSummary {
+        match tokio::time::timeout(Duration::from_secs(2),self.peer.get_stats()).await {
+            Ok(Ok(stats))=>classify_stats(&stats).summary,
+            _=>Default::default(),
         }
     }
 

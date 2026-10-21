@@ -96,6 +96,8 @@ enum OnlineUiEvent {
     P2p { state: String },
     #[serde(rename = "path-diagnostic")]
     PathDiagnostic { summary: Diagnostic },
+    #[serde(rename = "connection-diagnostic")]
+    ConnectionDiagnostic { summary: crate::connection_diagnostics::PhaseEvent },
     /// A transfer finished (or failed).
     #[serde(rename = "transfer-done")]
     TransferDone {
@@ -404,7 +406,7 @@ impl OnlineSession {
                     let setup_begin = if initial_offer && self.native.is_some() {
                         matches!(self.setup.admit_offer(Instant::now())?, OfferAdmission::Begin(_))
                     } else {false};
-                    route.receive(signal).await?;
+                    route.receive(signal).await.map_err(|_|crate::connection_diagnostics::connection_failure())?;
                     if setup_begin && !self.setup.offer_ready(Instant::now()) {
                         route.fail("初始 offer 已超过 setup 期限".into()).await;
                         return Err("初始 offer 已超过 setup 期限".into());
@@ -642,7 +644,9 @@ impl OnlineSession {
                 room.send(&FlingMessage::NativeRoute {id,signal}).await
             })
         });
-        let (route,mut events)=DirectAttempt::new(role,capability,self.ice_servers.clone(),send);
+        let app=self.app.clone();let session_id=self.id.clone();
+        let observer=Arc::new(move |summary|emit(&app,&session_id,OnlineUiEvent::ConnectionDiagnostic {summary}));
+        let (route,mut events)=DirectAttempt::new_observed(role,capability,self.ice_servers.clone(),send,observer);
         // Old callback objects retain old Arcs and cannot emit into the replacement.
         let old=self.route.lock().await.replace((id.clone(),route.clone()));
         if let Some((_,old))=old {old.close().await;}
@@ -671,7 +675,8 @@ impl OnlineSession {
                         session.note(Phase::FallbackRequested);
                         emit(&session.app,&session.id,OnlineUiEvent::P2p {state:"fallback_requested".into()});
                     }
-                    TransportEvent::Failed(error) => {
+                    TransportEvent::Failed(_error) => {
+                        let error=crate::connection_diagnostics::connection_failure();
                         session.note(Phase::ConnectionFailed);
                         if let Some(sender)=session.senders.lock().await.get(&id) {sender.on_failed();}
                         if session.native.is_some() {let _=session.cancel_native(Some(error),false).await;}
@@ -853,8 +858,8 @@ impl OnlineSession {
         // 2. Rust owns both PCs, selected-pair evidence and the first-frame gate.
         self.diagnostics.begin_connection(Role::Initiator);
         let route = self.install_route(transfer_id.clone(), RouteRole::Sender, capability).await?;
-        route.start().await?;
-        let (selected_fence, p2p, dc) = route.wait_selected().await?;
+        route.start().await.map_err(|_|crate::connection_diagnostics::connection_failure())?;
+        let (selected_fence, p2p, dc) = route.wait_selected().await.map_err(|_|crate::connection_diagnostics::connection_failure())?;
         *self.p2p.lock().await = Some(p2p.clone());
         self.note(Phase::DataChannelOpen);
         self.observe_route(p2p.clone());
@@ -969,7 +974,7 @@ impl OnlineSession {
             let mut status = native.status.lock().await;
             if !status.terminal() {
                 status.stage = "error".into();
-                status.error = Some("原生单文件连接建立超时（15 秒）".into());
+                status.error = Some(crate::connection_diagnostics::connection_failure());
                 emit(&self.app, &self.id, OnlineUiEvent::NativeTask { status: status.clone() });
             }
         }
@@ -1204,5 +1209,19 @@ mod ui_event_serialization_tests {
         assert!(should_emit_peer_progress(&progress, "x", PEER_PROGRESS_UI_BYTES, false).await);
         assert!(should_emit_peer_progress(&progress, "x", PEER_PROGRESS_UI_BYTES, true).await);
         assert!(should_emit_peer_progress(&progress, "x", 0, false).await);
+    }
+}
+
+#[cfg(test)]
+mod connection_error_contract_tests {
+    #[test]
+    fn every_direct_first_ui_error_exit_uses_stable_mapping() {
+        let source=include_str!("online_session.rs");
+        assert!(source.contains("route.receive(signal).await.map_err(|_|crate::connection_diagnostics::connection_failure())?"));
+        assert!(source.contains("route.start().await.map_err(|_|crate::connection_diagnostics::connection_failure())?"));
+        assert!(source.contains("route.wait_selected().await.map_err(|_|crate::connection_diagnostics::connection_failure())?"));
+        let branch=source.split("TransportEvent::Failed(_error) => {").nth(1).unwrap().split("TransportEvent::Started").next().unwrap();
+        assert!(branch.contains("let error=crate::connection_diagnostics::connection_failure()"));
+        assert!(branch.contains("cancel_native(Some(error),false)"));
     }
 }
