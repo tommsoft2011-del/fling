@@ -22,13 +22,14 @@ const bridge = read('../src/online-rust.ts');
 const diagnostics = read('../src-tauri/src/online_diagnostics.rs');
 const transfer = read('../src-tauri/src/online_transfer.rs');
 const sender = session.slice(session.indexOf('async fn send_prepared'), session.indexOf('pub fn authorize'));
-const responder = session.slice(session.indexOf('async fn on_p2p_offer'), session.indexOf('fn note(&self'));
-for (const [role, body] of [['initiator', sender], ['responder', responder]]) {
-  assert.match(body, /Phase::DataChannelOpen/, role + ' observes channel open independently');
-  assert.match(body, /observe_route\(p2p\.clone\(\)\)/, role + ' observes selected route');
-  assert.match(body, /Phase::ConnectionFailed/, role + ' observes failure');
-  assert.match(body, /Phase::FallbackRequested/, role + ' observes fallback intent separately');
-}
+const responder = session.slice(session.indexOf('async fn install_route'), session.indexOf('async fn on_p2p_offer'));
+assert.match(sender, /route.wait_selected\(\)\.await\?[\s\S]*?Phase::DataChannelOpen[\s\S]*?observe_route\(p2p\.clone\(\)\)/);
+assert.match(responder, /TransportEvent::Started\(fence\)[\s\S]*?current_fence[\s\S]*?selected_peer\(fence\)[\s\S]*?Phase::DataChannelOpen[\s\S]*?observe_route\(peer\)/);
+assert.match(responder, /TransportEvent::Failed\(error\)[\s\S]*?Phase::ConnectionFailed/);
+assert.match(responder, /TransportEvent::TurnStarted[\s\S]*?Phase::FallbackRequested/);
+assert.match(read('../src-tauri/src/online_direct.rs'), /Effect::CreateTurnPeerConnection[\s\S]*?TransportEvent::TurnStarted/);
+assert.match(sender, /install_route\(transfer_id.clone\(\), RouteRole::Sender/);
+assert.match(session, /install_route\(id.clone\(\), RouteRole::Receiver/);
 assert.match(sender, /if sent > 0[\s\S]*Phase::FirstRealBytes/);
 assert.match(session, /if received_bytes > 0[\s\S]*Phase::FirstRealBytes/);
 assert.match(session, /check_complete_observed\(\|phase\| self\.note_transfer\(&id, phase\)\)/);
@@ -48,7 +49,7 @@ console.log('PASS path diagnostics: privacy allowlist, unknown mapping, both rol
 const history = read('../src/history.ts');
 assert.match(history, /transport === 'unknown' \? '路径暂不可确认'/);
 for (const body of [sender, responder]) assert.match(body, /begin_connection\(Role::/);
-for (const path of ['../package.json', '../src-tauri/tauri.conf.json']) assert.equal(JSON.parse(read(path)).version, '0.6.31');
-assert.match(read('../src/main.ts'), /frontendBuildId: `v0\.6\.31\+/);
+for (const path of ['../package.json', '../src-tauri/tauri.conf.json']) assert.equal(JSON.parse(read(path)).version, '0.6.32');
+assert.match(read('../src/main.ts'), /frontendBuildId: `v0\.6\.32\+/);
 assert.match(read('../src/main.ts'), /buildId: await invoke<string>\('app_build_identity'\)/);
 assert.match(read('../src-tauri/build.rs'), /FLING_BUILD_IDENTITY=v\{\}\+\{commit\}/);

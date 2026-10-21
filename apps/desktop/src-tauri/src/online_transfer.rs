@@ -130,6 +130,10 @@ impl OnlineSender {
         &self.manifest
     }
 
+    pub fn valid_ack_geometry(&self, next_seq:u32, received_bytes:u64) -> bool {
+        next_seq <= self.manifest.total_chunks
+            && received_bytes == (u64::from(next_seq)*u64::from(self.manifest.chunk_size)).min(self.manifest.size)
+    }
     /// Handle a `file-chunk-ack` from the receiver.
     pub fn on_chunk_ack(&self, next_seq: u32) {
         let prev = self.acked.load(std::sync::atomic::Ordering::SeqCst);
@@ -619,6 +623,7 @@ pub fn chunk_ack_message(
     complete: bool,
 ) -> FlingMessage {
     FlingMessage::FileChunkAck {
+        route_fence: None,
         id: receiver.manifest().id.clone(),
         next_seq,
         received_bytes,

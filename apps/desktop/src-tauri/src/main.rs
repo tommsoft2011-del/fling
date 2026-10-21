@@ -37,12 +37,18 @@ mod online_p2p;
 mod online_proto;
 mod online_room;
 mod online_session;
+mod online_setup;
 mod online_transfer;
 mod online_source;
 mod ui_events;
 mod native_drop;
 mod ice_syntax;
 mod online_native;
+mod online_route_choice;
+mod online_route_runtime;
+mod online_direct;
+#[cfg(all(target_os="linux",debug_assertions))]
+mod online_probe;
 // ================================================================ config ==
 
 /// 16 random bytes as lowercase hex. Generated once on first run, never rotated.
@@ -2375,6 +2381,10 @@ fn append_log(app: tauri::AppHandle, file: String, lines: Vec<String>) -> Result
 // ================================================================== main ==
 
 fn main() {
+    #[cfg(all(target_os="linux",debug_assertions))]
+    if let Some(path)=std::env::args().nth(1).filter(|s|s=="--internal-native-acceptance").and_then(|_|std::env::args().nth(2)) {
+        online_probe::run(&path); return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())

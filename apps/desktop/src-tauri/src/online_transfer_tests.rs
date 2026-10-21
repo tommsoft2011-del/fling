@@ -360,3 +360,21 @@ async fn diagnostic_hash_failure_never_reports_commit_and_sync_failure_is_silent
     receiver.abort().await;
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn malformed_ack_geometry_never_advances_confirmed_cursor() {
+    let dir=directory();let data=vec![42;NATIVE_CHUNK_SIZE as usize+19];
+    let source=dir.join("source.bin");std::fs::write(&source,&data).unwrap();
+    let sender=OnlineSender::new(manifest(&data),&source).unwrap();
+    for (seq,bytes) in [(u32::MAX,u64::MAX),(3,data.len() as u64),(1,1),(0,1),(2,data.len() as u64+1)] {
+        assert!(!sender.valid_ack_geometry(seq,bytes));
+        if sender.valid_ack_geometry(seq,bytes) {sender.on_chunk_ack(seq);}
+        assert_eq!(sender.acked.load(Ordering::Acquire),0);
+    }
+    assert!(sender.valid_ack_geometry(0,0));
+    assert!(sender.valid_ack_geometry(1,u64::from(NATIVE_CHUNK_SIZE)));
+    assert!(sender.valid_ack_geometry(2,data.len() as u64));
+    let empty=OnlineSender::new(manifest(b""),&source).unwrap();
+    assert!(empty.valid_ack_geometry(0,0));assert!(!empty.valid_ack_geometry(1,0));
+    drop(sender);drop(empty);std::fs::remove_dir_all(dir).unwrap();
+}

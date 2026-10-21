@@ -46,6 +46,11 @@ impl OnlineRoom {
             .await
             .map_err(|e| format!("LiveKit room connect failed: {e}"))?;
 
+        // Later ParticipantConnected events do not replace the initial snapshot.
+        // The second native process must see a peer that joined before it did.
+        for identity in room.remote_participants().keys() {
+            let _ = event_tx.send(OnlineRoomEvent::PeerJoined(identity.to_string()));
+        }
         // Dispatch loop: decrypt + parse incoming data, forward peer events.
         let key = room_key;
         tokio::spawn(async move {
@@ -107,7 +112,7 @@ impl OnlineRoom {
     pub async fn send(&self, msg: &FlingMessage) -> Result<(), String> {
         let json = serde_json::to_string(msg).map_err(|e| format!("encode message: {e}"))?;
         let sealed = seal_text(&self.room_key, &json);
-        self.room
+        crate::online_setup::bounded_initial_effect(async { self.room
             .local_participant()
             .publish_data(DataPacket {
                 payload: sealed.into_bytes(),
@@ -116,13 +121,13 @@ impl OnlineRoom {
                 ..Default::default()
             })
             .await
-            .map_err(|e| format!("publish Fling message: {e}"))
+            .map_err(|e| format!("publish Fling message: {e}")) }).await
     }
 
     /// Publish raw bytes (already encrypted by the caller) on the Fling
     /// topic. Used for the relay file-chunk path.
     pub async fn publish_raw(&self, payload: Vec<u8>) -> Result<(), String> {
-        self.room
+        crate::online_setup::bounded_initial_effect(async { self.room
             .local_participant()
             .publish_data(DataPacket {
                 payload,
@@ -131,13 +136,16 @@ impl OnlineRoom {
                 ..Default::default()
             })
             .await
-            .map_err(|e| format!("publish raw payload: {e}"))
+            .map_err(|e| format!("publish raw payload: {e}")) }).await
     }
 
     pub async fn disconnect(&self) -> Result<(), String> {
-        self.room
-            .close()
-            .await
-            .map_err(|e| format!("LiveKit disconnect failed: {e}"))
+        // Peer departure and the owner can concurrently request the same close.
+        if self.room.connection_state()==livekit::ConnectionState::Disconnected {return Ok(());}
+        match self.room.close().await {
+            Ok(())=>Ok(()),
+            Err(_) if self.room.connection_state()==livekit::ConnectionState::Disconnected=>Ok(()),
+            Err(error)=>Err(format!("LiveKit disconnect failed: {error}")),
+        }
     }
 }

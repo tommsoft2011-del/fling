@@ -14,7 +14,10 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::online_crypto::derive_room_key;
+use crate::online_direct::{Capability, DirectAttempt, SignalSender, TransportEvent};
+use crate::online_route_choice::{Fence, Role as RouteRole};
 use crate::online_native::{NativeTask, NativeTaskConfig, NativeTaskStatus};
+use crate::online_setup::{bounded_initial_effect, OfferAdmission, SetupLifecycle};
 use crate::online_source::SourceLease;
 use crate::online_diagnostics::{Diagnostic, Diagnostics, Phase, Role, Route, RouteObservation};
 use crate::online_p2p::{has_relay_candidate, OnlineP2p};
@@ -161,6 +164,8 @@ pub struct OnlineSession {
     /// Last ACKed seq per receiver (to throttle `file-chunk-ack`).
     receiver_last_ack: Arc<Mutex<HashMap<String, u32>>>,
     p2p: Mutex<Option<Arc<OnlineP2p>>>,
+    route: Mutex<Option<(String, Arc<DirectAttempt>)>>,
+    route_capabilities: Mutex<HashMap<String, Capability>>,
     // Remote online only. Never serialized or logged; LAN has its own transport.
     ice_servers: Vec<livekit::webrtc::peer_connection_factory::IceServer>,
     pending_ice: Mutex<Vec<String>>,
@@ -169,6 +174,8 @@ pub struct OnlineSession {
     manifest_acks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
     /// Rate-limit ACK progress events sent from Rust to the WebView.
     peer_progress_ui: Arc<Mutex<HashMap<String, (u64, Instant)>>>,
+    /// Receiver-only native direct setup clock; starts after validated manifest, before ACK.
+    setup: SetupLifecycle,
 }
 
 impl OnlineSession {
@@ -205,11 +212,14 @@ impl OnlineSession {
             receivers: Arc::new(Mutex::new(HashMap::new())),
             receiver_last_ack: Arc::new(Mutex::new(HashMap::new())),
             p2p: Mutex::new(None),
+            route: Mutex::new(None),
+            route_capabilities: Mutex::new(HashMap::new()),
             ice_servers,
             pending_ice: Mutex::new(Vec::new()),
             download_dir,
             manifest_acks: Arc::new(Mutex::new(HashMap::new())),
             peer_progress_ui: Arc::new(Mutex::new(HashMap::new())),
+            setup: SetupLifecycle::new(),
         });
 
         // Dispatch loop.
@@ -295,6 +305,7 @@ impl OnlineSession {
                 | FlingMessage::P2pOffer { .. }
                 | FlingMessage::P2pAnswer { .. }
                 | FlingMessage::P2pIce { .. }
+                | FlingMessage::NativeRoute { .. }
         );
         if !is_transfer_internal {
             let message = serde_json::to_value(&msg)
@@ -312,10 +323,15 @@ impl OnlineSession {
             FlingMessage::Text { id, text } => {
                 emit(&self.app, &self.id, OnlineUiEvent::Text { from, id, text });
             }
-            FlingMessage::FileManifest { manifest } => {
-                self.on_file_manifest(manifest).await?;
+            FlingMessage::FileManifest { manifest, route } => {
+                let capability = route.filter(|r| r.valid()).ok_or("对方不支持本版 Rust direct-first 协议，请两端使用同一测试版本")?;
+                self.on_file_manifest(manifest, capability).await?;
             }
-            FlingMessage::FileManifestAck { id, native_single_file, .. } => {
+            FlingMessage::FileManifestAck { id, native_single_file, route, .. } => {
+                let expected = self.route_capabilities.lock().await.get(&id).copied();
+                if route != expected || expected.is_none() {
+                    if let Some(sender) = self.senders.lock().await.get(&id) { sender.on_failed(); }
+                }
                 if self.native.is_some() && native_single_file != Some(true) {
                     if let Some(sender) = self.senders.lock().await.get(&id) { sender.on_failed(); }
                 }
@@ -328,13 +344,21 @@ impl OnlineSession {
             }
             FlingMessage::FileChunkAck {
                 id,
+                route_fence,
                 next_seq,
                 received_bytes,
                 complete,
                 failed,
                 ..
             } => {
-                if let Some(sender) = self.senders.lock().await.get(&id).cloned() {
+                let route = self.route.lock().await.as_ref().filter(|(tid,_)| tid == &id).map(|(_,r)| r.clone());
+                let Some(route) = route else { return Ok(()); };
+                let Some(fence) = route_fence else { return Ok(()); };
+                let sender=self.senders.lock().await.get(&id).cloned();
+                let Some(sender)=sender else {return Ok(());};
+                if !sender.valid_ack_geometry(next_seq,received_bytes) {return Ok(());}
+                if !route.confirm_ack(fence, received_bytes).await { return Ok(()); }
+                {
                     if failed == Some(true) { sender.on_failed(); return Err(format!("receiver failed transfer {id}")); }
                     sender.on_chunk_ack(next_seq);
                     let is_complete = complete == Some(true);
@@ -373,16 +397,22 @@ impl OnlineSession {
                     }
                 }
             }
-            FlingMessage::P2pOffer { sdp } => {
-                self.on_p2p_offer(sdp).await?;
-            }
-            FlingMessage::P2pAnswer { sdp } => {
-                if let Some(p2p) = self.p2p.lock().await.as_ref() {
-                    p2p.handle_answer(&sdp).await?;
+            FlingMessage::NativeRoute { id, signal } => {
+                let route = self.route.lock().await.as_ref().filter(|(tid,_)| tid == &id).map(|(_,r)|r.clone());
+                if let Some(route) = route {
+                    let initial_offer = matches!(&signal, crate::online_direct::Signal::Description { fence, answer: false, .. } if fence.path == crate::online_route_choice::Path::Direct && fence.epoch == route.capability.epoch);
+                    let setup_begin = if initial_offer && self.native.is_some() {
+                        matches!(self.setup.admit_offer(Instant::now())?, OfferAdmission::Begin(_))
+                    } else {false};
+                    route.receive(signal).await?;
+                    if setup_begin && !self.setup.offer_ready(Instant::now()) {
+                        route.fail("初始 offer 已超过 setup 期限".into()).await;
+                        return Err("初始 offer 已超过 setup 期限".into());
+                    }
                 }
             }
-            FlingMessage::P2pIce { candidate } => {
-                self.on_p2p_ice(candidate).await?;
+            FlingMessage::P2pOffer { .. } | FlingMessage::P2pAnswer { .. } | FlingMessage::P2pIce { .. } => {
+                return Err("旧版未围栏 WebRTC 信令不适用于本测试版本".into());
             }
             FlingMessage::TaskAck { task_id } => {
                 if let Some(native) = &self.native {
@@ -421,8 +451,9 @@ impl OnlineSession {
 
     /// Receiver: a manifest arrived. Create the receiver state and ACK it.
     async fn on_file_manifest(
-        &self,
+        self: &Arc<Self>,
         manifest: crate::online_proto::FileManifest,
+        capability: Capability,
     ) -> Result<(), String> {
         self.diagnostics.set_role(Role::Responder);
         if self.cancelled.load(Ordering::Acquire) { return Err("session cancelled".into()); }
@@ -431,7 +462,26 @@ impl OnlineSession {
             if status.direction != "receiving" || status.name != manifest.name || status.total_bytes != manifest.size || manifest.kind != FileKind::File {
                 return Err("manifest does not match accepted single-file offer".into());
             }
+            if native.claimed.load(Ordering::Acquire) {
+                drop(status);
+                let existing = self.receivers.lock().await.get(&manifest.id).cloned();
+                if self.route_capabilities.lock().await.get(&manifest.id) != Some(&capability)
+                    || !existing.as_ref().is_some_and(|r| r.manifest() == &manifest) {
+                    return Err("conflicting manifest for claimed native task".into());
+                }
+                // Idempotent reliable re-delivery: no file recreation, UI
+                // transition, source clock reset, or second native PC.
+                return self.send_manifest_ack(&manifest.id).await;
+            }
             if native.claimed.swap(true, Ordering::AcqRel) { return Err("single-file task already has a manifest".into()); }
+            drop(status);
+            // No untrusted offer can start this clock: task and manifest have now both validated.
+            if self.setup.start(Instant::now()) {
+                let session = self.clone();
+                tokio::spawn(async move {
+                    if session.setup.wait_for_timeout().await { session.fail_setup_timeout().await; }
+                });
+            }
         }
         let id = manifest.id.clone();
         // Notify the frontend so it can create the transferId -> item mapping
@@ -452,25 +502,29 @@ impl OnlineSession {
         );
         let receiver = Arc::new(OnlineReceiver::new(manifest, &self.download_dir)?);
         self.receivers.lock().await.insert(id.clone(), receiver);
+        self.route_capabilities.lock().await.insert(id.clone(), capability);
+        self.install_route(id.clone(), RouteRole::Receiver, capability).await?;
         self.receiver_last_ack.lock().await.insert(id.clone(), 0);
         // Advertise full capabilities: chunk ACKs, binary chunks, 128 KiB
         // direct frames (matching the v0.6.6 LAN engine).
-        self.room
-            .send(&FlingMessage::FileManifestAck {
-                id: id.clone(),
-                native_single_file: self.native.as_ref().map(|_| true),
-                chunk_ack: Some(true),
-                binary_chunks: Some(true),
-                direct_frame_payload_bytes: Some(128 * 1024),
-            })
-            .await?;
+        self.send_manifest_ack(&id).await?;
         let receiver = self.receivers.lock().await.get(&id).cloned().ok_or("receiver missing")?;
-        if receiver.manifest().size == 0 { self.maybe_ack(&receiver, 0).await?; }
+        let _ = receiver; // Empty-file commit is gated by the receiver START handshake, too.
         Ok(())
+    }
+
+    async fn send_manifest_ack(&self, id: &str) -> Result<(), String> {
+        let ack = FlingMessage::FileManifestAck {
+            id: id.to_owned(), route: self.route_capabilities.lock().await.get(id).copied(), native_single_file: self.native.as_ref().map(|_| true),
+            chunk_ack: Some(true), binary_chunks: Some(true), direct_frame_payload_bytes: Some(128 * 1024),
+        };
+        if self.native.is_some() { bounded_initial_effect(self.room.send(&ack)).await }
+        else { self.room.send(&ack).await }
     }
 
     /// Receiver: a relay chunk arrived.
     async fn on_relay_chunk(&self, id: String, seq: u32, data: String) -> Result<(), String> {
+        if self.route.lock().await.is_some() || self.native.is_some() { return Err("本测试版拒绝未选中路径的 relay 文件帧".into()); }
         let receiver = self
             .receivers
             .lock()
@@ -512,7 +566,7 @@ impl OnlineSession {
             let mut publish_error = String::new();
             for attempt in 0..3 {
                 let result = async {
-                    self.room.send(&chunk_ack_message(receiver, next_seq, received_bytes, true)).await?;
+                    self.room.send(&self.fenced_ack(receiver, next_seq, received_bytes, true).await?).await?;
                     self.note_transfer(&id, Phase::DurableAckSent);
                     if let Some(native) = &self.native {
                         let task_id = native.status.lock().await.task_id.clone();
@@ -557,7 +611,7 @@ impl OnlineSession {
             } else { self.receivers.lock().await.remove(&id); }
             emit(&self.app, &self.id, OnlineUiEvent::TransferDone { transfer_id: id.clone(), ok: true, error: None });
         } else {
-            let ack = chunk_ack_message(receiver, next_seq, received_bytes, false);
+            let ack = self.fenced_ack(receiver, next_seq, received_bytes, false).await?;
             if publish_progress_ack(receiver, &self.receiver_last_ack, next_seq, self.room.send(&ack)).await? {
                 if due { emit(&self.app, &self.id, OnlineUiEvent::Progress { transfer_id: id.clone(), sent_bytes: received_bytes, total_bytes: receiver.manifest().size, direction: "receiving".into() }); }
             }
@@ -565,113 +619,90 @@ impl OnlineSession {
         Ok(())
     }
 
-    /// Receiver: a P2P offer arrived. Become the responder.
-    async fn on_p2p_offer(self: &Arc<Self>, sdp: String) -> Result<(), String> {
-        if self.cancelled.load(Ordering::Acquire) { return Err("session cancelled".into()); }
-        if self.native.is_some() { self.native_stage("connecting").await; }
-        self.diagnostics.begin_connection(Role::Responder);
+    async fn current_fence(&self, id: &str) -> Option<Fence> {
+        let route = self.route.lock().await.as_ref().filter(|(tid,_)| tid == id).map(|(_,r)|r.clone())?;
+        route.active_fence().await
+    }
 
-        let ice_servers = self.ice_servers.clone();
-        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (p2p, ice_rx, answer_sdp) = OnlineP2p::accept_offer(ice_servers, &sdp, frame_tx).await.map_err(|e| {
-            self.note(Phase::ConnectionFailed);
-            e
-        })?;
+    async fn fenced_ack(&self, receiver: &OnlineReceiver, next_seq: u32, received_bytes: u64, complete: bool) -> Result<FlingMessage,String> {
+        let fence = self.current_fence(&receiver.manifest().id).await.ok_or("no selected receive path for ACK")?;
+        let mut message = chunk_ack_message(receiver,next_seq,received_bytes,complete);
+        if let FlingMessage::FileChunkAck {route_fence,..} = &mut message { *route_fence=Some(fence); }
+        Ok(message)
+    }
 
-        let p2p = Arc::new(p2p);
-        *self.p2p.lock().await = Some(p2p.clone());
-
-        // Forward our ICE candidates.
-        let room = self.room.clone();
-        let ice_session = self.clone();
-        tokio::spawn(async move {
-            let mut ice_rx = ice_rx;
-            while let Some(candidate) = ice_rx.recv().await {
-                ice_session.note_relay_candidate(candidate.as_deref());
-                let _ = room.send(&FlingMessage::P2pIce { candidate }).await;
-            }
+    async fn install_route(self: &Arc<Self>, id: String, role: RouteRole, capability: Capability) -> Result<Arc<DirectAttempt>,String> {
+        if role==RouteRole::Receiver {self.diagnostics.begin_connection(Role::Responder);}
+        let room = self.room.clone(); let signal_id=id.clone();
+        let send: SignalSender = Arc::new(move |signal| {
+            let room=room.clone();let id=signal_id.clone();
+            Box::pin(async move {
+                #[cfg(all(target_os="linux",debug_assertions))]
+                if crate::online_probe::drop_signal(&signal) {return Ok(());}
+                room.send(&FlingMessage::NativeRoute {id,signal}).await
+            })
         });
-
-        self.room.send(&FlingMessage::P2pAnswer { sdp: answer_sdp }).await?;
-
-        // Flush any ICE that arrived before the PC existed.
-        let pending: Vec<String> = std::mem::take(&mut *self.pending_ice.lock().await);
-        for candidate in pending {
-            p2p.add_remote_ice(Some(candidate)).await?;
-        }
-
-        // Wait for the channel, then pump FLNG frames into the receivers.
-        let session_id = self.id.clone();
-        let app = self.app.clone();
-        let room = self.room.clone();
-        // We need &self in the async pump; clone the Arcs we need.
-        let session = self.clone();
-        let receivers = self.receivers.clone();
+        let (route,mut events)=DirectAttempt::new(role,capability,self.ice_servers.clone(),send);
+        // Old callback objects retain old Arcs and cannot emit into the replacement.
+        let old=self.route.lock().await.replace((id.clone(),route.clone()));
+        if let Some((_,old))=old {old.close().await;}
+        if role==RouteRole::Receiver {route.expect_offer(Instant::now()).await?;}
+        let weak_session=Arc::downgrade(self);let weak_route=Arc::downgrade(&route);
+        let mut terminal=route.terminal_watch();
         tokio::spawn(async move {
-            // Register the message handler BEFORE wait_open(): libwebrtc drops
-            // messages received before on_message is set, so the handler must
-            // be attached as soon as the DataChannel is created (via
-            // on_data_channel), not after it opens.
-            match p2p.wait_open().await {
-                Ok(_dc) => {
-
-                    // Surface the P2P state to the UI (⚡ label): the sender
-                    // emits this from send_file, the responder must too.
-                    session.note(Phase::DataChannelOpen);
-                    emit(&app, &session_id, OnlineUiEvent::P2p { state: "open".to_string() });
-                    session.observe_route(p2p.clone());
-                    // Pump: on_message (native thread, attached early by
-                    // OnlineP2p) -> channel -> async task that routes frames
-                    // to receivers and ACKs.
-                    while let Some(frame_bytes) = frame_rx.recv().await {
-                        // Decode just the transfer id synchronously.
-                        let id = match crate::native_lan::decode_direct_file_frame(&frame_bytes) {
-                            Ok(Some(f)) => f.id,
-                            _ => {
-
-                                continue;
-                            }
-                        };
-                        let receiver = match receivers.lock().await.get(&id).cloned() {
-                            Some(r) => r,
-                            None => {
-
-                                continue;
-                            }
-                        };
-                        if receiver.is_committed() {
-                            let _ = session.maybe_ack(&receiver, receiver.manifest().total_chunks).await;
-                            continue;
+            loop {
+                // Terminal state is sticky and independent of a full data-frame
+                // queue. Do not hold a route Arc while awaiting (avoids a cycle).
+                let terminated=*terminal.borrow();
+                let event=if terminated {TransportEvent::Failed("安全连接已终止".into())} else {
+                    tokio::select! {biased;
+                        changed=terminal.changed()=>{
+                            if changed.is_err() {break;}
+                            TransportEvent::Failed("安全连接已终止".into())
+                        },
+                        event=events.recv()=>{let Some(event)=event else {break;};event}
+                    }
+                };
+                let (Some(session),Some(route))=(weak_session.upgrade(),weak_route.upgrade()) else {break;};
+                let current=session.route.lock().await.as_ref().is_some_and(|(tid,r)|tid==&id && Arc::ptr_eq(r,&route));
+                if !current || session.cancelled.load(Ordering::Acquire) {break;}
+                match event {
+                    TransportEvent::TurnStarted => {
+                        session.note(Phase::FallbackRequested);
+                        emit(&session.app,&session.id,OnlineUiEvent::P2p {state:"fallback_requested".into()});
+                    }
+                    TransportEvent::Failed(error) => {
+                        session.note(Phase::ConnectionFailed);
+                        if let Some(sender)=session.senders.lock().await.get(&id) {sender.on_failed();}
+                        if session.native.is_some() {let _=session.cancel_native(Some(error),false).await;}
+                        break;
+                    }
+                    TransportEvent::Started(fence) => {
+                        if session.current_fence(&id).await!=Some(fence) {continue;}
+                        if let Some(peer)=route.selected_peer(fence).await {
+                            let first=session.p2p.lock().await.is_none();
+                            *session.p2p.lock().await=Some(peer.clone());
+                            if first {session.note(Phase::DataChannelOpen);session.observe_route(peer);}
                         }
-                        let next_seq = match receiver.on_p2p_frame(&frame_bytes).await {
-                            Ok(n) => n,
-                            Err(e) => {
-
-                                session.fail_receive(&receiver, &e).await;
-                                continue;
-                            }
-                        };
-                        let _ = session.maybe_ack(&receiver, next_seq).await;
+                        let receiver=session.receivers.lock().await.get(&id).cloned();
+                        if let Some(receiver)=receiver {if receiver.manifest().size==0 {let _=session.maybe_ack(&receiver,0).await;}}
                     }
-                    let _ = room;
-                }
-                Err(_e) => {
-                    session.note(Phase::ConnectionFailed);
-                    emit(&app, &session_id, OnlineUiEvent::P2p { state: "failed".to_string() });
-                    session.note(Phase::FallbackRequested);
-                    emit(&app, &session_id, OnlineUiEvent::P2p { state: "fallback_requested".into() });
-                    p2p.close();
-                    session.note(Phase::ConnectionClosed);
-                    // No file frames arrived: this is a recoverable connection failure,
-                    // not a file-transfer failure or a successful relay takeover.
-                    if session.native.is_some() {
-                        let _ = session.cancel_native(Some(connection_failure().into()), false).await;
+                    TransportEvent::Frame {fence,bytes} => {
+                        if session.current_fence(&id).await!=Some(fence) {continue;}
+                        let decoded=match crate::native_lan::decode_direct_file_frame(&bytes) {Ok(Some(f))=>f,_=>continue};
+                        if decoded.id!=id {continue;}
+                        let receiver=session.receivers.lock().await.get(&id).cloned();
+                        let Some(receiver)=receiver else {continue;};
+                        let result=if receiver.is_committed() {Ok(receiver.manifest().total_chunks)} else {receiver.on_p2p_frame(&bytes).await};
+                        match result {
+                            Ok(next)=>{if let Err(error)=session.maybe_ack(&receiver,next).await {session.fail_receive(&receiver,&error).await;route.fail(error).await;}},
+                            Err(error)=>{session.fail_receive(&receiver,&error).await;route.fail(error).await;}
+                        }
                     }
-                    eprintln!("fling online P2P responder connection failed");
                 }
             }
         });
-        Ok(())
+        Ok(route)
     }
 
     fn note(&self, phase: Phase) {
@@ -701,7 +732,11 @@ impl OnlineSession {
         let p2p = self.p2p.lock().await.clone();
         if let Some(p2p) = p2p {
             let observation = p2p.route_state().await;
-            self.record_route(observation, p2p.state().await == crate::online_p2p::P2pState::Open);
+            let open=p2p.state().await == crate::online_p2p::P2pState::Open;
+            let current=self.p2p.lock().await;
+            if current.as_ref().is_some_and(|p|Arc::ptr_eq(p,&p2p)) {
+                self.record_route(observation,open);
+            }
         }
     }
 
@@ -718,33 +753,29 @@ impl OnlineSession {
             // Advisory stats never block frames. One collection per second; no per-chunk stats.
             loop {
                 let state = p2p.state().await;
+                let current=session.p2p.lock().await;
+                if !current.as_ref().is_some_and(|p|Arc::ptr_eq(p,&p2p)) {break;}
                 if matches!(state, crate::online_p2p::P2pState::Failed | crate::online_p2p::P2pState::Closed) {
                     session.record_route(RouteObservation::default(), false);
                     session.note(if state == crate::online_p2p::P2pState::Failed { Phase::ConnectionFailed } else { Phase::ConnectionClosed });
                     emit(&session.app, &session.id, OnlineUiEvent::P2p { state: "closed".into() });
                     break;
                 }
+                drop(current);
                 if session.cancelled.load(Ordering::Acquire) { break; }
                 if let Some(native) = &session.native {
                     if native.status.lock().await.terminal() { break; }
                 }
                 if state != crate::online_p2p::P2pState::Open { break; }
                 let observation = p2p.route_state().await;
-                session.record_route(observation, p2p.state().await == crate::online_p2p::P2pState::Open);
+                let open=p2p.state().await == crate::online_p2p::P2pState::Open;
+                let current=session.p2p.lock().await;
+                if !current.as_ref().is_some_and(|p|Arc::ptr_eq(p,&p2p)) {break;}
+                session.record_route(observation,open);
+                drop(current);
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
-    }
-
-    /// Handle a remote ICE candidate (or buffer it if the PC isn't ready).
-    async fn on_p2p_ice(&self, candidate: Option<String>) -> Result<(), String> {
-        self.note_relay_candidate(candidate.as_deref());
-        if let Some(p2p) = self.p2p.lock().await.as_ref() {
-            p2p.add_remote_ice(candidate).await?;
-        } else if let Some(c) = candidate {
-            self.pending_ice.lock().await.push(c);
-        }
-        Ok(())
     }
 
     /// Sender: transmit one file. Builds the manifest, exchanges it, tries
@@ -761,6 +792,22 @@ impl OnlineSession {
     }
 
     async fn send_prepared(self: &Arc<Self>, sender: Arc<OnlineSender>) -> Result<String, String> {
+        let id=sender.manifest().id.clone();
+        let result=self.send_prepared_inner(sender).await;
+        // All early exits share cleanup; native cancellation also has an outer scope.
+        self.senders.lock().await.remove(&id);
+        self.manifest_acks.lock().await.remove(&id);
+        self.route_capabilities.lock().await.remove(&id);
+        self.peer_progress_ui.lock().await.remove(&id);
+        if result.is_err() {
+            self.note_transfer(&id,Phase::TransferFailed);
+            let route={let mut current=self.route.lock().await;
+                if current.as_ref().is_some_and(|(tid,_)|tid==&id) {current.take()} else {None}};
+            if let Some((_,route))=route {route.close().await;}
+        }
+        result
+    }
+    async fn send_prepared_inner(self: &Arc<Self>, sender: Arc<OnlineSender>) -> Result<String, String> {
         self.diagnostics.set_role(Role::Initiator);
         let manifest = sender.manifest();
         let transfer_id = manifest.id.clone();
@@ -777,7 +824,9 @@ impl OnlineSession {
             .await
             .insert(transfer_id.clone(), sender.clone());
 
-        // 1. Manifest + ACK.
+        // 1. Manifest + exact Rust route capability/epoch echo.
+        let capability = Capability::fresh();
+        self.route_capabilities.lock().await.insert(transfer_id.clone(), capability);
         let manifest_notify = Arc::new(tokio::sync::Notify::new());
         self.manifest_acks
             .lock()
@@ -786,6 +835,7 @@ impl OnlineSession {
         self.room
             .send(&FlingMessage::FileManifest {
                 manifest: sender.manifest().clone(),
+                route: Some(capability),
             })
             .await?;
         // Wait for the receiver's manifest ACK (advertises capabilities).
@@ -797,65 +847,17 @@ impl OnlineSession {
             return Err("file manifest ACK timeout".to_string());
         }
         self.manifest_acks.lock().await.remove(&transfer_id);
-        if sender.is_failed() { return Err("对方不支持 0.6.29 原生单文件确认，请两端使用此测试版本".into()); }
+        if sender.is_failed() { return Err("对方不支持本版 Rust direct-first 协议，请两端使用此测试版本".into()); }
 
         if self.native.is_some() { self.native_stage("connecting").await; }
-        // 2. P2P attempt (initiator).
-        let ice_servers = self.ice_servers.clone();
+        // 2. Rust owns both PCs, selected-pair evidence and the first-frame gate.
         self.diagnostics.begin_connection(Role::Initiator);
-        let p2p_result = OnlineP2p::start_initiator(ice_servers).await;
-        let use_p2p = match p2p_result {
-            Ok((p2p, ice_rx, offer_sdp)) => {
-
-                let p2p = Arc::new(p2p);
-                *self.p2p.lock().await = Some(p2p.clone());
-                let room = self.room.clone();
-                let ice_session = self.clone();
-                tokio::spawn(async move {
-                    let mut ice_rx = ice_rx;
-                    while let Some(candidate) = ice_rx.recv().await {
-                        ice_session.note_relay_candidate(candidate.as_deref());
-                        let _ = room.send(&FlingMessage::P2pIce { candidate }).await;
-                    }
-                });
-                self.room.send(&FlingMessage::P2pOffer { sdp: offer_sdp }).await?;
-
-                // Flush pending ICE.
-                let pending: Vec<String> = std::mem::take(&mut *self.pending_ice.lock().await);
-
-                for candidate in pending {
-                    p2p.add_remote_ice(Some(candidate)).await?;
-                }
-                    match p2p.wait_open().await {
-                    Ok(dc) => {
-
-                        self.note(Phase::DataChannelOpen);
-                        emit(&self.app, &self.id, OnlineUiEvent::P2p { state: "open".to_string() });
-                        self.observe_route(p2p.clone());
-                        Some((p2p, dc))
-                    }
-                    Err(_e) => {
-                        self.note(Phase::ConnectionFailed);
-                        p2p.close();
-
-                        eprintln!("fling online P2P initiator failed; relay not established");
-                        emit(&self.app, &self.id, OnlineUiEvent::P2p { state: "failed".to_string() });
-                        None
-                    }
-                }
-            }
-            Err(_e) => {
-                self.note(Phase::ConnectionFailed);
-                eprintln!("fling online P2P setup failed; relay not established");
-                emit(&self.app, &self.id, OnlineUiEvent::P2p { state: "failed".into() });
-                None
-            }
-        };
-
-        if use_p2p.is_none() {
-            self.note(Phase::FallbackRequested);
-            emit(&self.app, &self.id, OnlineUiEvent::P2p { state: "fallback_requested".into() });
-        }
+        let route = self.install_route(transfer_id.clone(), RouteRole::Sender, capability).await?;
+        route.start().await?;
+        let (selected_fence, p2p, dc) = route.wait_selected().await?;
+        *self.p2p.lock().await = Some(p2p.clone());
+        self.note(Phase::DataChannelOpen);
+        self.observe_route(p2p.clone());
         // 3. Transfer.
         let app = self.app.clone();
         let session_id = self.id.clone();
@@ -890,53 +892,19 @@ impl OnlineSession {
             );
         };
 
-        let result = if let Some((_p2p, dc)) = use_p2p {
-            // P2P path: FLNG batch frames with polling backpressure.
-            let dc_send = dc.clone();
-            sender
-                .send_via_p2p(
-                    |frame| {
-                        dc_send
-                            .send(&frame, true)
-                            .map_err(|e| format!("P2P send frame: {e}"))
-                    },
-                    || dc.buffered_amount(),
-                    on_progress,
-                )
-                .await
-        } else if self.native.is_some() {
-            Err(connection_failure().into())
-        } else {
-            // Relay path: base64 chunks over LiveKit. The engine emits
-            // (seq, b64) pairs into a channel; a forwarder publishes them.
-            let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel::<(u32, String)>();
-            let room = self.room.clone();
-            let tid2 = transfer_id.clone();
-            let forwarder = tokio::spawn(async move {
-                while let Some((seq, b64)) = chunk_rx.recv().await {
-                    let _ = room
-                        .send(&FlingMessage::FileChunk {
-                            id: tid2.clone(),
-                            seq,
-                            data: b64,
-                        })
-                        .await;
+        let dc_send = dc.clone();
+        let gate = route.clone();
+        let result = sender.send_via_p2p(
+            |frame| {
+                if gate.is_terminal() || dc_send.state() != livekit::webrtc::data_channel::DataChannelState::Open {
+                    return Err("选中路径已失败；本次传输不迁移路径".into());
                 }
-            });
-            let relay_result = sender
-                .send_via_relay(
-                    |seq, b64| {
-                        chunk_tx
-                            .send((seq, b64))
-                            .map_err(|_| "relay chunk channel closed".to_string())
-                    },
-                    on_progress,
-                )
-                .await;
-            drop(chunk_tx);
-            let _ = forwarder.await;
-            relay_result
-        };
+                // The only DC returned by wait_selected belongs to this immutable fence.
+                let _ = selected_fence;
+                dc_send.send(&frame, true).map_err(|e| format!("P2P send frame: {e}"))
+            },
+            || dc.buffered_amount(), on_progress,
+        ).await;
 
         // 4. Report.
         // NOTE: Do NOT send FlingMessage::TaskDone here — that's a task-level
@@ -982,10 +950,36 @@ impl OnlineSession {
     pub async fn native_stage(&self, stage: &str) {
         if let Some(native) = &self.native {
             let mut status = native.status.lock().await;
+            if status.direction == "receiving" && !self.setup.active(Instant::now()) { return; }
             if !status.terminal() {
                 status.stage = stage.into();
                 emit(&self.app, &self.id, OnlineUiEvent::NativeTask { status: status.clone() });
             }
+        }
+    }
+
+    /// Commit local terminal status and reclaim resources before best-effort signaling.
+    async fn fail_setup_timeout(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let route = self.route.lock().await.as_ref().map(|(_,r)|r.clone());
+        if let Some(route)=route {route.close().await;}
+        self.cancel_notify.notify_one();
+        if let Some(native) = &self.native {
+            native.cancel_source();
+            let mut status = native.status.lock().await;
+            if !status.terminal() {
+                status.stage = "error".into();
+                status.error = Some("原生单文件连接建立超时（15 秒）".into());
+                emit(&self.app, &self.id, OnlineUiEvent::NativeTask { status: status.clone() });
+            }
+        }
+        let receivers: Vec<_> = self.receivers.lock().await.drain().map(|(_, receiver)| receiver).collect();
+        for receiver in receivers { receiver.abort().await; }
+        self.receiver_last_ack.lock().await.clear();
+        if let Some(p2p) = self.p2p.lock().await.as_ref() { p2p.close(); }
+        let task_id = self.native.as_ref().and_then(|n| n.status.try_lock().ok().map(|s| s.task_id.clone())).unwrap_or_default();
+        if !task_id.is_empty() {
+            let _ = tokio::time::timeout(Duration::from_millis(500), self.room.send(&FlingMessage::TaskCancel { task_id })).await;
         }
     }
 
@@ -995,7 +989,7 @@ impl OnlineSession {
         self.snapshot_route().await;
         self.note_transfer(&id, Phase::TaskEnd);
         receiver.abort().await;
-        let _ = self.room.send(&FlingMessage::FileChunkAck { id: id.clone(), next_seq: 0, received_bytes: 0, ack_id: None, complete: None, failed: Some(true) }).await;
+        let _ = self.room.send(&FlingMessage::FileChunkAck { route_fence: self.current_fence(&id).await, id: id.clone(), next_seq: 0, received_bytes: 0, ack_id: None, complete: None, failed: Some(true) }).await;
         self.receivers.lock().await.remove(&id);
         self.receiver_last_ack.lock().await.remove(&id);
         if let Some(native) = &self.native {
@@ -1070,7 +1064,13 @@ impl OnlineSession {
         self.senders.lock().await.clear();
         self.manifest_acks.lock().await.clear();
         self.peer_progress_ui.lock().await.clear();
-        if result.is_err() { self.note(Phase::TransferFailed); }
+        if result.is_err() {
+            let route=self.route.lock().await.as_ref().map(|(_,r)|r.clone());
+            if let Some(route)=route {route.close().await;}
+            if let Some(p2p) = self.p2p.lock().await.take() { p2p.close(); }
+            self.pending_ice.lock().await.clear();
+            self.note(Phase::TransferFailed);
+        }
         self.snapshot_route().await;
         self.note(Phase::TaskEnd);
         let mut status = native.status.lock().await;
@@ -1089,10 +1089,14 @@ impl OnlineSession {
             if native.status.lock().await.terminal() { return Ok(()); }
             native.cancel_source();
         }
+        self.cancelled.store(true, Ordering::Release);
+        self.cancel_notify.notify_one();
+        let route = self.route.lock().await.as_ref().map(|(_,r)|r.clone());
+        if let Some(route)=&route {route.block_frames();}
         if error.is_some() { self.note(Phase::TransferFailed); } else { self.note(Phase::TaskCancelled); }
         self.snapshot_route().await;
         self.note(Phase::TaskEnd);
-        self.cancelled.store(true, Ordering::Release);
+        if let Some(route)=route {route.close().await;}
         self.cancel_notify.notify_one();
         let receivers: Vec<_> = self.receivers.lock().await.drain().map(|(_, receiver)| receiver).collect();
         for receiver in receivers { receiver.abort().await; }
@@ -1119,6 +1123,7 @@ impl OnlineSession {
     /// Send a raw protocol message (used by the frontend adapter for
     /// offer / task lifecycle messages).
     pub async fn send_raw(&self, msg: FlingMessage) -> Result<(), String> {
+        if !msg.webview_intent() {return Err("WebView 不得发送 Rust 所有的传输信令、帧或 ACK".into());}
         self.room.send(&msg).await
     }
 

@@ -11,7 +11,7 @@
 //! switch to LiveKit file relay when connection establishment fails.
 
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use livekit::webrtc::{
     data_channel::{DataChannel, DataChannelState},
@@ -136,6 +136,41 @@ fn classify_stats(stats: &[RtcStats]) -> crate::online_diagnostics::RouteObserva
     RouteObservation::default()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IceMode { Legacy, Direct, Turn }
+
+/// Filter before allocating a PC: Direct never receives TURN credentials, and
+/// Turn has Relay policy rather than an All-policy PC containing a TURN URL.
+fn mode_configuration(servers: Vec<IceServer>, mode: IceMode) -> Result<RtcConfiguration, String> {
+    let mut config = RtcConfiguration::default();
+    config.continual_gathering_policy = ContinualGatheringPolicy::GatherOnce;
+    config.ice_transport_type = if mode == IceMode::Turn { IceTransportsType::Relay } else { IceTransportsType::All };
+    config.ice_servers = servers.into_iter().filter_map(|mut server| {
+        server.urls.retain(|url| match mode {
+            IceMode::Legacy => true,
+            IceMode::Direct => url.starts_with("stun:") || url.starts_with("stuns:"),
+            IceMode::Turn => valid_turn_url(url),
+        });
+        if mode == IceMode::Direct { server.username.clear(); server.password.clear(); }
+        (!server.urls.is_empty()).then_some(server)
+    }).collect();
+    if mode == IceMode::Turn && config.ice_servers.is_empty() { return Err("未配置可用 TURN；本次连接失败，请重试".into()); }
+    Ok(config)
+}
+
+/// Bound both allocation size and backlog BEFORE copying native callback data.
+const MAX_INCOMING_FRAME: usize = crate::native_lan::DIRECT_FILE_BATCH_PAYLOAD_LIMIT_BYTES
+    + crate::native_lan::DIRECT_FILE_BATCH_FRAME_HEADER_SIZE;
+fn enqueue_frame(tx: &mpsc::Sender<Vec<u8>>, data: &[u8], closed: &std::sync::atomic::AtomicBool) {
+    if data.len() > MAX_INCOMING_FRAME {
+        closed.store(true, std::sync::atomic::Ordering::Release); return;
+    }
+    match tx.try_reserve() {
+        Ok(permit) => permit.send(data.to_vec()),
+        Err(_) => { closed.store(true, std::sync::atomic::Ordering::Release); }
+    }
+}
+
 pub const P2P_DC_LABEL: &str = "fling-file";
 /// P2P handshake timeout, matching the 12s `p2pReady` timeout in `tasks.ts`.
 pub const P2P_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
@@ -162,6 +197,7 @@ pub enum P2pState {
 /// A direct P2P link. The initiator creates the offer; the responder
 /// answers. Both sides feed remote ICE candidates via `add_remote_ice`.
 pub struct OnlineP2p {
+    gathering_origin: Option<Instant>,
     channel_closed: Arc<std::sync::atomic::AtomicBool>,
     peer: livekit::webrtc::peer_connection::PeerConnection,
     _factory: PeerConnectionFactory,
@@ -175,7 +211,7 @@ pub struct OnlineP2p {
     /// Early message handler: attached to the DataChannel as soon as it is
     /// created (before Open), so no frames are dropped by libwebrtc.
     /// If not set before the channel is created, messages may be lost.
-    msg_handler: Arc<StdMutex<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
+    msg_handler: Arc<StdMutex<Option<mpsc::Sender<Vec<u8>>>>>,
 }
 
 impl OnlineP2p {
@@ -185,10 +221,11 @@ impl OnlineP2p {
         open_tx: mpsc::UnboundedSender<DataChannel>,
         open_rx: mpsc::UnboundedReceiver<DataChannel>,
     ) -> Result<Self, String> {
-        let mut config = RtcConfiguration::default();
-        config.ice_servers = ice_servers;
-        config.continual_gathering_policy = ContinualGatheringPolicy::GatherOnce;
-        config.ice_transport_type = IceTransportsType::All;
+        Self::new_mode(ice_servers, IceMode::Legacy, ice_tx, open_tx, open_rx)
+    }
+
+    fn new_mode(ice_servers: Vec<IceServer>, mode: IceMode, ice_tx: mpsc::UnboundedSender<Option<String>>, open_tx: mpsc::UnboundedSender<DataChannel>, open_rx: mpsc::UnboundedReceiver<DataChannel>) -> Result<Self, String> {
+        let config = mode_configuration(ice_servers, mode)?;
         let factory = PeerConnectionFactory::default();
         let peer = factory
             .create_peer_connection(config)
@@ -211,6 +248,7 @@ impl OnlineP2p {
         let state = Arc::new(Mutex::new(P2pState::Connecting));
 
         Ok(Self {
+            gathering_origin: None,
             channel_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             peer,
             _factory: factory,
@@ -226,7 +264,7 @@ impl OnlineP2p {
     /// The handler will be attached as soon as the channel exists, preventing
     /// libwebrtc from dropping early frames (it does not queue messages
     /// received before on_message is registered).
-    pub fn set_message_handler(&self, tx: mpsc::UnboundedSender<Vec<u8>>) {
+    pub fn set_message_handler(&self, tx: mpsc::Sender<Vec<u8>>) {
         *self.msg_handler.lock().unwrap() = Some(tx);
     }
 
@@ -234,9 +272,10 @@ impl OnlineP2p {
     /// Called as soon as the channel is created (before Open).
     fn attach_early_handler(&self, dc: &DataChannel) {
         if let Some(tx) = self.msg_handler.lock().unwrap().clone() {
+            let closed = self.channel_closed.clone();
             dc.on_message(Some(Box::new(move |msg| {
                 if msg.binary {
-                    let _ = tx.send(msg.data.to_vec());
+                    enqueue_frame(&tx, &msg.data, &closed);
                 }
             })));
         }
@@ -247,9 +286,13 @@ impl OnlineP2p {
     pub async fn start_initiator(
         ice_servers: Vec<IceServer>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Option<String>>, String), String> {
+        Self::start_initiator_mode(ice_servers, IceMode::Legacy).await
+    }
+
+    pub async fn start_initiator_mode(ice_servers: Vec<IceServer>, mode: IceMode) -> Result<(Self, mpsc::UnboundedReceiver<Option<String>>, String), String> {
         let (ice_tx, ice_rx) = mpsc::unbounded_channel();
         let (open_tx, open_rx) = mpsc::unbounded_channel();
-        let link = Self::new_common(ice_servers, ice_tx, open_tx.clone(), open_rx)?;
+        let mut link = Self::new_mode(ice_servers, mode, ice_tx, open_tx.clone(), open_rx)?;
 
         let dc = link
             .peer
@@ -270,6 +313,7 @@ impl OnlineP2p {
             .set_local_description(offer)
             .await
             .map_err(|e| format!("set P2P local offer: {e}"))?;
+        link.gathering_origin = Some(Instant::now());
         Ok((link, ice_rx, sdp))
     }
 
@@ -278,11 +322,15 @@ impl OnlineP2p {
     pub async fn accept_offer(
         ice_servers: Vec<IceServer>,
         offer_sdp: &str,
-        frame_tx: mpsc::UnboundedSender<Vec<u8>>,
+        frame_tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Option<String>>, String), String> {
+        Self::accept_offer_mode(ice_servers, IceMode::Legacy, offer_sdp, frame_tx).await
+    }
+
+    pub async fn accept_offer_mode(ice_servers: Vec<IceServer>, mode: IceMode, offer_sdp: &str, frame_tx: mpsc::Sender<Vec<u8>>) -> Result<(Self, mpsc::UnboundedReceiver<Option<String>>, String), String> {
         let (ice_tx, ice_rx) = mpsc::unbounded_channel();
         let (open_tx, open_rx) = mpsc::unbounded_channel();
-        let link = Self::new_common(ice_servers, ice_tx, open_tx.clone(), open_rx)?;
+        let mut link = Self::new_mode(ice_servers, mode, ice_tx, open_tx.clone(), open_rx)?;
 
         link.set_message_handler(frame_tx);
 
@@ -296,9 +344,10 @@ impl OnlineP2p {
                 // drop frames that arrive before the handler is registered.
                 if let Some(tx) = link_msg_handler.lock().unwrap().clone() {
                     let tx_clone = tx.clone();
+                    let ingress_closed = link_closed.clone();
                     dc.on_message(Some(Box::new(move |msg| {
                         if msg.binary {
-                            let _ = tx_clone.send(msg.data.to_vec());
+                            enqueue_frame(&tx_clone, &msg.data, &ingress_closed);
                         }
                     })));
                 }
@@ -330,6 +379,7 @@ impl OnlineP2p {
             .set_local_description(answer)
             .await
             .map_err(|e| format!("set P2P local answer: {e}"))?;
+        link.gathering_origin = Some(Instant::now());
         Ok((link, ice_rx, sdp))
     }
 
@@ -400,6 +450,24 @@ impl OnlineP2p {
         *self.state.lock().await
     }
 
+    pub fn gathering_origin(&self) -> Instant { self.gathering_origin.expect("successful setLocalDescription source") }
+
+    /// Native readiness, not a UI classification. Unknown or transitional
+    /// stats cannot authorize transfer, including the diagnostic flicker cache.
+    pub async fn ready_proof(&self, dc: &DataChannel) -> crate::online_route_choice::ReadyProof {
+        use crate::online_diagnostics::{Candidate, PairState, Route};
+        let observation = self.route_state().await;
+        let s = observation.summary;
+        crate::online_route_choice::ReadyProof {
+            dc_open: dc.state() == DataChannelState::Open,
+            pc_connected: self.peer.connection_state() == livekit::webrtc::peer_connection::PeerConnectionState::Connected,
+            selected: s.selected, nominated: s.nominated == Some(true),
+            succeeded: s.pair_state == PairState::Succeeded,
+            known: s.local_type != Candidate::Unknown && s.remote_type != Candidate::Unknown,
+            relay: s.route == Route::TurnRelay,
+        }
+    }
+
     /// Determine the selected ICE route only after the DataChannel is open.
     /// Stats are never logged or exposed, and collection is bounded.
     pub async fn route_state(&self) -> crate::online_diagnostics::RouteObservation {
@@ -437,6 +505,15 @@ impl OnlineP2p {
     pub fn close(&self) {
         self.channel_closed.store(true, std::sync::atomic::Ordering::Release);
         self.peer.close();
+    }
+}
+
+// Initial createOffer/setLocalDescription futures may fail or be cancelled
+// before the link is installed in OnlineSession. Close that partial allocation
+// as well; session-level CloseAll cannot reach a not-yet-returned link.
+impl Drop for OnlineP2p {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -571,5 +648,55 @@ mod tests {
             "a=candidate:1 1 udp 1 1.2.3.4 9 typ host"
         ));
         assert!(!has_relay_candidate("a=x relay typ host"));
+    }
+    #[tokio::test]
+    async fn initial_effect_timeout_closes_unregistered_native_peer_connection() {
+        use livekit::webrtc::peer_connection::PeerConnectionState;
+        let (ice_tx, _ice_rx) = mpsc::unbounded_channel();
+        let (open_tx, open_rx) = mpsc::unbounded_channel();
+        let link = OnlineP2p::new_common(vec![], ice_tx, open_tx, open_rx).unwrap();
+        let observer = link.peer.clone();
+        let result = crate::online_setup::bounded_initial_effect(async move {
+            let owned = link;
+            std::future::pending::<()>().await;
+            drop(owned);
+            Ok::<(), String>(())
+        }).await;
+        assert!(result.is_err());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while observer.connection_state() != PeerConnectionState::Closed {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("partial native PC must close even before session registration");
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    #[test]
+    fn direct_drops_turn_credentials_and_turn_is_relay_only() {
+        let servers=vec![IceServer {urls:vec!["stun:stun.example:3478".into(),"turn:turn.example:3478".into()],username:"user".into(),password:"password".into()}];
+        let direct=mode_configuration(servers.clone(),IceMode::Direct).unwrap();
+        assert_eq!(direct.ice_transport_type,IceTransportsType::All);
+        assert_eq!(direct.ice_servers[0].urls,vec!["stun:stun.example:3478"]);
+        assert!(direct.ice_servers[0].username.is_empty());assert!(direct.ice_servers[0].password.is_empty());
+        let turn=mode_configuration(servers,IceMode::Turn).unwrap();
+        assert_eq!(turn.ice_transport_type,IceTransportsType::Relay);
+        assert_eq!(turn.ice_servers[0].urls,vec!["turn:turn.example:3478"]);
+        assert_eq!(turn.ice_servers[0].username,"user");
+        assert!(mode_configuration(vec![],IceMode::Turn).is_err());
+        assert!(mode_configuration(vec![],IceMode::Direct).unwrap().ice_servers.is_empty());
+    }
+    #[test]
+    fn callback_queue_is_bounded_before_copy_and_overflow_fences_link() {
+        use std::sync::atomic::{AtomicBool,Ordering};
+        let (tx,mut rx)=mpsc::channel(1);let closed=AtomicBool::new(false);
+        enqueue_frame(&tx,&vec![0;MAX_INCOMING_FRAME+1],&closed);
+        assert!(closed.load(Ordering::Acquire));assert!(rx.try_recv().is_err());
+        closed.store(false,Ordering::Release);
+        enqueue_frame(&tx,b"first",&closed);assert!(!closed.load(Ordering::Acquire));
+        enqueue_frame(&tx,b"overflow",&closed);assert!(closed.load(Ordering::Acquire));
+        assert_eq!(rx.try_recv().unwrap(),b"first");assert!(rx.try_recv().is_err());
     }
 }
