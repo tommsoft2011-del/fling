@@ -240,7 +240,7 @@ export interface ItemState {
   /** 文件 sha256（用于完整性核对） */
   sha256?: string;
   mimeType?: string;
-  transport?: 'p2p' | 'relay' | 'mixed';
+  transport?: 'p2p' | 'relay' | 'mixed' | 'unknown';
   relPath?: string;
 }
 
@@ -270,7 +270,7 @@ function mergeTransport(current: ItemState['transport'], route: 'p2p' | 'relay')
   return current && current !== route ? 'mixed' : route;
 }
 
-function summarizeTransport(items: ItemState[]): 'p2p' | 'relay' | 'mixed' | undefined {
+function summarizeTransport(items: ItemState[]): 'p2p' | 'relay' | 'mixed' | 'unknown' | undefined {
   const routes = new Set(items.map((item) => item.transport).filter(Boolean));
   if (routes.size === 0) return undefined;
   return routes.size === 1 ? [...routes][0] : 'mixed';
@@ -283,7 +283,7 @@ export class SendTask {
   readonly taskId = uid('task');
   phase: SendPhase = 'preparing';
   nativeStage?: string;
-  nativeRoute?: 'direct' | 'relay';
+  nativeRoute?: 'direct' | 'relay' | 'unknown';
   get nativeSingleFile(): boolean { return this.source.length === 1 && !!this.source[0]?.sourceId && !this.source[0]?.relPath; }
   items: ItemState[];
   startedAt = Date.now();
@@ -580,7 +580,11 @@ export class SendTask {
       }
       this.room = await connectFlingRoom(spec, {
         onNativeTask: (status) => this.applyNativeStatus(status),
-        onNativeRoute: (route) => { this.nativeRoute = route; this.notify(); },
+        onNativeRoute: (route) => {
+          this.nativeRoute = route;
+          if (route !== undefined && this.items[0]) this.items[0].transport = route === 'direct' ? 'p2p' : route;
+          this.notify();
+        },
         onPeerJoined: () => this.onPeer(),
         onPeerLeft: () => {
           // 接收方离开：ack 可能还在路上，给 3 秒宽限期，超时才判失败
@@ -719,7 +723,7 @@ export class SendTask {
             this.p2p = nextP2p as typeof this.p2p;
             this.notify();
           }
-          if (this.nativeSingleFile) this.items[0]!.transport = route;
+          // Native history follows confirmed Rust route, never DataChannel-open alone.
           if (this.currentSendingItem) {
             this.currentSendingItem.transport = mergeTransport(this.currentSendingItem.transport, route);
           }
@@ -1413,7 +1417,7 @@ export class RecvTask {
   readonly taskId: string;
   phase: RecvPhase = 'receiving';
   nativeStage?: string;
-  nativeRoute?: 'direct' | 'relay';
+  nativeRoute?: 'direct' | 'relay' | 'unknown';
   items: ItemState[];
   startedAt = Date.now();
   endedAt?: number;
@@ -1591,8 +1595,12 @@ export class RecvTask {
         this.nativeStage = 'connecting';
         this.room = await connectFlingRoom(spec, {
           onNativeTask: (status) => this.applyNativeStatus(status),
-        onNativeRoute: (route) => { this.nativeRoute = route; this.notify(); },
-          onFileRoute: (route) => { this.p2p = route === 'p2p' ? 'open' : 'failed'; this.items[0]!.transport = route; this.notify(); },
+        onNativeRoute: (route) => {
+          this.nativeRoute = route;
+          if (route !== undefined && this.items[0]) this.items[0].transport = route === 'direct' ? 'p2p' : route;
+          this.notify();
+        },
+          onFileRoute: (route) => { this.p2p = route === 'p2p' ? 'open' : 'failed'; this.notify(); },
           onLog: (tag, msg) => log(tag as LogTag, `[native] ${msg}`),
         });
         if (this.cancelled) {

@@ -79,7 +79,7 @@ function renderEntry(e: HistoryEntry): HTMLElement {
   const l1 = el('div', 'hl1');
   l1.appendChild(el('b', '', e.peer));
   if (e.transport) {
-    const routeLabel = e.transport === 'p2p' ? 'P2P 直连' : e.transport === 'relay' ? '中继' : 'P2P/中继混合';
+    const routeLabel = e.transport === 'p2p' ? 'P2P 直连' : e.transport === 'relay' ? '中继' : e.transport === 'unknown' ? '路径暂不可确认' : 'P2P/中继混合';
     l1.appendChild(el('span', '', routeLabel));
   }
   const counts = new Map<string, number>();
@@ -124,7 +124,7 @@ function renderEntry(e: HistoryEntry): HTMLElement {
       fn.title = [it.savedPath, it.mimeType ? `MIME：${it.mimeType}` : ''].filter(Boolean).join('\n') || it.path || it.name;
       row.append(fn, el('span', '', fmtSize(it.size)));
       if (it.transport) {
-        const routeLabel = it.transport === 'p2p' ? 'P2P 直连' : it.transport === 'relay' ? '中继' : '混合';
+        const routeLabel = it.transport === 'p2p' ? 'P2P 直连' : it.transport === 'relay' ? '中继' : it.transport === 'unknown' ? '路径暂不可确认' : '混合';
         row.appendChild(el('span', '', routeLabel));
       }
       if (it.status === 'ok') {
@@ -215,7 +215,7 @@ function singleSummary(it: HistoryItem, dir: 'send' | 'recv'): HTMLElement {
     th.append(`剪贴板图片 · ${fmtSize(it.size)}`);
     span.appendChild(th);
   } else {
-    const routeLabel = it.transport === 'p2p' ? ' · P2P 直连' : it.transport === 'relay' ? ' · 中继' : it.transport === 'mixed' ? ' · P2P/中继混合' : '';
+    const routeLabel = it.transport === 'p2p' ? ' · P2P 直连' : it.transport === 'relay' ? ' · 中继' : it.transport === 'mixed' ? ' · P2P/中继混合' : it.transport === 'unknown' ? ' · 路径暂不可确认' : '';
     const resultLabel = it.status === 'fail' ? '传输失败' : dir === 'send' ? '发送成功' : '已保存到接收目录';
     span.textContent = `${it.path ?? it.name} · ${fmtSize(it.size)} · ${resultLabel}${routeLabel}`;
     const details = [it.savedPath ? `保存位置：${it.savedPath}` : '', it.mimeType ? `MIME：${it.mimeType}` : ''].filter(Boolean);

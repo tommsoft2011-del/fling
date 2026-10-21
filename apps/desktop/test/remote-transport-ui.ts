@@ -28,5 +28,5 @@ console.log('ok - remote Rust transport UI regression contracts');
 assert.match(card, /bars\.hidden = !hasProgress/, 'overall progress is hidden before receive/ACK progress');
 assert.match(card, /bytes === 0 && !complete[\s\S]*?等待接收进度/, 'file details do not show invented zero-percent progress');
 
-assert.match(card, /task\.nativeRoute === 'relay'[\s\S]*?备用连接已建立/, 'backup-established label requires Rust confirmed route');
+assert.match(card, /nativeRouteLabel\(task\.nativeRoute\)/, 'labels use the native route mapping');
 assert.match(bridge, /ev\.state === 'relay_established'[\s\S]*?events\.onNativeRoute\?\.\('relay'\)/, 'only actual Rust takeover sets relay confirmation');

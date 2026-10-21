@@ -534,7 +534,13 @@ impl OnlineReceiver {
 
     /// Check whether the transfer is complete; if so, verify the hash and
     /// move the temp file into place. Returns true when done.
+    #[cfg(test)]
     pub async fn check_complete(&self) -> Result<bool, String> {
+        self.check_complete_observed(|_| {}).await
+    }
+
+    pub async fn check_complete_observed(&self, observe: impl Fn(crate::online_diagnostics::Phase)) -> Result<bool, String> {
+        use crate::online_diagnostics::Phase;
         let _gate = self.gate.lock().await;
         if self.cancelled.load(Ordering::Acquire) { return Err("receive cancelled".into()); }
         if self.committed.load(Ordering::Acquire) { return Ok(true); }
@@ -553,6 +559,7 @@ impl OnlineReceiver {
             file.sync_all().map_err(|e| format!("sync receive: {e}"))?;
             *guard = None;
         }
+        observe(Phase::DiskSynced);
         let mut disk = File::open(&self.temp_path).map_err(|e| format!("open for SHA verification: {e}"))?;
         let mut hasher = Sha256::new();
         let mut buffer = vec![0; 128 * 1024];
@@ -564,11 +571,13 @@ impl OnlineReceiver {
         drop(disk);
         let digest = format!("{:x}", hasher.finalize());
         if digest != self.manifest.sha256 { return Err("sha256 mismatch after receive".into()); }
+        observe(Phase::HashVerified);
         // Same-directory hard-link is atomic and never overwrites an existing file.
         // Existing names fail explicitly; the owner can rename/remove and retry.
         std::fs::hard_link(&self.temp_path, &self.target_path)
             .map_err(|e| format!("atomic no-overwrite commit: {e}"))?;
         self.committed.store(true, Ordering::Release);
+        observe(Phase::AtomicCommit);
         let _ = std::fs::remove_file(&self.temp_path);
         self.complete_notify.notify_waiters();
         Ok(true)

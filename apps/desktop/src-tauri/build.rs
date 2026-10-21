@@ -21,5 +21,6 @@ fn main() {
         })
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=FLING_BUILD_ID={commit}");
+    println!("cargo:rustc-env=FLING_BUILD_IDENTITY=v{}+{commit}", std::env::var("CARGO_PKG_VERSION").expect("package version"));
     tauri_build::build();
 }

@@ -32,6 +32,7 @@ mod transport_diagnostics;
 mod native_lan;
 mod native_lan_runtime;
 mod online_crypto;
+mod online_diagnostics;
 mod online_p2p;
 mod online_proto;
 mod online_room;
@@ -2296,6 +2297,11 @@ fn app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+#[tauri::command]
+fn app_build_identity() -> String {
+    env!("FLING_BUILD_IDENTITY").to_string()
+}
+
 /// 日志目录：<app_log_dir>/fling
 fn log_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     use tauri::Manager;
@@ -2492,6 +2498,7 @@ fn main() {
             write_image_clipboard,
             open_folder,
             app_version,
+            app_build_identity,
             get_log_dir,
             append_log,
             read_history,

@@ -180,7 +180,8 @@ async function startMain(): Promise<void> {
     const ver = (await invoke('app_version')) as string;
     log('app', 'fling started', { version: ver });
     log('app', 'diagnostic build identifier', {
-      buildId: `v0.6.29+${__FLING_BUILD_COMMIT__}`,
+      buildId: await invoke<string>('app_build_identity'),
+      frontendBuildId: `v0.6.31+${__FLING_BUILD_COMMIT__}`,
       commit: __FLING_BUILD_COMMIT__,
     });
   } catch {

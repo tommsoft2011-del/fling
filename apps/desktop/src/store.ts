@@ -20,7 +20,7 @@ export interface HistoryItem {
   /** Browser-provided MIME type when available. */
   mimeType?: string;
   /** Observed payload route for this item. */
-  transport?: 'p2p' | 'relay' | 'mixed';
+  transport?: 'p2p' | 'relay' | 'mixed' | 'unknown';
 }
 
 export interface HistoryEntry {
@@ -31,7 +31,7 @@ export interface HistoryEntry {
   endedAt?: number;
   items: HistoryItem[];
   totalBytes: number;
-  transport?: 'p2p' | 'relay' | 'mixed';
+  transport?: 'p2p' | 'relay' | 'mixed' | 'unknown';
 }
 
 const HIST_KEY = 'fling-history-v4';

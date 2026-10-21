@@ -322,3 +322,41 @@ fn windows_junction_is_rejected_for_source_registration_and_folder_receive() {
     assert!(!outside.join("received.bin").exists());
     std::fs::remove_dir(link).unwrap(); std::fs::remove_dir_all(root).unwrap(); std::fs::remove_dir_all(outside).unwrap();
 }
+
+#[tokio::test]
+async fn diagnostic_phases_follow_real_sync_hash_and_atomic_commit() {
+    use crate::online_diagnostics::Phase;
+    let dir = directory();
+    let data = b"observable durable bytes";
+    let receiver = OnlineReceiver::new(manifest(data), &dir).unwrap();
+    let phases = std::sync::Mutex::new(Vec::new());
+    assert!(!receiver.check_complete_observed(|p| phases.lock().unwrap().push(p)).await.unwrap());
+    assert!(phases.lock().unwrap().is_empty());
+    receiver.on_relay_chunk(0, &B64.encode(data)).await.unwrap();
+    assert!(receiver.check_complete_observed(|p| phases.lock().unwrap().push(p)).await.unwrap());
+    assert_eq!(*phases.lock().unwrap(), vec![Phase::DiskSynced, Phase::HashVerified, Phase::AtomicCommit]);
+    assert_eq!(std::fs::read(receiver.target_path()).unwrap(), data);
+    assert!(receiver.check_complete_observed(|_| panic!("commit replay must be silent")).await.unwrap());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn diagnostic_hash_failure_never_reports_commit_and_sync_failure_is_silent() {
+    use crate::online_diagnostics::Phase;
+    let dir = directory();
+    let data = b"corruption must not be success";
+    let receiver = OnlineReceiver::new(manifest(data), &dir).unwrap();
+    receiver.on_relay_chunk(0, &B64.encode(data)).await.unwrap();
+    std::fs::write(&receiver.temp_path, vec![0; data.len()]).unwrap();
+    let phases = std::sync::Mutex::new(Vec::new());
+    assert!(receiver.check_complete_observed(|p| phases.lock().unwrap().push(p)).await.is_err());
+    assert_eq!(*phases.lock().unwrap(), vec![Phase::DiskSynced]);
+    assert!(!receiver.target_path().exists());
+    receiver.abort().await;
+    let receiver = OnlineReceiver::new(manifest(data), &dir).unwrap();
+    receiver.on_relay_chunk(0, &B64.encode(data)).await.unwrap();
+    receiver.file.lock().await.take();
+    assert!(receiver.check_complete_observed(|_| panic!("sync failed: no success milestone")).await.is_err());
+    receiver.abort().await;
+    std::fs::remove_dir_all(dir).unwrap();
+}

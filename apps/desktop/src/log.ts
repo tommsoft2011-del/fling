@@ -8,7 +8,7 @@ const queue: string[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Never serialize identifying, path-like, address, credential, content, or hash fields.
-const PRIVATE_FIELD = /^(?:name|filename|file_name|displayname|peer|peerlabel|peername|device|devicename|deviceid|path|filepath|relpath|savedpath|directory|dir|folder|url|urls|host|hostname|address|ip|port|candidate|sdp|token|secret|password|apikey|apisecret|key|taskkey|content|text|payload|data|datab64|sha256|hash|checksum|error|msg|message)$/i;
+const PRIVATE_FIELD = /^(?:id|taskid|sessionid|session|transferid|sourceid|roomid|roomname|identity|username|credential|credentials|errMsg|reason|name|filename|file_name|displayname|peer|peerlabel|peername|device|devicename|deviceid|path|filepath|relpath|savedpath|directory|dir|folder|url|urls|host|hostname|address|ip|port|candidate|sdp|token|secret|password|apikey|apisecret|key|taskkey|content|text|payload|data|datab64|sha256|hash|checksum|error|msg|message)$/i;
 
 function dayStamp(d = new Date()): string {
   const p = (n: number) => String(n).padStart(2, '0');

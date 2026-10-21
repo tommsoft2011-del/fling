@@ -86,57 +86,54 @@ pub fn has_relay_candidate(sdp: &str) -> bool {
     })
 }
 
-fn classify_stats(stats: &[RtcStats]) -> Option<&'static str> {
-    use livekit::webrtc::stats::IceCandidatePairState::Succeeded;
-    for transport in stats {
-        let RtcStats::Transport(transport) = transport else {
-            continue;
-        };
-        let pair_id = &transport.transport.selected_candidate_pair_id;
-        if pair_id.is_empty() {
-            continue;
-        }
+// Select only the pair referenced by a transport, never any candidate merely present.
+fn classify_stats(stats: &[RtcStats]) -> crate::online_diagnostics::RouteObservation {
+    use crate::online_diagnostics::{Candidate, PairState, Protocol, Route, RouteObservation};
+    fn candidate(t: Option<IceCandidateType>) -> Candidate {
+        match t { Some(IceCandidateType::Host) => Candidate::Host,
+            Some(IceCandidateType::Srflx) => Candidate::Srflx,
+            Some(IceCandidateType::Prflx) => Candidate::Prflx,
+            Some(IceCandidateType::Relay) => Candidate::Relay, None => Candidate::Unknown }
+    }
+    fn protocol(p: &str) -> Protocol {
+        if p.eq_ignore_ascii_case("udp") { Protocol::Udp }
+        else if p.eq_ignore_ascii_case("tcp") { Protocol::Tcp } else { Protocol::Unknown }
+    }
+    for stat in stats {
+        let RtcStats::Transport(transport) = stat else { continue; };
+        let id = &transport.transport.selected_candidate_pair_id;
+        if id.is_empty() { continue; }
         let Some(pair) = stats.iter().find_map(|s| match s {
-            RtcStats::CandidatePair(p) if p.rtc.id == *pair_id => Some(&p.candidate_pair),
-            _ => None,
-        }) else {
-            continue;
+            RtcStats::CandidatePair(p) if p.rtc.id == *id => Some(&p.candidate_pair), _ => None,
+        }) else { continue; };
+        let mut observation = RouteObservation { pair_key: Some(id.clone()), ..Default::default() };
+        let summary = &mut observation.summary;
+        summary.selected = true;
+        summary.pair_state = match pair.state {
+            Some(IceCandidatePairState::Succeeded) => PairState::Succeeded,
+            Some(IceCandidatePairState::Failed) => PairState::Failed,
+            Some(IceCandidatePairState::Frozen) => PairState::Frozen,
+            Some(IceCandidatePairState::Waiting) => PairState::Waiting,
+            Some(IceCandidatePairState::InProgress) => PairState::InProgress,
+            None => PairState::Unknown,
         };
-        if pair.state != Some(Succeeded) {
-            continue;
-        }
+        summary.nominated = Some(pair.nominated);
         let local = stats.iter().find_map(|s| match s {
-            RtcStats::LocalCandidate(c) if c.rtc.id == pair.local_candidate_id => {
-                c.local_candidate.candidate_type
-            }
-            _ => None,
+            RtcStats::LocalCandidate(c) if c.rtc.id == pair.local_candidate_id => Some(&c.local_candidate), _ => None,
         });
         let remote = stats.iter().find_map(|s| match s {
-            RtcStats::RemoteCandidate(c) if c.rtc.id == pair.remote_candidate_id => {
-                c.remote_candidate.candidate_type
-            }
-            _ => None,
+            RtcStats::RemoteCandidate(c) if c.rtc.id == pair.remote_candidate_id => Some(&c.remote_candidate), _ => None,
         });
-        if local.is_none() || remote.is_none() {
-            continue;
+        if let Some(c) = local { summary.local_type = candidate(c.candidate_type); summary.local_protocol = protocol(&c.protocol); }
+        if let Some(c) = remote { summary.remote_type = candidate(c.candidate_type); summary.remote_protocol = protocol(&c.protocol); }
+        if summary.pair_state == PairState::Succeeded && summary.local_type != Candidate::Unknown && summary.remote_type != Candidate::Unknown {
+            summary.route = if summary.local_type == Candidate::Relay || summary.remote_type == Candidate::Relay {
+                Route::TurnRelay
+            } else { Route::Direct };
         }
-        return Some(
-            if local == Some(IceCandidateType::Relay) || remote == Some(IceCandidateType::Relay) {
-                "relay_established"
-            } else if matches!(
-                local,
-                Some(IceCandidateType::Host | IceCandidateType::Srflx)
-            ) && matches!(
-                remote,
-                Some(IceCandidateType::Host | IceCandidateType::Srflx)
-            ) {
-                "direct_established"
-            } else {
-                continue;
-            },
-        );
+        return observation;
     }
-    None
+    RouteObservation::default()
 }
 
 pub const P2P_DC_LABEL: &str = "fling-file";
@@ -159,11 +156,13 @@ pub enum P2pState {
     Connecting,
     Open,
     Failed,
+    Closed,
 }
 
 /// A direct P2P link. The initiator creates the offer; the responder
 /// answers. Both sides feed remote ICE candidates via `add_remote_ice`.
 pub struct OnlineP2p {
+    channel_closed: Arc<std::sync::atomic::AtomicBool>,
     peer: livekit::webrtc::peer_connection::PeerConnection,
     _factory: PeerConnectionFactory,
     state: Arc<Mutex<P2pState>>,
@@ -212,6 +211,7 @@ impl OnlineP2p {
         let state = Arc::new(Mutex::new(P2pState::Connecting));
 
         Ok(Self {
+            channel_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             peer,
             _factory: factory,
             state,
@@ -289,6 +289,7 @@ impl OnlineP2p {
         // The responder's DataChannel arrives via on_data_channel.
         let link_open_tx = link.open_tx.clone();
         let link_msg_handler = link.msg_handler.clone();
+        let link_closed = link.channel_closed.clone();
         link.peer
             .on_data_channel(Some(Box::new(move |dc: DataChannel| {
                 // Attach early message handler BEFORE Open, so libwebrtc doesn't
@@ -304,7 +305,9 @@ impl OnlineP2p {
                 // Wire open-state delivery like the initiator path.
                 let open_tx = link_open_tx.clone();
                 let dc_for_open = dc.clone();
+                let closed = link_closed.clone();
                 dc.on_state_change(Some(Box::new(move |state| {
+                    if state == DataChannelState::Closed { closed.store(true, std::sync::atomic::Ordering::Release); }
                     if state == DataChannelState::Open {
                         let _ = open_tx.send(dc_for_open.clone());
                     }
@@ -391,23 +394,27 @@ impl OnlineP2p {
     }
 
     pub async fn state(&self) -> P2pState {
+        use livekit::webrtc::peer_connection::PeerConnectionState;
+        if self.channel_closed.load(std::sync::atomic::Ordering::Acquire) || self.peer.connection_state() == PeerConnectionState::Closed { return P2pState::Closed; }
+        if self.peer.connection_state() == PeerConnectionState::Failed { return P2pState::Failed; }
         *self.state.lock().await
     }
 
     /// Determine the selected ICE route only after the DataChannel is open.
     /// Stats are never logged or exposed, and collection is bounded.
-    pub async fn route_state(&self) -> Option<&'static str> {
-        if *self.state.lock().await != P2pState::Open {
-            return None;
+    pub async fn route_state(&self) -> crate::online_diagnostics::RouteObservation {
+        if self.state().await != P2pState::Open {
+            return Default::default();
         }
         if self.peer.connection_state()
             != livekit::webrtc::peer_connection::PeerConnectionState::Connected
         {
-            return None;
+            return Default::default();
         }
         match tokio::time::timeout(Duration::from_secs(2), self.peer.get_stats()).await {
-            Ok(Ok(stats)) => classify_stats(&stats),
-            _ => None,
+            Ok(Ok(stats)) if self.state().await == P2pState::Open && self.peer.connection_state()
+                == livekit::webrtc::peer_connection::PeerConnectionState::Connected => classify_stats(&stats),
+            _ => Default::default(),
         }
     }
 
@@ -418,7 +425,9 @@ impl OnlineP2p {
         // Deliver the channel via open_tx only once it reaches Open state.
         let open_tx = self.open_tx.clone();
         let dc_for_open = dc.clone();
+        let closed = self.channel_closed.clone();
         dc.on_state_change(Some(Box::new(move |state| {
+            if state == DataChannelState::Closed { closed.store(true, std::sync::atomic::Ordering::Release); }
             if state == DataChannelState::Open {
                 let _ = open_tx.send(dc_for_open.clone());
             }
@@ -426,6 +435,7 @@ impl OnlineP2p {
     }
 
     pub fn close(&self) {
+        self.channel_closed.store(true, std::sync::atomic::Ordering::Release);
         self.peer.close();
     }
 }
@@ -526,52 +536,30 @@ mod tests {
 
     #[test]
     fn route_classifies_only_selected_succeeded_pair() {
-        assert_eq!(
-            classify_stats(&stats(
-                Some(IceCandidatePairState::Succeeded),
-                Some(IceCandidateType::Relay),
-                Some(IceCandidateType::Host),
-                true
-            )),
-            Some("relay_established")
-        );
-        assert_eq!(
-            classify_stats(&stats(
-                Some(IceCandidatePairState::Succeeded),
-                Some(IceCandidateType::Host),
-                Some(IceCandidateType::Srflx),
-                true
-            )),
-            Some("direct_established")
-        );
-        assert_eq!(
-            classify_stats(&stats(
-                Some(IceCandidatePairState::Succeeded),
-                Some(IceCandidateType::Relay),
-                Some(IceCandidateType::Host),
-                false
-            )),
-            None
-        );
-        assert_eq!(
-            classify_stats(&stats(
-                Some(IceCandidatePairState::Failed),
-                Some(IceCandidateType::Relay),
-                Some(IceCandidateType::Host),
-                true
-            )),
-            None
-        );
-        assert_eq!(
-            classify_stats(&stats(
-                Some(IceCandidatePairState::Succeeded),
-                Some(IceCandidateType::Relay),
-                None,
-                true
-            )),
-            None
-        );
-        assert_eq!(classify_stats(&[]), None);
+        use crate::online_diagnostics::{Route, Candidate, Protocol, PairState};
+        for (state, local, remote, selected, expected) in [
+            (Some(IceCandidatePairState::Succeeded), Some(IceCandidateType::Relay), Some(IceCandidateType::Host), true, Route::TurnRelay),
+            (Some(IceCandidatePairState::Succeeded), Some(IceCandidateType::Host), Some(IceCandidateType::Srflx), true, Route::Direct),
+            (Some(IceCandidatePairState::Succeeded), Some(IceCandidateType::Prflx), Some(IceCandidateType::Host), true, Route::Direct),
+            (Some(IceCandidatePairState::Succeeded), Some(IceCandidateType::Relay), Some(IceCandidateType::Host), false, Route::Unknown),
+            (Some(IceCandidatePairState::Failed), Some(IceCandidateType::Relay), Some(IceCandidateType::Host), true, Route::Unknown),
+            (Some(IceCandidatePairState::Succeeded), Some(IceCandidateType::Relay), None, true, Route::Unknown),
+        ] { assert_eq!(classify_stats(&stats(state, local, remote, selected)).summary.route, expected); }
+        assert_eq!(classify_stats(&[]).summary.route, Route::Unknown);
+        let mut input = stats(Some(IceCandidatePairState::Succeeded), Some(IceCandidateType::Relay), Some(IceCandidateType::Host), true);
+        for item in &mut input {
+            match item {
+                RtcStats::CandidatePair(p) => p.candidate_pair.nominated = true,
+                RtcStats::LocalCandidate(c) => { c.local_candidate.protocol = "UDP".into(); c.local_candidate.address = "192.0.2.44".into(); c.local_candidate.port = 54321; c.local_candidate.url = "turn:private".into(); },
+                RtcStats::RemoteCandidate(c) => c.remote_candidate.protocol = "tcp".into(), _ => {},
+            }
+        }
+        let summary = classify_stats(&input).summary;
+        assert!(summary.selected); assert_eq!(summary.nominated, Some(true));
+        assert_eq!(summary.local_type, Candidate::Relay); assert_eq!(summary.pair_state, PairState::Succeeded);
+        assert_eq!(summary.local_protocol, Protocol::Udp); assert_eq!(summary.remote_protocol, Protocol::Tcp);
+        let json = serde_json::to_string(&summary).unwrap();
+        for forbidden in ["192.0.2.44", "54321", "turn:private", "address", "url", "port\""] { assert!(!json.contains(forbidden)); }
     }
 
     #[test]

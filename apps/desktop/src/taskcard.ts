@@ -1,3 +1,4 @@
+import { nativeRouteLabel } from './route-diagnostics.js';
 // 任务行：紧凑单行渲染（底部抽屉 / 接收中分组用）
 // DOM 只建一次，之后原地更新
 import type { SendTask, RecvTask } from './tasks.js';
@@ -277,10 +278,13 @@ export function createTaskRow(task: AnyTask, dir: 'send' | 'recv'): CardHandle {
 
     // P2P 直连标记（紧凑：加到 peer 后）
     const p2p = task.p2p;
-    const relayEstablished = task.nativeRoute === 'relay';
-    peer.textContent = task.peerLabel + (relayEstablished ? ' · 备用连接已建立' : task.nativeRoute === 'direct' ? ' · 直连已建立' : '');
-    peer.title = relayEstablished ? 'Rust 已确认选中 TURN 中继且安全数据通道已打开' : task.nativeRoute === 'direct' ? 'Rust 已确认直连通道' : active ? '正在建立安全连接' : '';
-
+    const routeLabel = nativeRouteLabel(task.nativeRoute);
+    peer.textContent = task.peerLabel + (routeLabel ? ' · ' + routeLabel : '');
+    peer.title = task.nativeRoute === 'relay'
+      ? 'Rust 已确认选中的成功 ICE 候选对包含 TURN；TURN 承载 WebRTC DataChannel 数据包，不是 LiveKit 应用层文件中继'
+      : task.nativeRoute === 'direct' ? 'Rust 已确认选中的成功 ICE 直连候选对'
+      : task.nativeRoute === 'unknown' ? '安全数据通道已打开，但统计暂不可用或选中路径尚不能确认'
+      : active ? '正在建立安全连接' : '';
     // 完成/失败/取消/拒绝后 5s 自动淡出
     if ((phase === 'done' || (phase === 'error' && !task.error?.includes('连接未建立')) || phase === 'cancelled' || (phase as string) === 'rejected') && !dismissTimer) {
       dismissTimer = setTimeout(() => {

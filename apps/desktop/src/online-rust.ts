@@ -16,6 +16,7 @@ import type {
 } from '@fling/core';
 import type { FileLike } from '@fling/core';
 import { log } from './log.js';
+import { safeRouteDiagnostic, type NativeRoute } from './route-diagnostics.js';
 import { KEY_CTX, mintToken } from './net.js';
 import type { RoomSpec } from './net.js';
 
@@ -26,7 +27,7 @@ export interface NativeTaskStatus {
 }
 export type NativeRoomEvents = FlingRoomEvents & {
   onNativeTask?: (status: NativeTaskStatus) => void;
-  onNativeRoute?: (route: 'direct' | 'relay') => void;
+  onNativeRoute?: (route: NativeRoute | undefined) => void;
 };
 
 interface OnlineUiEvent {
@@ -112,7 +113,7 @@ export class RustFlingRoom {
     const events = this.events;
     // Native tasks never let legacy TS protocol handlers decide completion,
     // cancellation or byte accounting. Render Rust snapshots only.
-    if (this.nativeTask && !['native-task', 'p2p', 'p2p-log', 'peer', 'disconnected'].includes(ev.kind)) return;
+    if (this.nativeTask && !['native-task', 'p2p', 'p2p-log', 'path-diagnostic', 'peer', 'disconnected'].includes(ev.kind)) return;
     try {
       switch (ev.kind) {
         case 'native-task':
@@ -171,19 +172,26 @@ export class RustFlingRoom {
             this.directActive = true;
             events.onNativeRoute?.('relay');
             events.onFileRoute?.('relay', '');
-          } else if (ev.state === 'direct_established' || ev.state === 'open') {
+          } else if (ev.state === 'direct_established' || ev.state === 'open' || ev.state === 'unknown_established') {
             this.directActive = true;
             if (ev.state === 'direct_established') events.onNativeRoute?.('direct');
+            else events.onNativeRoute?.('unknown');
             events.onFileRoute?.('p2p', '');
           } else if (ev.state === 'relay_candidate' || ev.state === 'fallback_requested') {
             // ICE/TURN candidate selection and fallback request are not an open DataChannel.
-          } else if (ev.state === 'failed') {
+          } else if (ev.state === 'failed' || ev.state === 'closed') {
             // Direct failure is not proof that an alternate DataChannel opened.
             this.directActive = false;
+            events.onNativeRoute?.(undefined);
           }
           break;
+        case 'path-diagnostic': {
+          const summary = safeRouteDiagnostic(ev.summary);
+          if (summary) log('p2p', 'path diagnostic', summary);
+          break;
+        }
         case 'p2p-log':
-          log('p2p', 'rust: ' + (ev.message as string));
+          // Old arbitrary native strings are not a safe diagnostic contract.
           break;
         case 'transfer-done':
           if (ev.ok) {
