@@ -12,3 +12,14 @@ assert.equal(written.length, 1);
 for (const value of ['RAW-', 'PRIVATE-', '192.0.2.10', '54321', 'turn:']) assert.ok(!written[0].includes(value), value);
 for (const value of ['turn_relay', 'local_type', 'remote_type', 'local_protocol', 'selected', 'nominated', 'elapsed_ms']) assert.ok(written[0].includes(value), value);
 console.log('PASS path log privacy: raw IDs, endpoints, credentials, paths, names and content excluded; route evidence retained');
+
+const { safeConnectionDiagnostic } = await import('../src/connection-diagnostics.js');
+const diagnostic = safeConnectionDiagnostic({ role: 'sender', path: 'Turn', stage: 'ice_add', outcome: 'failed', reason: 'timeout', count: 3, elapsed_ms: 42,
+  error: 'PRIVATE-CREDENTIAL', candidate: 'RAW-CANDIDATE' });
+assert.ok(diagnostic);
+log('p2p', 'connection diagnostic', diagnostic);
+await flushLogs();
+const line = written.at(-1)!;
+for (const value of ['transport_path','Turn','failure_category','timeout','ice_add','count']) assert.ok(line.includes(value), value);
+for (const value of ['PRIVATE-', 'RAW-', 'candidate', 'password']) assert.ok(!line.includes(value), value);
+console.log('PASS connection log boundary: safe path and failure category survive global privacy filtering');

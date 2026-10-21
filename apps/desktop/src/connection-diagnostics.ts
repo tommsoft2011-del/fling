@@ -41,5 +41,9 @@ export function safeConnectionDiagnostic(value: unknown): Record<string, unknown
     if (typeof source.selected !== 'boolean' || !(source.nominated === null || typeof source.nominated === 'boolean')) return null;
     pair.selected = source.selected; pair.nominated = source.nominated; result.pair = pair;
   }
+  // The global logger deliberately strips generic path/reason keys. These
+  // aliases carry ONLY validated finite enums; do not relax its privacy filter.
+  result.transport_path = result.path; result.failure_category = result.reason;
+  delete result.path; delete result.reason;
   return result;
 }
