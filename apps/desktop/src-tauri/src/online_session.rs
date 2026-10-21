@@ -265,6 +265,8 @@ impl OnlineSession {
                 self.peer_present.store(false, Ordering::Release);
                 if let Some(native) = &self.native {
                     if !native.status.lock().await.terminal() { self.cancel_native(Some("对方断开连接".into()), false).await?; }
+                    let route = self.route.lock().await.as_ref().map(|(_,r)|r.clone());
+                    if let Some(route) = route { route.close().await; }
                     self.receivers.lock().await.clear();
                     if let Some(p2p) = self.p2p.lock().await.as_ref() { p2p.close(); }
                     self.record_route(RouteObservation::default(), false);
@@ -284,6 +286,9 @@ impl OnlineSession {
                 self.record_route(RouteObservation::default(), false);
                 self.note(Phase::ConnectionClosed);
                 if self.native.is_some() { self.cancel_native(Some(reason.clone()), false).await?; }
+                let route = self.route.lock().await.as_ref().map(|(_,r)|r.clone());
+                if let Some(route) = route { route.close().await; }
+                self.receivers.lock().await.clear();
                 emit(&self.app, &self.id, OnlineUiEvent::Disconnected { reason });
                 Ok(())
             }
@@ -594,6 +599,7 @@ impl OnlineSession {
                 self.note_transfer(&id, Phase::TaskEnd);
                 return Err(publish_error);
             }
+            if self.native.is_some() { self.complete_route(&id).await?; }
             self.note_transfer(&id, Phase::DurableAckSent);
             if self.native.is_some() { self.note(Phase::TaskAckSent); }
             self.snapshot_route().await;
@@ -619,6 +625,12 @@ impl OnlineSession {
             }
         }
         Ok(())
+    }
+
+    async fn complete_route(&self, id: &str) -> Result<(),String> {
+        let route = self.route.lock().await.as_ref().filter(|(tid,_)|tid==id).map(|(_,r)|r.clone()).ok_or("missing completion route")?;
+        let fence = route.active_fence().await.ok_or("missing completion fence")?;
+        route.complete(fence).await
     }
 
     async fn current_fence(&self, id: &str) -> Option<Fence> {
@@ -676,6 +688,9 @@ impl OnlineSession {
                         emit(&session.app,&session.id,OnlineUiEvent::P2p {state:"fallback_requested".into()});
                     }
                     TransportEvent::Failed(_error) => {
+                        // The sticky terminal notice also wakes on graceful close.
+                        // A completed route must never produce a failure UI event.
+                        if route.is_completed() { break; }
                         let error=crate::connection_diagnostics::connection_failure();
                         session.note(Phase::ConnectionFailed);
                         if let Some(sender)=session.senders.lock().await.get(&id) {sender.on_failed();}
@@ -1064,6 +1079,8 @@ impl OnlineSession {
                     tokio::select! { _ = notified => {}, _ = self.cancel_notify.notified() => return Err("已取消".to_string()) }
                 }
             }).await.map_err(|_| "最终任务确认超时".to_string())??;
+            let id = self.route.lock().await.as_ref().map(|(id,_)|id.clone()).ok_or("missing completion route")?;
+            self.complete_route(&id).await?;
             Ok::<(), String>(())
         }.await;
         self.senders.lock().await.clear();
@@ -1090,6 +1107,9 @@ impl OnlineSession {
     }
 
     pub async fn cancel_native(&self, error: Option<String>, notify_peer: bool) -> Result<(), String> {
+        // Completion can precede the final UI snapshot by one scheduling turn.
+        // PeerLeft/cancel during that turn is still normal completed teardown.
+        if self.route.lock().await.as_ref().is_some_and(|(_,r)|r.is_completed()) { return Ok(()); }
         if let Some(native) = &self.native {
             if native.status.lock().await.terminal() { return Ok(()); }
             native.cancel_source();
@@ -1134,6 +1154,9 @@ impl OnlineSession {
 
     pub async fn disconnect(&self) -> Result<(), String> {
         self.cancel_native(None, false).await?;
+        let route = self.route.lock().await.as_ref().map(|(_,r)|r.clone());
+        if let Some(route) = route { route.close().await; }
+        self.receivers.lock().await.clear();
         if let Some(p2p) = self.p2p.lock().await.as_ref() {
             p2p.close();
         }

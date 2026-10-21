@@ -80,7 +80,7 @@ pub struct DirectAttempt {
     runtime: OnceLock<RouteRuntime>, peers: Mutex<HashMap<Path, Peer>>,
     creating: Mutex<HashSet<Path>>, candidates: Mutex<CandidateStore>,
     pending_turn: Mutex<Option<Signal>>, turn_allowed: AtomicBool,
-    terminal: AtomicBool, terminal_notice:watch::Sender<bool>, permit: Mutex<Option<Fence>>, changed: Notify,
+    completed: AtomicBool, terminal: AtomicBool, terminal_notice:watch::Sender<bool>, permit: Mutex<Option<Fence>>, changed: Notify,
     events: mpsc::Sender<TransportEvent>, failure: Mutex<Option<String>>,
 }
 struct Executor(Weak<DirectAttempt>);
@@ -147,6 +147,11 @@ impl EffectExecutor for Executor {
                 Effect::CloseUnselected(path) => {
                     if let Some(peer)=attempt.peers.lock().await.remove(&path) { peer.link.close(); }
                 }
+                Effect::ApplicationCompleted => {
+                    attempt.completed.store(true, Ordering::Release);
+                    *attempt.permit.lock().await = None;
+                    attempt.changed.notify_waiters();
+                }
                 Effect::CloseAll(_) => attempt.close_peers().await,
                 Effect::Failed => {
                     attempt.block_frames();
@@ -172,7 +177,7 @@ impl DirectAttempt {
         let (terminal_notice,_)=watch::channel(false);
         let attempt=Arc::new(Self { diagnostics, capability, role, servers, send, runtime: OnceLock::new(),
             peers:Mutex::new(HashMap::new()),creating:Mutex::new(HashSet::new()), candidates:Mutex::new(CandidateStore::default()),
-            pending_turn:Mutex::new(None),turn_allowed:AtomicBool::new(false),terminal:AtomicBool::new(false),terminal_notice,
+            pending_turn:Mutex::new(None),turn_allowed:AtomicBool::new(false),completed:AtomicBool::new(false),terminal:AtomicBool::new(false),terminal_notice,
             permit:Mutex::new(None),changed:Notify::new(),events,failure:Mutex::new(None) });
         let runtime=RouteRuntime::spawn(RouteHandler::new(role,capability.epoch),Executor(Arc::downgrade(&attempt)),64);
         assert!(attempt.runtime.set(runtime).is_ok());
@@ -208,7 +213,7 @@ impl DirectAttempt {
         Ok(())
     }
     pub async fn receive(self:&Arc<Self>,signal:Signal) -> Result<(),String> {
-        if self.terminal.load(Ordering::Acquire) {return Ok(());}
+        if self.terminal.load(Ordering::Acquire) || self.is_completed() {return Ok(());}
         let result=match signal {
             Signal::Control(envelope) => {
                 let scope=self.diagnostics.scope(envelope.fence.path);
@@ -382,6 +387,13 @@ impl DirectAttempt {
         if self.active_fence().await!=Some(fence) {return false;}
         self.runtime().dispatch(Event::Wire(Envelope {fence,message:crate::online_route_choice::Wire::Ack {bytes}})).await.is_ok()
     }
+    /// Called only after the session's durable and task-level ACK boundary.
+    /// Keep the active receive fence for duplicate final-frame ACK replay.
+    pub async fn complete(&self, fence:Fence) -> Result<(),String> {
+        self.runtime().dispatch(Event::ApplicationCompleted {fence}).await?;
+        if self.is_completed() {Ok(())} else {Err("transport failed before final completion".into())}
+    }
+    pub fn is_completed(&self) -> bool {self.completed.load(Ordering::Acquire)}
     pub fn is_terminal(&self) -> bool {self.terminal.load(Ordering::Acquire)}
     pub fn terminal_watch(&self) -> watch::Receiver<bool> {self.terminal_notice.subscribe()}
     pub fn block_frames(&self) {
@@ -392,9 +404,8 @@ impl DirectAttempt {
         self.terminal_notice.send_replace(true);
     }
     pub async fn fail(&self,error:String) {
-        self.block_frames();
-        *self.permit.lock().await=None;
-        self.changed.notify_waiters();
+        // Serialize against ApplicationCompleted; a late ICE/close callback
+        // must not independently turn a completed task into a terminal failure.
         *self.failure.lock().await=Some(error);
         let _=self.runtime().dispatch(Event::Timeout {epoch:self.capability.epoch}).await;
     }
@@ -404,7 +415,10 @@ impl DirectAttempt {
         for (_,peer) in self.peers.lock().await.drain() {peer.link.close();}
         self.changed.notify_waiters();
     }
-    pub async fn close(&self) {self.fail("连接已关闭".into()).await;}
+    pub async fn close(&self) {
+        if self.is_completed() {self.close_peers().await;}
+        else {self.fail("连接已关闭".into()).await;}
+    }
 }
 
 #[cfg(test)]
@@ -450,6 +464,40 @@ mod native_tests {
             let signal=serde_json::from_slice(&json).unwrap();
             tx.send(signal).map_err(|_|"test signaling closed".into())
         })})
+    }
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn actual_completed_receiver_replays_frames_then_closes_without_abort_or_failed() {
+        let capability=Capability::fresh();
+        let (stx,mut srx)=mpsc::unbounded_channel();let (rtx,mut rrx)=mpsc::unbounded_channel();
+        let seen=Arc::new(std::sync::Mutex::new(Vec::new()));let observed=seen.clone();
+        let (s,_sevents)=DirectAttempt::new(Role::Sender,capability,vec![],sender(stx));
+        let (r,mut events)=DirectAttempt::new_observed(Role::Receiver,capability,vec![],sender(rtx),Arc::new(move |e|observed.lock().unwrap().push(serde_json::to_value(e).unwrap())));
+        r.expect_offer(Instant::now()).await.unwrap();
+        let task=r.clone();let sr=tokio::spawn(async move {while let Some(signal)=srx.recv().await {task.receive(signal).await.unwrap();}});
+        let task=s.clone();let rs=tokio::spawn(async move {while let Some(signal)=rrx.recv().await {task.receive(signal).await.unwrap();}});
+        s.start().await.unwrap();let (fence,_link,dc)=s.wait_selected().await.unwrap();
+        r.complete(fence).await.unwrap();
+        assert!(r.is_completed());assert!(!r.is_terminal());
+        for _ in 0..2 {
+            dc.send(b"replayed-final-frame",true).unwrap();
+            tokio::time::timeout(Duration::from_secs(3),async {
+                loop {match events.recv().await.unwrap() {
+                    TransportEvent::Frame {fence:f,bytes}=>{assert_eq!(f,fence);assert_eq!(bytes,b"replayed-final-frame");break;},
+                    TransportEvent::Started(_)=>{},_=>panic!("completed receiver must not fail"),
+                }}
+            }).await.unwrap();
+        }
+        assert_eq!(r.active_fence().await,Some(fence));
+        assert!(r.confirm_ack(fence,19).await);assert!(r.confirm_ack(fence,19).await);
+        r.fail("late ICE callback".into()).await;
+        assert!(!r.is_terminal(),"late callback must not destroy final ACK replay window");
+        r.close().await;r.close().await;
+        assert!(r.is_terminal());assert!(r.peers.lock().await.is_empty());
+        assert!(r.is_completed());
+        assert_eq!(r.runtime().snapshot().await.unwrap().0,Phase::Active);
+        assert!(!seen.lock().unwrap().iter().any(|e|e["stage"]=="attempt_abort"));
+        while let Ok(event)=events.try_recv() {assert!(!matches!(event,TransportEvent::Failed(_)));}
+        sr.abort();rs.abort();s.close().await;
     }
     #[tokio::test(flavor="multi_thread",worker_threads=4)]
     async fn actual_native_peers_require_ready_commit_start_ack_before_frame() {

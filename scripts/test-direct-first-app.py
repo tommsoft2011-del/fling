@@ -62,6 +62,12 @@ for case in a.cases.split(','):
     else:
         received=output/name
         ok=codes==[0,0] and all(x.get('probeResult')=='done' for x in probe.values()) and received.exists() and hashlib.sha256(received.read_bytes()).hexdigest()==digest and not list(output.glob('.*.part'))
+    teardown_errors={role:[x for x in ev if
+        (x.get('event',{}).get('kind')=='path-diagnostic' and x['event']['summary']['phase']=='connection_failed') or
+        (x.get('event',{}).get('kind')=='connection-diagnostic' and x['event']['summary']['stage']=='attempt_abort')]
+        for role,ev in events.items()}
+    if case not in ('repeat','cancel'):
+        ok=ok and all(not errors for errors in teardown_errors.values())
     identity_ok=all(x.get('version')=='0.6.32' and x.get('buildIdentity')==a.expected_build_id for x in probe.values())
     route_evidence={role:[x['event']['summary'] for x in ev if x.get('event',{}).get('kind')=='path-diagnostic' and x['event']['summary']['phase']=='selected_pair'] for role,ev in events.items()}
     if case=='turn':
@@ -74,7 +80,7 @@ for case in a.cases.split(','):
     s_first=phase('sending','first_real_bytes');s_last=stage('sending','finalizing');s_ack=phase('sending','durable_ack_received')
     r_last=stage('receiving','finalizing');r_commit=phase('receiving','atomic_commit');r_ack=phase('receiving','durable_ack_sent')
     timings={'senderDataWindowMs':delta(s_last,s_first),'senderLastFrameToDurableAckMs':delta(s_ack,s_last),'receiverSaveAndFinalAckMs':delta(r_ack,r_last),'receiverFinalizeToAtomicCommitMs':delta(r_commit,r_last),'receiverFinalAckPublishMs':delta(r_ack,r_commit),'senderTaskToDurableAckMs':delta(s_ack,stage('sending','preparing'))}
-    result={'case':case,'bytes':size,'sha256':digest,'sameHost':True,'processExitCodes':codes,'probe':probe,'identityPass':identity_ok,'routeEvidence':route_evidence,'timings':timings,'pass':ok and identity_ok,'elapsedMs':round((time.monotonic()-started)*1000,3)}
+    result={'case':case,'bytes':size,'sha256':digest,'sameHost':True,'processExitCodes':codes,'probe':probe,'identityPass':identity_ok,'routeEvidence':route_evidence,'teardownErrors':teardown_errors,'timings':timings,'pass':ok and identity_ok,'elapsedMs':round((time.monotonic()-started)*1000,3)}
     results.append(result);print(json.dumps(result,ensure_ascii=False),flush=True)
     (root/'summary.json').write_text(json.dumps(results,ensure_ascii=False,indent=2)+'\n')
     if not result['pass']:raise SystemExit(1)

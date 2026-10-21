@@ -54,6 +54,8 @@ pub enum Event {
     Wire(Envelope),
     OfferFailed { epoch: Epoch, failure: OfferFailure },
     PathFailed { epoch: Epoch, path: Path },
+    /// Trusted application boundary: durable file ACK AND final task ACK succeeded.
+    ApplicationCompleted { fence: Fence },
     Frame { fence: Fence },
     Tick,
     Timeout { epoch: Epoch },
@@ -63,7 +65,7 @@ pub enum Event {
 pub enum Effect {
     Send(Envelope), CreateTurnPeerConnection(Epoch), FirstFramePermit(Fence),
     AcceptFrame(Fence), CloseUnselected(Path), CloseAll(Epoch),
-    DirectStarted, Cutoff(Path), Failed, IgnoreStale,
+    DirectStarted, Cutoff(Path), Failed, IgnoreStale, ApplicationCompleted,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteHandler {
@@ -73,7 +75,7 @@ pub struct RouteHandler {
     own_direct_at: Option<u64>, peer_direct_at: Option<u64>,
     own: HashMap<Path, ReadyProof>, peer: HashMap<Path, ReadyProof>,
     decision_ack: bool, receiver_prepared: bool, receiver_committed: bool,
-    close_confirmed: bool, bytes: u64,
+    close_confirmed: bool, bytes: u64, application_completed: bool,
     pending: Option<Envelope>, last_send: u64,
     expected_ufrags: HashMap<Path, String>,
     candidates: HashMap<(Path, String), HashSet<String>>, candidate_count: usize,
@@ -85,7 +87,7 @@ impl RouteHandler {
             last_now: 0, decision_at: None, own_direct_at: None, peer_direct_at: None,
             own: HashMap::new(), peer: HashMap::new(), decision_ack: false,
             receiver_prepared: false, receiver_committed: false, close_confirmed: false,
-            bytes: 0, pending: None, last_send: 0, expected_ufrags: HashMap::new(),
+            bytes: 0, application_completed: false, pending: None, last_send: 0, expected_ufrags: HashMap::new(),
             candidates: HashMap::new(), candidate_count: 0 }
     }
     pub fn phase(&self) -> Phase { self.phase }
@@ -110,7 +112,7 @@ impl RouteHandler {
     }
     pub fn fence(&self) -> Option<Fence> { self.selected.map(|path| Fence { epoch: self.epoch, seq: 1, path }) }
     pub fn permits_frame(&self, fence: Fence) -> bool {
-        self.role == Role::Sender && self.phase == Phase::Active && self.fence() == Some(fence)
+        self.role == Role::Sender && !self.application_completed && self.phase == Phase::Active && self.fence() == Some(fence)
     }
     pub fn accepts_frame(&self, fence: Fence) -> bool {
         self.role == Role::Receiver && self.phase == Phase::Active && self.fence() == Some(fence)
@@ -174,6 +176,15 @@ impl RouteHandler {
     /// `now` MUST be sampled by the local serialized executor at event observation.
     /// Remote payloads never supply readiness timestamps. Equal-cutoff READY loses.
     pub fn handle(&mut self, event: Event, now: u64) -> Vec<Effect> {
+        // Completion is absorbing for transport failures, but committed receiver
+        // frames may still request idempotent final-ACK replay until room teardown.
+        // No remote wire message can establish this trusted local boundary.
+        if self.application_completed && !matches!(event, Event::Retry(_)) {
+            return match event {
+                Event::Frame { fence } if self.accepts_frame(fence) => vec![Effect::AcceptFrame(fence)],
+                _ => vec![],
+            };
+        }
         if now < self.last_now { return self.fail(); }
         self.last_now = now;
         if let Event::Retry(epoch) = event {
@@ -204,6 +215,14 @@ impl RouteHandler {
             }
             Event::OfferFailed { epoch, .. } | Event::Timeout { epoch } => {
                 if epoch != self.epoch { vec![Effect::IgnoreStale] } else { self.fail() }
+            }
+            Event::ApplicationCompleted { fence } => {
+                if self.phase != Phase::Active || self.fence() != Some(fence) {
+                    return vec![Effect::IgnoreStale];
+                }
+                self.application_completed = true;
+                self.pending = None;
+                vec![Effect::ApplicationCompleted]
             }
             Event::PathFailed { epoch, path } => {
                 if epoch != self.epoch { return vec![Effect::IgnoreStale]; }
@@ -417,6 +436,62 @@ mod tests {
             p.local(true,Event::Tick,2500);p.drain(2500);
             assert_eq!(p.s.selected(),Some(Path::Direct));assert_eq!(p.s.phase(),Phase::Active);p
         }
+    }
+    #[test]
+    fn completed_turn_ignores_selected_unselected_close_and_peer_abort() {
+        for sender in [true,false] {
+            let mut p=Pair::turn_active();
+            let h=if sender {&mut p.s}else{&mut p.r};
+            let fence=h.fence().unwrap();
+            assert_eq!(h.handle(Event::ApplicationCompleted {fence},2700),vec![Effect::ApplicationCompleted]);
+            for event in [Event::PathFailed {epoch:E,path:Path::Direct},
+                Event::PathFailed {epoch:E,path:Path::Turn},Event::Timeout {epoch:E},
+                Event::Wire(Envelope {fence:Fence {epoch:E,seq:0,path:Path::Direct},message:Wire::AttemptAbort}),
+                Event::Tick,Event::ApplicationCompleted {fence}] {
+                assert!(h.handle(event,2800).is_empty(),"completed teardown must not emit Abort/Failed");
+                assert_eq!(h.phase(),Phase::Active);
+            }
+            assert!(!h.permits_frame(fence),"no new sender bytes after completion");
+            if !sender {assert_eq!(h.handle(Event::Frame {fence},2900),vec![Effect::AcceptFrame(fence)]);}
+        }
+    }
+    #[test]
+    fn turn_failure_before_application_completion_still_aborts() {
+        for sender in [true,false] {
+            for bytes in [0,14_040] {
+                let mut p=Pair::turn_active();let h=if sender {&mut p.s}else{&mut p.r};
+                let fence=h.fence().unwrap();
+                assert!(h.confirm_bytes(fence,bytes));
+                let effects=h.handle(Event::PathFailed {epoch:E,path:Path::Turn},2700);
+                assert!(effects.contains(&Effect::Failed));
+                assert!(effects.iter().any(|e|matches!(e,Effect::Send(Envelope {message:Wire::AttemptAbort,..}))));
+                assert_eq!(h.phase(),Phase::Failed);
+                assert!(h.handle(Event::ApplicationCompleted {fence},2800).is_empty());
+                assert!(!h.application_completed,"byte accounting is not durable/task completion");
+            }
+        }
+    }
+    #[test]
+    fn stale_or_early_completion_cannot_hide_selected_failure() {
+        let mut h=RouteHandler::new(Role::Sender,E);
+        let fence=Fence {epoch:E,seq:1,path:Path::Turn};
+        assert_eq!(h.handle(Event::ApplicationCompleted {fence},0),vec![Effect::IgnoreStale]);
+        let mut p=Pair::turn_active();
+        for bad in [Fence {epoch:Epoch {generation:0,..E},..fence},Fence {path:Path::Direct,..fence},Fence {seq:0,..fence}] {
+            assert_eq!(p.s.handle(Event::ApplicationCompleted {fence:bad},2700),vec![Effect::IgnoreStale]);
+        }
+        assert!(p.s.handle(Event::PathFailed {epoch:E,path:Path::Turn},2800).contains(&Effect::Failed));
+    }
+    #[test]
+    fn completion_preserves_duplicate_final_frame_and_ack_fences() {
+        let mut p=Pair::turn_active();let f=p.r.fence().unwrap();
+        assert_eq!(p.r.handle(Event::ApplicationCompleted {fence:f},2700),vec![Effect::ApplicationCompleted]);
+        for _ in 0..3 {
+            assert_eq!(p.r.handle(Event::Frame {fence:f},2800),vec![Effect::AcceptFrame(f)]);
+            assert!(p.r.handle(Event::Wire(Envelope {fence:f,message:Wire::Start}),2800).is_empty());
+        }
+        assert!(p.r.handle(Event::Frame {fence:Fence {path:Path::Direct,..f}},2800).is_empty());
+        assert_eq!(p.r.fence(),Some(f));
     }
     #[test] fn direct_needs_peer_selection_not_candidate_open() {
         let mut p=Pair::new();p.ready(Path::Direct,100);assert_eq!(p.permits,0);
