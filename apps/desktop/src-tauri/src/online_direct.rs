@@ -198,7 +198,10 @@ impl DirectAttempt {
         if self.terminal.load(Ordering::Acquire) { return Err("terminal attempt".into()); }
         if path==Path::Turn && !self.turn_allowed.load(Ordering::Acquire) { return Err("TURN before cutoff".into()); }
         if !self.creating.lock().await.insert(path) { return Ok(()); }
-        let mode=if path==Path::Direct {IceMode::Direct}else{IceMode::Turn};
+        // The direct attempt deliberately uses the full-list Legacy
+        // configuration (the v0.6.2/v0.6.31 proven recipe); see
+        // mode_configuration in online_p2p.rs for why STUN-only was removed.
+        let mode=if path==Path::Direct {IceMode::Legacy}else{IceMode::Turn};
         let scope=self.diagnostics.scope(path);
         let (link,ice,sdp)=scope.bounded(Stage::OfferSetup,OnlineP2p::start_initiator_observed(self.servers.clone(),mode,Some(scope.clone()))).await?;
         let origin=link.gathering_origin();let ufrag=sdp_ufrag(&sdp)?;
@@ -276,7 +279,7 @@ impl DirectAttempt {
             }
             if !self.creating.lock().await.insert(path) {return Ok(());}
             let (frames_tx,frames_rx)=mpsc::channel(32);
-            let mode=if path==Path::Direct {IceMode::Direct}else{IceMode::Turn};
+            let mode=if path==Path::Direct {IceMode::Legacy}else{IceMode::Turn};
             let (link,ice,local_sdp)=scope.bounded(Stage::AnswerSetup,OnlineP2p::accept_offer_observed(self.servers.clone(),mode,&sdp,frames_tx,Some(scope.clone()))).await?;
             let origin=link.gathering_origin();let local_ufrag=sdp_ufrag(&local_sdp)?;
             if self.terminal.load(Ordering::Acquire) {link.close();return Err("terminal attempt".into());}

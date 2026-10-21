@@ -57,11 +57,11 @@ pub fn default_ice_servers(
         {
             // coturn answers STUN binding requests on the same host:port as
             // TURN. Offer that STUN endpoint to every PC built from this
-            // list: the Direct (STUN-only) PC gains a reflexive-candidate
-            // source on infrastructure both peers already prove reachable
-            // through their TURN allocations, instead of depending solely
-            // on public STUN servers some networks cannot reach. The Turn
-            // mode filter drops non-TURN URLs, so relay purity is unchanged.
+            // list: the direct attempt gains a reflexive-candidate source on
+            // infrastructure both peers already prove reachable through
+            // their TURN allocations, instead of depending solely on public
+            // STUN servers some networks cannot reach. The Turn mode filter
+            // drops non-TURN URLs, so relay purity is unchanged.
             if let Some(stun_url) = stun_url_from_turn(url) {
                 servers.push(IceServer {
                     urls: vec![stun_url],
@@ -208,10 +208,19 @@ fn classify_stats(stats: &[RtcStats]) -> crate::online_diagnostics::RouteObserva
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IceMode { Legacy, Direct, Turn }
+pub enum IceMode { Legacy, Turn }
 
-/// Filter before allocating a PC: Direct never receives TURN credentials, and
-/// Turn has Relay policy rather than an All-policy PC containing a TURN URL.
+/// Filter before allocating a PC. Turn gets Relay policy with only TURN
+/// URLs. Every other PC — the baseline session and the direct-first attempt —
+/// gets the full configured server list with All policy, matching the
+/// establishment recipe that v0.6.2 (browser RTCPeerConnection) and v0.6.31
+/// (single-PC Rust) proved on the user's machines. The 0.6.32 experiment of
+/// giving the direct attempt a STUN-only PC never nominated a single pair in
+/// field tests (2026-10-21 dual-side logs), so it is removed. Honest route
+/// attribution does not depend on this filter: the coordinator credits
+/// Direct only for a ReadyProof-verified non-relay selected pair, and every
+/// commit/start effect re-verifies that proof, so a direct-attempt PC that
+/// happens to connect over a relay pair can never be reported as direct.
 fn mode_configuration(servers: Vec<IceServer>, mode: IceMode) -> Result<RtcConfiguration, String> {
     let mut config = RtcConfiguration::default();
     config.continual_gathering_policy = ContinualGatheringPolicy::GatherOnce;
@@ -219,10 +228,8 @@ fn mode_configuration(servers: Vec<IceServer>, mode: IceMode) -> Result<RtcConfi
     config.ice_servers = servers.into_iter().filter_map(|mut server| {
         server.urls.retain(|url| match mode {
             IceMode::Legacy => true,
-            IceMode::Direct => url.starts_with("stun:") || url.starts_with("stuns:"),
             IceMode::Turn => valid_turn_url(url),
         });
-        if mode == IceMode::Direct { server.username.clear(); server.password.clear(); }
         (!server.urls.is_empty()).then_some(server)
     }).collect();
     if mode == IceMode::Turn && config.ice_servers.is_empty() { return Err("未配置可用 TURN；本次连接失败，请重试".into()); }
@@ -750,10 +757,11 @@ mod tests {
         assert_eq!(stun_url_from_turn("turn:turn.example:3478").as_deref(), Some("stun:turn.example:3478"));
         assert_eq!(stun_url_from_turn("turn:user@host:3478"), None);
         assert_eq!(stun_url_from_turn("stun:host:3478"), None);
-        // Direct mode keeps the derived STUN; Turn mode drops it.
-        let direct = mode_configuration(servers.clone(), IceMode::Direct).unwrap();
+        // The direct-attempt (Legacy) configuration keeps the full list —
+        // derived STUN and TURN alike; Turn mode keeps only TURN URLs.
+        let direct = mode_configuration(servers.clone(), IceMode::Legacy).unwrap();
         assert!(direct.ice_servers.iter().any(|s| s.urls.iter().any(|u| u == "stun:turn.example:3478")));
-        assert!(direct.ice_servers.iter().all(|s| s.urls.iter().all(|u| !u.starts_with("turn"))));
+        assert!(direct.ice_servers.iter().any(|s| s.urls.iter().any(|u| u == "turn:turn.example:3478?transport=udp")));
         let turn = mode_configuration(servers, IceMode::Turn).unwrap();
         assert!(turn.ice_servers.iter().all(|s| s.urls.iter().all(|u| !u.starts_with("stun"))));
     }
@@ -854,18 +862,21 @@ mod tests {
 mod isolation_tests {
     use super::*;
     #[test]
-    fn direct_drops_turn_credentials_and_turn_is_relay_only() {
+    fn direct_attempt_uses_full_list_and_turn_is_relay_only() {
         let servers=vec![IceServer {urls:vec!["stun:stun.example:3478".into(),"turn:turn.example:3478".into()],username:"user".into(),password:"password".into()}];
-        let direct=mode_configuration(servers.clone(),IceMode::Direct).unwrap();
+        // The direct-first attempt is built with the Legacy (full-list)
+        // configuration — the proven v0.6.2/v0.6.31 recipe. Credentials stay
+        // on the entry; ReadyProof, not this filter, guards attribution.
+        let direct=mode_configuration(servers.clone(),IceMode::Legacy).unwrap();
         assert_eq!(direct.ice_transport_type,IceTransportsType::All);
-        assert_eq!(direct.ice_servers[0].urls,vec!["stun:stun.example:3478"]);
-        assert!(direct.ice_servers[0].username.is_empty());assert!(direct.ice_servers[0].password.is_empty());
+        assert_eq!(direct.ice_servers[0].urls,vec!["stun:stun.example:3478","turn:turn.example:3478"]);
+        assert_eq!(direct.ice_servers[0].username,"user");assert_eq!(direct.ice_servers[0].password,"password");
         let turn=mode_configuration(servers,IceMode::Turn).unwrap();
         assert_eq!(turn.ice_transport_type,IceTransportsType::Relay);
         assert_eq!(turn.ice_servers[0].urls,vec!["turn:turn.example:3478"]);
         assert_eq!(turn.ice_servers[0].username,"user");
         assert!(mode_configuration(vec![],IceMode::Turn).is_err());
-        assert!(mode_configuration(vec![],IceMode::Direct).unwrap().ice_servers.is_empty());
+        assert!(mode_configuration(vec![],IceMode::Legacy).unwrap().ice_servers.is_empty());
     }
     #[test]
     fn callback_queue_is_bounded_before_copy_and_overflow_fences_link() {
