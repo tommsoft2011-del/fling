@@ -49,7 +49,7 @@ console.log('PASS path diagnostics: privacy allowlist, unknown mapping, both rol
 const history = read('../src/history.ts');
 assert.match(history, /transport === 'unknown' \? '路径暂不可确认'/);
 for (const body of [sender, responder]) assert.match(body, /begin_connection\(Role::/);
-for (const path of ['../package.json', '../src-tauri/tauri.conf.json']) assert.equal(JSON.parse(read(path)).version, '0.6.32');
-assert.match(read('../src/main.ts'), /frontendBuildId: `v0\.6\.32\+/);
+for (const path of ['../package.json', '../src-tauri/tauri.conf.json']) assert.equal(JSON.parse(read(path)).version, '0.6.33');
+assert.match(read('../src/main.ts'), /frontendBuildId: `v0\.6\.33\+/);
 assert.match(read('../src/main.ts'), /buildId: await invoke<string>\('app_build_identity'\)/);
 assert.match(read('../src-tauri/build.rs'), /FLING_BUILD_IDENTITY=v\{\}\+\{commit\}/);
