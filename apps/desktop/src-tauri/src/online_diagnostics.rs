@@ -52,6 +52,17 @@ pub struct RouteSummary {
     pub remote_type: Candidate,
     pub local_protocol: Protocol,
     pub remote_protocol: Protocol,
+    /// Privacy-safe checklist aggregates over ALL candidate pairs and
+    /// candidates in a stats snapshot (counts and type presence only;
+    /// never IDs or addresses). These stay populated even when no pair is
+    /// selected yet, so diagnostics can distinguish "no pairs formed",
+    /// "pairs exist but checks are failing", and "no srflx gathered".
+    pub pairs_total: u32,
+    pub pairs_succeeded: u32,
+    pub pairs_in_progress: u32,
+    pub pairs_failed: u32,
+    pub local_srflx: bool,
+    pub remote_srflx: bool,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RouteObservation {

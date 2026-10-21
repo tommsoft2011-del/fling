@@ -55,6 +55,20 @@ pub fn default_ice_servers(
             && !username.contains(['\r', '\n', '\0'])
             && !password.contains(['\r', '\n', '\0'])
         {
+            // coturn answers STUN binding requests on the same host:port as
+            // TURN. Offer that STUN endpoint to every PC built from this
+            // list: the Direct (STUN-only) PC gains a reflexive-candidate
+            // source on infrastructure both peers already prove reachable
+            // through their TURN allocations, instead of depending solely
+            // on public STUN servers some networks cannot reach. The Turn
+            // mode filter drops non-TURN URLs, so relay purity is unchanged.
+            if let Some(stun_url) = stun_url_from_turn(url) {
+                servers.push(IceServer {
+                    urls: vec![stun_url],
+                    username: String::new(),
+                    password: String::new(),
+                });
+            }
             servers.push(IceServer {
                 urls: vec![url.to_string()],
                 username: username.to_string(),
@@ -79,6 +93,30 @@ fn valid_turn_url(url: &str) -> bool {
         && !rest.starts_with('/')
 }
 
+/// Derive the STUN URL served by the same coturn host as a TURN URL:
+/// `turn:host:3478?transport=udp` -> `stun:host:3478`,
+/// `turns:host:5349` -> `stuns:host:5349`. Returns None for a host part
+/// that would not pass the same hygiene checks as `valid_turn_url`.
+fn stun_url_from_turn(turn_url: &str) -> Option<String> {
+    let (scheme, rest) = if let Some(rest) = turn_url.strip_prefix("turns:") {
+        ("stuns", rest)
+    } else if let Some(rest) = turn_url.strip_prefix("turn:") {
+        ("stun", rest)
+    } else {
+        return None;
+    };
+    let host = rest.split(['?', ';']).next().unwrap_or_default();
+    if host.is_empty()
+        || host.contains('@')
+        || host.contains('#')
+        || host.contains(['\r', '\n', '\0', ' ', '\t'])
+        || host.starts_with('/')
+    {
+        return None;
+    }
+    Some(format!("{scheme}:{host}"))
+}
+
 /// Returns true only when an SDP candidate has an exact `typ relay` token pair.
 pub fn has_relay_candidate(sdp: &str) -> bool {
     sdp.lines().any(|line| {
@@ -100,6 +138,35 @@ fn classify_stats(stats: &[RtcStats]) -> crate::online_diagnostics::RouteObserva
         if p.eq_ignore_ascii_case("udp") { Protocol::Udp }
         else if p.eq_ignore_ascii_case("tcp") { Protocol::Tcp } else { Protocol::Unknown }
     }
+    // Aggregates over the whole checklist, computed independently of pair
+    // selection so a PC that never nominates still reports whether pairs
+    // formed, what state they are stuck in, and whether srflx candidates
+    // exist on either side. Counts and type presence only; no IDs.
+    let mut aggregate = crate::online_diagnostics::RouteSummary::default();
+    for stat in stats {
+        match stat {
+            RtcStats::CandidatePair(p) => {
+                aggregate.pairs_total += 1;
+                match p.candidate_pair.state {
+                    Some(IceCandidatePairState::Succeeded) => aggregate.pairs_succeeded += 1,
+                    Some(IceCandidatePairState::InProgress) => aggregate.pairs_in_progress += 1,
+                    Some(IceCandidatePairState::Failed) => aggregate.pairs_failed += 1,
+                    _ => {}
+                }
+            }
+            RtcStats::LocalCandidate(c) => {
+                if c.local_candidate.candidate_type == Some(IceCandidateType::Srflx) {
+                    aggregate.local_srflx = true;
+                }
+            }
+            RtcStats::RemoteCandidate(c) => {
+                if c.remote_candidate.candidate_type == Some(IceCandidateType::Srflx) {
+                    aggregate.remote_srflx = true;
+                }
+            }
+            _ => {}
+        }
+    }
     for stat in stats {
         let RtcStats::Transport(transport) = stat else { continue; };
         let id = &transport.transport.selected_candidate_pair_id;
@@ -107,7 +174,7 @@ fn classify_stats(stats: &[RtcStats]) -> crate::online_diagnostics::RouteObserva
         let Some(pair) = stats.iter().find_map(|s| match s {
             RtcStats::CandidatePair(p) if p.rtc.id == *id => Some(&p.candidate_pair), _ => None,
         }) else { continue; };
-        let mut observation = RouteObservation { pair_key: Some(id.clone()), ..Default::default() };
+        let mut observation = RouteObservation { pair_key: Some(id.clone()), summary: aggregate.clone() };
         let summary = &mut observation.summary;
         summary.selected = true;
         summary.pair_state = match pair.state {
@@ -134,7 +201,10 @@ fn classify_stats(stats: &[RtcStats]) -> crate::online_diagnostics::RouteObserva
         }
         return observation;
     }
-    RouteObservation::default()
+    // No selected pair: still surface the checklist aggregates so the
+    // diagnostic stream can show pair formation/check progress instead of
+    // an opaque all-unknown snapshot.
+    RouteObservation { summary: aggregate, ..Default::default() }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -634,9 +704,10 @@ mod tests {
 
     #[test]
     fn turn_validation_and_credentials() {
+        // 2 public STUN + 1 STUN derived from the TURN host + 1 TURN.
         assert_eq!(
             default_ice_servers(Some("turn:host:3478"), Some("u"), Some("p")).len(),
-            3
+            4
         );
         for url in [
             "https://host",
@@ -659,6 +730,32 @@ mod tests {
             default_ice_servers(Some("turn:host"), Some(" "), Some("p")).len(),
             2
         );
+    }
+
+    #[test]
+    fn turn_host_also_offers_stun_for_direct() {
+        let servers = default_ice_servers(
+            Some("turn:turn.example:3478?transport=udp"),
+            Some("u"),
+            Some("p"),
+        );
+        let urls: Vec<&str> = servers.iter().flat_map(|s| s.urls.iter().map(String::as_str)).collect();
+        assert!(urls.contains(&"stun:turn.example:3478"), "{urls:?}");
+        assert!(urls.contains(&"turn:turn.example:3478?transport=udp"), "{urls:?}");
+        // The derived STUN entry carries no credentials.
+        let derived = servers.iter().find(|s| s.urls.iter().any(|u| u == "stun:turn.example:3478")).unwrap();
+        assert!(derived.username.is_empty() && derived.password.is_empty());
+        // turns: maps to stuns:.
+        assert_eq!(stun_url_from_turn("turns:turn.example:5349").as_deref(), Some("stuns:turn.example:5349"));
+        assert_eq!(stun_url_from_turn("turn:turn.example:3478").as_deref(), Some("stun:turn.example:3478"));
+        assert_eq!(stun_url_from_turn("turn:user@host:3478"), None);
+        assert_eq!(stun_url_from_turn("stun:host:3478"), None);
+        // Direct mode keeps the derived STUN; Turn mode drops it.
+        let direct = mode_configuration(servers.clone(), IceMode::Direct).unwrap();
+        assert!(direct.ice_servers.iter().any(|s| s.urls.iter().any(|u| u == "stun:turn.example:3478")));
+        assert!(direct.ice_servers.iter().all(|s| s.urls.iter().all(|u| !u.starts_with("turn"))));
+        let turn = mode_configuration(servers, IceMode::Turn).unwrap();
+        assert!(turn.ice_servers.iter().all(|s| s.urls.iter().all(|u| !u.starts_with("stun"))));
     }
 
     #[test]
@@ -687,6 +784,38 @@ mod tests {
         assert_eq!(summary.local_protocol, Protocol::Udp); assert_eq!(summary.remote_protocol, Protocol::Tcp);
         let json = serde_json::to_string(&summary).unwrap();
         for forbidden in ["192.0.2.44", "54321", "turn:private", "address", "url", "port\""] { assert!(!json.contains(forbidden)); }
+    }
+
+    #[test]
+    fn classify_stats_reports_checklist_aggregates_without_selected_pair() {
+        // No transport points at the only pair: nothing is selected, yet the
+        // aggregates must still show the pair exists, is mid-check, and that
+        // an srflx candidate was gathered locally but none was received.
+        let input = stats(
+            Some(IceCandidatePairState::InProgress),
+            Some(IceCandidateType::Srflx),
+            Some(IceCandidateType::Host),
+            false,
+        );
+        let summary = classify_stats(&input).summary;
+        assert!(!summary.selected);
+        assert_eq!(summary.pairs_total, 1);
+        assert_eq!(summary.pairs_in_progress, 1);
+        assert_eq!(summary.pairs_succeeded, 0);
+        assert_eq!(summary.pairs_failed, 0);
+        assert!(summary.local_srflx);
+        assert!(!summary.remote_srflx);
+        // And with a selected succeeded srflx pair, aggregates ride along.
+        let input = stats(
+            Some(IceCandidatePairState::Succeeded),
+            Some(IceCandidateType::Srflx),
+            Some(IceCandidateType::Srflx),
+            true,
+        );
+        let summary = classify_stats(&input).summary;
+        assert!(summary.selected);
+        assert_eq!(summary.pairs_succeeded, 1);
+        assert!(summary.local_srflx && summary.remote_srflx);
     }
 
     #[test]
