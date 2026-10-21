@@ -44,7 +44,7 @@ export function safeConnectionDiagnostic(value: unknown): Record<string, unknown
     // state and srflx presence per side. Counts/flags only, never IDs or
     // addresses. Same strictness as elapsed_ms/count: a present but
     // malformed value invalidates the whole record.
-    for (const key of ['pairs_total', 'pairs_succeeded', 'pairs_in_progress', 'pairs_failed']) {
+    for (const key of ['pairs_total', 'pairs_succeeded', 'pairs_in_progress', 'pairs_failed', 'pairs_succeeded_direct', 'pairs_succeeded_relay']) {
       const v = source[key];
       if (v === undefined) continue;
       if (typeof v !== 'number' || !Number.isSafeInteger(v) || v < 0) return null;

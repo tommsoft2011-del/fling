@@ -61,6 +61,13 @@ pub struct RouteSummary {
     pub pairs_succeeded: u32,
     pub pairs_in_progress: u32,
     pub pairs_failed: u32,
+    /// Succeeded pairs split by whether either side is a relay candidate.
+    /// `pairs_succeeded_direct + pairs_succeeded_relay <= pairs_succeeded`
+    /// (a succeeded pair whose candidate types are missing counts in
+    /// neither), so diagnostics can prove whether a genuinely non-relay
+    /// pair ever connected, and when, without exposing pair identities.
+    pub pairs_succeeded_direct: u32,
+    pub pairs_succeeded_relay: u32,
     pub local_srflx: bool,
     pub remote_srflx: bool,
 }

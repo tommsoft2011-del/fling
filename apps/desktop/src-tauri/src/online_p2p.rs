@@ -93,6 +93,20 @@ fn valid_turn_url(url: &str) -> bool {
         && !rest.starts_with('/')
 }
 
+fn valid_stun_url(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("stun:")
+        .or_else(|| url.strip_prefix("stuns:"))
+    else {
+        return false;
+    };
+    !rest.is_empty()
+        && !rest.contains('@')
+        && !rest.contains('#')
+        && !rest.contains(['\r', '\n', '\0', ' ', '\t'])
+        && !rest.starts_with('/')
+}
+
 /// Derive the STUN URL served by the same coturn host as a TURN URL:
 /// `turn:host:3478?transport=udp` -> `stun:host:3478`,
 /// `turns:host:5349` -> `stuns:host:5349`. Returns None for a host part
@@ -142,13 +156,48 @@ fn classify_stats(stats: &[RtcStats]) -> crate::online_diagnostics::RouteObserva
     // selection so a PC that never nominates still reports whether pairs
     // formed, what state they are stuck in, and whether srflx candidates
     // exist on either side. Counts and type presence only; no IDs.
+    let mut local_types = std::collections::HashMap::new();
+    let mut remote_types = std::collections::HashMap::new();
+    for stat in stats {
+        match stat {
+            RtcStats::LocalCandidate(c) => {
+                local_types.insert(c.rtc.id.as_str(), c.local_candidate.candidate_type);
+            }
+            RtcStats::RemoteCandidate(c) => {
+                remote_types.insert(c.rtc.id.as_str(), c.remote_candidate.candidate_type);
+            }
+            _ => {}
+        }
+    }
     let mut aggregate = crate::online_diagnostics::RouteSummary::default();
     for stat in stats {
         match stat {
             RtcStats::CandidatePair(p) => {
                 aggregate.pairs_total += 1;
                 match p.candidate_pair.state {
-                    Some(IceCandidatePairState::Succeeded) => aggregate.pairs_succeeded += 1,
+                    Some(IceCandidatePairState::Succeeded) => {
+                        aggregate.pairs_succeeded += 1;
+                        // Split succeeded pairs by relay involvement so the
+                        // diagnostic stream can prove whether a non-relay
+                        // pair ever connected, not just the selected one.
+                        let local_type = local_types
+                            .get(p.candidate_pair.local_candidate_id.as_str())
+                            .copied()
+                            .flatten();
+                        let remote_type = remote_types
+                            .get(p.candidate_pair.remote_candidate_id.as_str())
+                            .copied()
+                            .flatten();
+                        if let (Some(local_type), Some(remote_type)) = (local_type, remote_type) {
+                            if local_type == IceCandidateType::Relay
+                                || remote_type == IceCandidateType::Relay
+                            {
+                                aggregate.pairs_succeeded_relay += 1;
+                            } else {
+                                aggregate.pairs_succeeded_direct += 1;
+                            }
+                        }
+                    }
                     Some(IceCandidatePairState::InProgress) => aggregate.pairs_in_progress += 1,
                     Some(IceCandidatePairState::Failed) => aggregate.pairs_failed += 1,
                     _ => {}
@@ -208,19 +257,27 @@ fn classify_stats(stats: &[RtcStats]) -> crate::online_diagnostics::RouteObserva
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IceMode { Legacy, Turn }
+pub enum IceMode { Legacy, Direct, Turn }
 
-/// Filter before allocating a PC. Turn gets Relay policy with only TURN
-/// URLs. Every other PC — the baseline session and the direct-first attempt —
-/// gets the full configured server list with All policy, matching the
-/// establishment recipe that v0.6.2 (browser RTCPeerConnection) and v0.6.31
-/// (single-PC Rust) proved on the user's machines. The 0.6.32 experiment of
-/// giving the direct attempt a STUN-only PC never nominated a single pair in
-/// field tests (2026-10-21 dual-side logs), so it is removed. Honest route
-/// attribution does not depend on this filter: the coordinator credits
-/// Direct only for a ReadyProof-verified non-relay selected pair, and every
-/// commit/start effect re-verifies that proof, so a direct-attempt PC that
-/// happens to connect over a relay pair can never be reported as direct.
+/// Filter before allocating a PC.
+/// - Turn: Relay policy, TURN URLs only.
+/// - Legacy (baseline session PC): the full configured list, All policy.
+/// - Direct (direct-first attempt): STUN URLs only, All policy, credentials
+///   cleared. Its candidate pool therefore cannot contain a relay candidate
+///   at all, so ICE can never nominate a relay pair on this PC and a
+///   ReadyProof earned here is genuinely non-relay.
+///
+/// Why Direct is STUN-only again after the v0.6.33 full-list detour: the
+/// v0.6.33 field test (2026-10-22 dual-side logs) showed the full-list
+/// direct PC nominating a relay pair within ~2s; the coordinator rightly
+/// refuses to credit that as Direct, so the already-open connection was
+/// discarded and a separate TURN PC rebuilt from scratch. The original
+/// 0.6.32 STUN-only failure is not repeated here: that build's server list
+/// contained NO reachable STUN (only public Google STUN, unreachable from
+/// the user's network), so it gathered host candidates only. The list now
+/// also carries the coturn-derived STUN endpoint, and srflx gathering
+/// through it is field-verified on both peers. ReadyProof verification
+/// stays in place as a second, independent guard on attribution.
 fn mode_configuration(servers: Vec<IceServer>, mode: IceMode) -> Result<RtcConfiguration, String> {
     let mut config = RtcConfiguration::default();
     config.continual_gathering_policy = ContinualGatheringPolicy::GatherOnce;
@@ -228,8 +285,15 @@ fn mode_configuration(servers: Vec<IceServer>, mode: IceMode) -> Result<RtcConfi
     config.ice_servers = servers.into_iter().filter_map(|mut server| {
         server.urls.retain(|url| match mode {
             IceMode::Legacy => true,
+            IceMode::Direct => valid_stun_url(url),
             IceMode::Turn => valid_turn_url(url),
         });
+        if mode == IceMode::Direct {
+            // No TURN credentials may ride into the direct attempt, even on
+            // an entry that originally mixed STUN and TURN URLs.
+            server.username.clear();
+            server.password.clear();
+        }
         (!server.urls.is_empty()).then_some(server)
     }).collect();
     if mode == IceMode::Turn && config.ice_servers.is_empty() { return Err("未配置可用 TURN；本次连接失败，请重试".into()); }
@@ -757,11 +821,16 @@ mod tests {
         assert_eq!(stun_url_from_turn("turn:turn.example:3478").as_deref(), Some("stun:turn.example:3478"));
         assert_eq!(stun_url_from_turn("turn:user@host:3478"), None);
         assert_eq!(stun_url_from_turn("stun:host:3478"), None);
-        // The direct-attempt (Legacy) configuration keeps the full list —
-        // derived STUN and TURN alike; Turn mode keeps only TURN URLs.
-        let direct = mode_configuration(servers.clone(), IceMode::Legacy).unwrap();
+        // The direct-attempt (Direct) configuration keeps only STUN URLs —
+        // the derived STUN included — and carries no credentials; the
+        // baseline Legacy configuration keeps the full list, and Turn mode
+        // keeps only TURN URLs.
+        let direct = mode_configuration(servers.clone(), IceMode::Direct).unwrap();
         assert!(direct.ice_servers.iter().any(|s| s.urls.iter().any(|u| u == "stun:turn.example:3478")));
-        assert!(direct.ice_servers.iter().any(|s| s.urls.iter().any(|u| u == "turn:turn.example:3478?transport=udp")));
+        assert!(direct.ice_servers.iter().all(|s| s.urls.iter().all(|u| u.starts_with("stun"))));
+        assert!(direct.ice_servers.iter().all(|s| s.username.is_empty() && s.password.is_empty()));
+        let legacy = mode_configuration(servers.clone(), IceMode::Legacy).unwrap();
+        assert!(legacy.ice_servers.iter().any(|s| s.urls.iter().any(|u| u == "turn:turn.example:3478?transport=udp")));
         let turn = mode_configuration(servers, IceMode::Turn).unwrap();
         assert!(turn.ice_servers.iter().all(|s| s.urls.iter().all(|u| !u.starts_with("stun"))));
     }
@@ -824,6 +893,20 @@ mod tests {
         assert!(summary.selected);
         assert_eq!(summary.pairs_succeeded, 1);
         assert!(summary.local_srflx && summary.remote_srflx);
+        // The succeeded-pair split attributes this srflx<->srflx pair as
+        // direct, and a relay-involved success as relay.
+        assert_eq!(summary.pairs_succeeded_direct, 1);
+        assert_eq!(summary.pairs_succeeded_relay, 0);
+        let input = stats(
+            Some(IceCandidatePairState::Succeeded),
+            Some(IceCandidateType::Relay),
+            Some(IceCandidateType::Srflx),
+            false,
+        );
+        let summary = classify_stats(&input).summary;
+        assert_eq!(summary.pairs_succeeded, 1);
+        assert_eq!(summary.pairs_succeeded_direct, 0);
+        assert_eq!(summary.pairs_succeeded_relay, 1);
     }
 
     #[test]
@@ -862,21 +945,28 @@ mod tests {
 mod isolation_tests {
     use super::*;
     #[test]
-    fn direct_attempt_uses_full_list_and_turn_is_relay_only() {
+    fn direct_attempt_is_stun_only_and_turn_is_relay_only() {
         let servers=vec![IceServer {urls:vec!["stun:stun.example:3478".into(),"turn:turn.example:3478".into()],username:"user".into(),password:"password".into()}];
-        // The direct-first attempt is built with the Legacy (full-list)
-        // configuration — the proven v0.6.2/v0.6.31 recipe. Credentials stay
-        // on the entry; ReadyProof, not this filter, guards attribution.
-        let direct=mode_configuration(servers.clone(),IceMode::Legacy).unwrap();
+        // The direct-first attempt is built with the Direct (STUN-only)
+        // configuration: no TURN URL survives, so no relay candidate can
+        // ever form on it, and credentials are cleared rather than merely
+        // unused. ReadyProof remains as the independent attribution guard.
+        let direct=mode_configuration(servers.clone(),IceMode::Direct).unwrap();
         assert_eq!(direct.ice_transport_type,IceTransportsType::All);
-        assert_eq!(direct.ice_servers[0].urls,vec!["stun:stun.example:3478","turn:turn.example:3478"]);
-        assert_eq!(direct.ice_servers[0].username,"user");assert_eq!(direct.ice_servers[0].password,"password");
+        assert_eq!(direct.ice_servers.len(),1);
+        assert_eq!(direct.ice_servers[0].urls,vec!["stun:stun.example:3478"]);
+        assert_eq!(direct.ice_servers[0].username,"");assert_eq!(direct.ice_servers[0].password,"");
+        // The baseline keeps the full list with credentials untouched.
+        let legacy=mode_configuration(servers.clone(),IceMode::Legacy).unwrap();
+        assert_eq!(legacy.ice_servers[0].urls,vec!["stun:stun.example:3478","turn:turn.example:3478"]);
+        assert_eq!(legacy.ice_servers[0].username,"user");assert_eq!(legacy.ice_servers[0].password,"password");
         let turn=mode_configuration(servers,IceMode::Turn).unwrap();
         assert_eq!(turn.ice_transport_type,IceTransportsType::Relay);
         assert_eq!(turn.ice_servers[0].urls,vec!["turn:turn.example:3478"]);
         assert_eq!(turn.ice_servers[0].username,"user");
         assert!(mode_configuration(vec![],IceMode::Turn).is_err());
         assert!(mode_configuration(vec![],IceMode::Legacy).unwrap().ice_servers.is_empty());
+        assert!(mode_configuration(vec![],IceMode::Direct).unwrap().ice_servers.is_empty());
     }
     #[test]
     fn callback_queue_is_bounded_before_copy_and_overflow_fences_link() {

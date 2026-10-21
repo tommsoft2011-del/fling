@@ -23,13 +23,17 @@ assert.match(direct, /start_initiator_observed\(self\.servers\.clone\(\),mode,So
 assert.match(direct, /accept_offer_observed\(self\.servers\.clone\(\),mode,/);
 const p2p = read('../src-tauri/src/online_p2p.rs');
 assert.match(p2p, /IceMode::Turn[\s\S]*?IceTransportsType::Relay/);
-// Since the v0.6.33 reference fix, the direct attempt intentionally uses the
-// full-list Legacy configuration (the v0.6.2/v0.6.31 proven recipe); the
-// STUN-only variant and its credential clearing are gone. Credentials still
-// never reach the WebView (asserted above), and honest direct attribution
-// is guarded by ReadyProof: a relay pair is valid only for the Turn path.
-assert.match(direct, /path==Path::Direct \{IceMode::Legacy\}/);
-assert.doesNotMatch(p2p, /IceMode::Direct|username\.clear\(\)|password\.clear\(\)/);
+// The direct attempt uses the STUN-only Direct configuration: its
+// candidate pool structurally cannot contain a relay pair, so ICE can
+// never nominate one there (the v0.6.33 full-list build did exactly that
+// and the connection had to be discarded). Credentials are cleared for
+// that mode and never reach the WebView (asserted above); honest direct
+// attribution is additionally guarded by ReadyProof: a relay pair is
+// valid only for the Turn path.
+assert.match(direct, /path==Path::Direct \{IceMode::Direct\}/);
+assert.match(p2p, /IceMode::Direct => valid_stun_url\(url\)/);
+assert.match(p2p, /server\.username\.clear\(\)/);
+assert.match(p2p, /server\.password\.clear\(\)/);
 const choice = read('../src-tauri/src/online_route_choice.rs');
 assert.match(choice, /relay == \(path == Path::Turn\)/);
 assert.doesNotMatch(session, /default_ice_servers\(None, None, None\)|falling back to relay|using relay/);
