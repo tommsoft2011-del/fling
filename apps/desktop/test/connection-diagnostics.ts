@@ -13,6 +13,11 @@ const pair = { route: 'turn_relay', pair_state: 'succeeded', local_type: 'relay'
 assert.deepEqual(safeConnectionDiagnostic({ ...base, pair: { ...pair, address: secret, id: secret } }), { ...logged, pair });
 assert.equal(safeConnectionDiagnostic({ ...base, pair: { ...pair, local_type: secret } }), null);
 assert.equal(safeConnectionDiagnostic({ ...base, pair: { ...pair, selected: 'true' } }), null);
+const aggregates = { pairs_total: 6, pairs_succeeded: 0, pairs_in_progress: 2, pairs_failed: 4, local_srflx: true, remote_srflx: false };
+assert.deepEqual(safeConnectionDiagnostic({ ...base, pair: { ...pair, ...aggregates, address: secret } }), { ...logged, pair: { ...pair, ...aggregates } });
+assert.equal(safeConnectionDiagnostic({ ...base, pair: { ...pair, pairs_total: -1 } }), null);
+assert.equal(safeConnectionDiagnostic({ ...base, pair: { ...pair, pairs_failed: 0.5 } }), null);
+assert.equal(safeConnectionDiagnostic({ ...base, pair: { ...pair, local_srflx: 'yes' } }), null);
 const source = readFileSync(new URL('../src/online-rust.ts', import.meta.url), 'utf8');
 assert.ok(source.includes("'connection-diagnostic'"));
 assert.match(source, /safeConnectionDiagnostic\(ev.summary\)/);
