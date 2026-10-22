@@ -37,7 +37,8 @@ import {
 } from './net.js';
 import { saveHistoryEntry, HIST_IMAGE_LIMIT, settings, type HistoryEntry } from './store.js';
 import { b64encode, toast, uid, utf8bytes } from './ui.js';
-import { P2PLink, type P2PState } from './p2p.js';
+/** P2P 直连状态（由 Rust 会话经事件上报，WebView 只做状态呈现） */
+type P2PState = 'idle' | 'connecting' | 'open' | 'failed';
 import { mergePeerProgress } from './peer-progress.js';
 import { log, flushLogs, type LogTag } from './log.js';
 import { notifyTaskDone } from './notify.js';
@@ -295,7 +296,6 @@ export class SendTask {
   p2p: P2PState = 'idle';
 
   private room?: RustFlingRoom;
-  private p2pLink: P2PLink | null = null;
   /** P2P 就绪（open/failed），文件发送前等待，避免前半走慢中继 */
   private p2pReady: Promise<'open' | 'failed'> | null = null;
   /** 接收方上报的真实接收进度（task-progress），UI 显示"对方已接收" */
@@ -597,9 +597,7 @@ export class SendTask {
             this.ackResolve = (ok: boolean) => resolve(ok);
           }
         },
-        onP2PSignal: (sig) => {
-          void this.p2pLink?.handleSignal(sig);
-        },
+
         onTaskAck: (taskId) => {
           if (taskId === this.taskId) {
             log('task', 'task-ack received', { taskId });
@@ -1212,7 +1210,6 @@ export class SendTask {
       p2pState: this.p2p,
     });
     this.stopDirectHealth('room_relay_fallback');
-    this.p2pLink?.fallbackToRelay(reason);
   }
 
   /**
@@ -1438,7 +1435,6 @@ export class RecvTask {
   private savedDir = '';
   /** P2P 直连状态：idle=未尝试 connecting=握手中 open=直连传输中 failed=已回退中继 */
   p2p: P2PState = 'idle';
-  private p2pLink: P2PLink | null = null;
   /** 正在落盘的 promise（task-done 到达时需等它们完成再发 task-ack） */
   private pendingSaves = new Set<Promise<void>>();
   /** ack 重试定时器（ack 可能丢包，重发直到发送方离开或超时） */
@@ -1642,7 +1638,6 @@ export class RecvTask {
         },
         onFileError: (id, err) => this.onFileError(id, err),
         onDirectFallback: (reason) => this.onDirectFallback(reason),
-        onP2PSignal: (sig) => this.onP2PSignal(sig),
         onLog: (tag, msg) => log(tag as LogTag, `[room] ${msg}`),
         onTaskDone: (taskId) => {
           if (taskId === this.taskId) void this.finish(true);
@@ -1961,7 +1956,7 @@ export class RecvTask {
    * method was missing on RecvTask while finish()/run() call it — the
    * resulting TypeError aborted finish() before task-ack was sent. */
   private closeP2P(): void {
-    this.p2pLink = null;
+    // Rust owns the P2P link; nothing to close here.
   }
 
   /** Registered in the room events but never defined on RecvTask (only
@@ -1989,14 +1984,6 @@ export class RecvTask {
     this.peerGoneTimer = setTimeout(() => {
       if (this.active && !this.finished) void this.finish(false);
     }, 4000);
-  }
-
-  /** offer 之前到达的远端 ICE candidate 缓存（发起方局域网 host candidate 极快，经常跑赢 offer，不能丢） */
-  private earlyIce: RTCIceCandidateInit[] = [];
-
-  /** P2P is handled in Rust. This is a no-op stub. */
-  private onP2PSignal(_sig: unknown): void {
-    // Rust consumes p2p-offer/p2p-answer/p2p-ice internally.
   }
 
   private async finish(completed: boolean): Promise<void> {

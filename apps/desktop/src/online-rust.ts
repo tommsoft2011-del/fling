@@ -1,10 +1,9 @@
-// Rust-backed online room: replaces the TypeScript FlingRoom +
-// livekit-client + RTCPeerConnection for online transfers.
+// Rust-backed online room for online transfers: signaling and the data
+// plane live in Rust (online_session.rs); the WebView only renders state.
 //
 // Native disk-file tasks only pass opaque sourceId + display metadata.
 // Legacy Blob compatibility below still spills WebView-owned bytes; it is NOT Rust-only.
-// Online signaling and the data plane live in
-// Rust (online_session.rs). This class implements the subset of the
+// This class implements the subset of the
 // FlingRoom interface used by tasks.ts, delegating to Tauri commands.
 
 import { invoke } from '@tauri-apps/api/core';
