@@ -6,7 +6,6 @@ import { writeText as writeClipboardText } from '@tauri-apps/plugin-clipboard-ma
 import {
   buildManifest,
   wrapWebFile,
-  type FileReceiver,
   type FileManifest,
   type FileLike,
   type FlingMessage,
@@ -64,143 +63,6 @@ export function errText(e: unknown): string {
 
 function errorType(e: unknown): string {
   return e instanceof Error ? e.name : typeof e;
-}
-
-interface SavedReceivedFileResult {
-  path: string;
-  writeAllMs: number;
-  syncAllMs: number;
-  sha256VerifyMs: number;
-  commitMs: number;
-}
-
-interface AppendedReceivedFileBatchResult {
-  bytes: number;
-  cumulativeBytes: number;
-  writeElapsedMs: number;
-}
-
-async function saveReceivedFile(
-  taskId: string,
-  transferId: string,
-  dir: string,
-  name: string,
-  receiver: FileReceiver,
-  relPath: string | null,
-  onBatch?: (bytes: Uint8Array) => void,
-  onProgress?: (writtenBytes: number) => void,
-): Promise<string> {
-  const xfer = transferId.slice(0, 8);
-  const size = receiver.totalBytes;
-  const startedAt = Date.now();
-  let sessionId: string | undefined;
-  let lastProgressLog = 0;
-  let batchCount = 0;
-  let batchesSinceLog = 0;
-  let invokeMsSinceLog = 0;
-  let invokeMsMaxSinceLog = 0;
-  let rustWriteMsSinceLog = 0;
-  let lastProgressAt = performance.now();
-  let failurePhase = 'begin';
-  const beginStartedAt = performance.now();
-  log('xfer', 'receiver temp file begin requested', { taskId, xfer, size });
-  try {
-    const currentSessionId = await invoke<string>('begin_received_file', {
-      dir,
-      name,
-      relPath,
-      expectedSize: size,
-      expectedSha256: receiver.manifest.sha256,
-    });
-    sessionId = currentSessionId;
-    log('xfer', 'receiver temp file begin complete', {
-      taskId, xfer, size, status: 'ok', elapsedMs: Math.round(performance.now() - beginStartedAt),
-    });
-    failurePhase = 'append';
-    await receiver.streamTo(async (bytes, writtenBytes) => {
-      const invokeStartedAt = performance.now();
-      const result = await invoke<AppendedReceivedFileBatchResult>(
-        'append_received_file_chunk',
-        bytes,
-        { headers: { 'x-session-id': currentSessionId } },
-      );
-      const invokeElapsedMs = performance.now() - invokeStartedAt;
-      if (result.bytes !== bytes.byteLength || result.cumulativeBytes !== writtenBytes) {
-        throw new Error('received file append accounting mismatch');
-      }
-      // streamTo awaits every append, so there are no queued batches behind this one.
-      batchCount++;
-      batchesSinceLog++;
-      invokeMsSinceLog += invokeElapsedMs;
-      invokeMsMaxSinceLog = Math.max(invokeMsMaxSinceLog, invokeElapsedMs);
-      rustWriteMsSinceLog += result.writeElapsedMs;
-      const now = performance.now();
-      if (batchCount === 1) {
-        log('xfer', 'first receiver append completed', {
-          taskId, xfer, batchBytes: result.bytes, cumulativeBytes: result.cumulativeBytes,
-          invokeMs: Math.round(invokeElapsedMs), rustWriteMs: Math.round(result.writeElapsedMs),
-        });
-      }
-      onBatch?.(bytes);
-      onProgress?.(writtenBytes);
-      if (
-        writtenBytes - lastProgressLog >= 32 * 1024 * 1024 ||
-        now - lastProgressAt >= 10_000 ||
-        writtenBytes === size
-      ) {
-        log('xfer', 'receiver append aggregate', {
-          taskId, xfer, size, cumulativeBytes: writtenBytes, batches: batchesSinceLog,
-          invokeTotalMs: Math.round(invokeMsSinceLog), invokeMaxMs: Math.round(invokeMsMaxSinceLog),
-          rustWriteTotalMs: Math.round(rustWriteMsSinceLog),
-        });
-        lastProgressLog = writtenBytes;
-        lastProgressAt = now;
-        batchesSinceLog = 0;
-        invokeMsSinceLog = 0;
-        invokeMsMaxSinceLog = 0;
-        rustWriteMsSinceLog = 0;
-      }
-    });
-    failurePhase = 'verify-sync-commit';
-    const result = await invoke<SavedReceivedFileResult>('finish_received_file', { sessionId });
-    log('xfer', 'Rust SHA-256 verify stage', {
-      taskId, xfer, size, status: 'ok', elapsedMs: Math.round(result.sha256VerifyMs),
-    });
-    log('xfer', 'Rust write_all stage', {
-      taskId, xfer, size, status: 'ok', elapsedMs: result.writeAllMs,
-    });
-    log('xfer', 'Rust sync_all stage', {
-      taskId, xfer, size, status: 'ok', elapsedMs: result.syncAllMs,
-    });
-    log('xfer', 'Rust atomic commit stage', {
-      taskId, xfer, size, status: 'ok', elapsedMs: Math.round(result.commitMs),
-    });
-    log('xfer', 'Tauri save IPC end', {
-      taskId, xfer, size, status: 'ok', elapsedMs: Date.now() - startedAt,
-    });
-    return result.path;
-  } catch (e) {
-    if (sessionId) {
-      try {
-        const cleanupStartedAt = performance.now();
-        await invoke('abort_received_file', { sessionId });
-        log('xfer', 'receiver temp cleanup completed', {
-          taskId, xfer, reason: 'save_error',
-          elapsedMs: Math.round(performance.now() - cleanupStartedAt),
-        });
-      } catch (cleanupError) {
-        log('xfer', 'receiver temp cleanup failed', {
-          taskId, xfer, reason: 'save_error', errorType: errorType(cleanupError),
-        });
-        // The backend also drops unfinished temp files when a session fails.
-      }
-    }
-    log('xfer', 'Tauri save IPC end', {
-      taskId, xfer, size, status: 'error', elapsedMs: Date.now() - startedAt,
-      failurePhase, errorType: errorType(e),
-    });
-    throw e;
-  }
 }
 
 /** 发送框里的一个条目（快照） */
@@ -1436,7 +1298,6 @@ export class RecvTask {
   /** P2P 直连状态：idle=未尝试 connecting=握手中 open=直连传输中 failed=已回退中继 */
   p2p: P2PState = 'idle';
   /** 正在落盘的 promise（task-done 到达时需等它们完成再发 task-ack） */
-  private pendingSaves = new Set<Promise<void>>();
   /** ack 重试定时器（ack 可能丢包，重发直到发送方离开或超时） */
   private ackTimer: ReturnType<typeof setInterval> | null = null;
   /** Progress report trailing edge: a fast burst must still publish its final value. */
@@ -1629,13 +1490,6 @@ export class RecvTask {
           }
           this.notify();
         },
-        onFileCompleteStream: (id, m, receiver) => {
-          // 落盘是异步的：跟踪起来，finish(true) 需要等它们全部完成再发 task-ack
-          const p = this.onFileComplete(id, m, receiver);
-          this.pendingSaves.add(p);
-          void p.finally(() => this.pendingSaves.delete(p)).catch(() => {});
-          return p;
-        },
         onFileError: (id, err) => this.onFileError(id, err),
         onDirectFallback: (reason) => this.onDirectFallback(reason),
         onLog: (tag, msg) => log(tag as LogTag, `[room] ${msg}`),
@@ -1784,9 +1638,8 @@ export class RecvTask {
     item.doneBytes = item.totalBytes;
     item.saveBytes = item.totalBytes;
     item.status = 'done';
-    // Rust path persists the file itself, so the legacy onFileComplete
-    // finally-block that settles the pending counter never runs. Settle
-    // here, or finish() stalls 30s in waitForPendingFiles.
+    // Rust persists the file itself; settle the pending counter here,
+    // or finish() stalls 30s in waitForPendingFiles.
     this.settlePendingFile(transferId);
     log('xfer', 'transfer-done marked', { taskId: this.taskId, name: item.name, size: item.totalBytes });
     this.notify();
@@ -1850,69 +1703,6 @@ export class RecvTask {
     item.error = err;
     this.settlePendingFile(id);
     log('xfer', 'item failed', { taskId: this.taskId, xfer: id.slice(0, 8), size: item.totalBytes, status: 'error' });
-    this.notify();
-  }
-
-  private async onFileComplete(id: string, m: FileManifest, receiver: FileReceiver): Promise<void> {
-    const item = this.manifestToItem.get(id);
-    if (!item) return;
-    item.saving = true;
-    item.saveBytes = 0;
-    this.notify();
-    // A small file may finish within the 1s throttle window. Send its exact
-    // received byte count immediately so the sender can advance to the next
-    // file without relying on the final task-ack.
-    this.reportProgress(true);
-    // Rust 在增量写入时核对 SHA-256；这里只记录通过保存验证后的 manifest 值供历史核对。
-    item.sha256 = m.sha256;
-    try {
-      const keepImageBytes = m.kind === 'clipboard-image' && m.size < HIST_IMAGE_LIMIT
-        ? new Uint8Array(m.size)
-        : undefined;
-      let imageOffset = 0;
-      const onBatch = keepImageBytes
-        ? (batch: Uint8Array) => {
-            keepImageBytes.set(batch, imageOffset);
-            imageOffset += batch.byteLength;
-          }
-        : undefined;
-      if (m.kind === 'clipboard-image') {
-        // 剪贴板图片存为 PNG 文件，不直接写入系统剪贴板（避免覆盖用户剪贴板内容）；
-        // 用户需要时去历史记录里点"复制到剪贴板"
-        const name = /\.png$/i.test(m.name) ? m.name : m.name + '.png';
-        const savedPath = await saveReceivedFile(this.taskId, id, this.savedDir, name, receiver, null, onBatch, (writtenBytes) => {
-          item.saveBytes = writtenBytes;
-          this.notify();
-          this.reportProgress();
-        });
-        log('xfer', 'clipboard image saved', { taskId: this.taskId, xfer: id.slice(0, 8), size: m.size });
-        item.savedPath = savedPath;
-        if (keepImageBytes) this.clipImages.set(item.uid, keepImageBytes);
-      } else {
-        const savedPath = await saveReceivedFile(this.taskId, id, this.savedDir, m.name, receiver, m.path ?? null, onBatch, (writtenBytes) => {
-          item.saveBytes = writtenBytes;
-          this.notify();
-          this.reportProgress();
-        });
-        log('xfer', 'item saved', { taskId: this.taskId, xfer: id.slice(0, 8), size: m.size });
-        item.savedPath = savedPath;
-      }
-      item.saving = false;
-      item.saveBytes = item.totalBytes;
-      item.status = 'done';
-      item.doneBytes = item.totalBytes;
-      // This exact report follows hash verification, fsync and atomic commit.
-      this.reportProgress(true);
-    } catch (e) {
-      item.saving = false;
-      item.status = 'error';
-      item.error = errText(e);
-      log('xfer', 'item save failed', { taskId: this.taskId, xfer: id.slice(0, 8), size: m.size, status: 'error' });
-      this.notify();
-      throw e;
-    } finally {
-      this.settlePendingFile(id);
-    }
     this.notify();
   }
 
@@ -2004,7 +1794,6 @@ export class RecvTask {
         log('task', 'wait pending files timeout', { taskId: this.taskId, pending: this.pendingFiles });
       }
       await this.room?.flush().catch(() => {});
-      await Promise.allSettled([...this.pendingSaves]);
     }
     this.closeP2P();
     // 文本：拼起来写剪贴板
@@ -2125,7 +1914,6 @@ export class RecvTask {
         taskId: this.taskId,
         receivedBytes: this.items.reduce((sum, item) => sum + item.doneBytes, 0),
         savedBytes: this.items.reduce((sum, item) => sum + (item.saveBytes ?? 0), 0),
-        pendingSaveCount: this.pendingSaves.size,
       });
       this.phase = 'cancelled';
       this.notify();

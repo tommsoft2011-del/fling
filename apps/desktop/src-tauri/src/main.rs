@@ -1236,61 +1236,6 @@ impl ReceivedFileStore {
     }
 }
 
-#[tauri::command]
-async fn begin_received_file(
-    store: tauri::State<'_, ReceivedFileStore>,
-    dir: String,
-    name: String,
-    rel_path: Option<String>,
-    expected_size: u64,
-    expected_sha256: String,
-) -> Result<String, String> {
-    let store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        store.begin(dir, name, rel_path, expected_size, expected_sha256)
-    })
-    .await
-    .map_err(|e| format!("开始接收文件失败: {e}"))?
-}
-
-#[tauri::command]
-async fn append_received_file_chunk(
-    store: tauri::State<'_, ReceivedFileStore>,
-    request: tauri::ipc::Request<'_>,
-) -> Result<AppendReceivedFileResult, String> {
-    let session_header = request
-        .headers()
-        .get("x-session-id")
-        .and_then(|value| value.to_str().ok());
-    let (session_id, data) = raw_append_request_parts(request.body(), session_header)?;
-    let store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || store.append(&session_id, &data))
-        .await
-        .map_err(|e| format!("写入接收文件失败: {e}"))?
-}
-
-#[tauri::command]
-async fn finish_received_file(
-    store: tauri::State<'_, ReceivedFileStore>,
-    session_id: String,
-) -> Result<SaveReceivedFileResult, String> {
-    let store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || store.finish(&session_id))
-        .await
-        .map_err(|e| format!("完成接收文件失败: {e}"))?
-}
-
-#[tauri::command]
-async fn abort_received_file(
-    store: tauri::State<'_, ReceivedFileStore>,
-    session_id: String,
-) -> Result<(), String> {
-    let store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || store.abort(&session_id))
-        .await
-        .map_err(|e| format!("清理接收文件失败: {e}"))?
-}
-
 fn history_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     let dir = app
         .path()
@@ -2482,10 +2427,6 @@ fn main() {
             pick_save_path,
             write_binary_file,
             save_received_file,
-            begin_received_file,
-            append_received_file_chunk,
-            finish_received_file,
-            abort_received_file,
             get_device_info,
             set_device_name,
             get_download_dir,
