@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 pub const DIRECT_CUTOFF_MS: u64 = 2_500;
+/// Bounded grace after the cutoff when our own Direct path is fully proven
+/// (valid ReadyProof recorded) but the peer's pre-decision Ready is still in
+/// flight: the decision waits for the peer Ready instead of escalating to
+/// TURN on a hair-missed cutoff. No grace when our own Direct is unproven,
+/// so a genuinely unreachable peer still escalates at DIRECT_CUTOFF_MS.
+pub const PEER_READY_GRACE_MS: u64 = 2_000;
 pub const SETUP_LIMIT_MS: u64 = 15_000;
 const HANDSHAKE_LIMIT_MS: u64 = 15_000;
 const RETRANSMIT_MS: u64 = 200;
@@ -174,7 +180,10 @@ impl RouteHandler {
         vec![]
     }
     /// `now` MUST be sampled by the local serialized executor at event observation.
-    /// Remote payloads never supply readiness timestamps. Equal-cutoff READY loses.
+    /// Remote payloads never supply readiness timestamps. A peer READY received
+    /// at/after the cutoff still counts while the PEER_READY_GRACE_MS grace is
+    /// open (own Direct proven, peer Ready outstanding); outside grace, a READY
+    /// that has not been received by decision time does not count.
     pub fn handle(&mut self, event: Event, now: u64) -> Vec<Effect> {
         // Completion is absorbing for transport failures, but committed receiver
         // frames may still request idempotent final-ACK replay until room teardown.
@@ -257,11 +266,20 @@ impl RouteHandler {
                 if now.saturating_sub(start) >= HANDSHAKE_LIMIT_MS { return self.fail(); }
                 if self.role == Role::Sender && self.phase == Phase::Gathering
                     && now.saturating_sub(start) >= DIRECT_CUTOFF_MS {
-                    let path = if self.own_direct_at.is_some() && self.peer_direct_at.is_some() { Path::Direct } else { Path::Turn };
-                    self.selected = Some(path); self.phase = Phase::Locked; self.decision_at = Some(now);
-                    let mut fx = vec![Effect::Cutoff(path)];
-                    if path == Path::Turn { fx.push(Effect::CreateTurnPeerConnection(self.epoch)); }
-                    fx.extend(self.send_pending(Wire::Decision, now)); return fx;
+                    // Grace: our Direct is fully proven but the peer's Ready
+                    // has not landed yet. Hold the decision (fall through to
+                    // retransmission) until it arrives or the grace expires;
+                    // escalating here would abandon a healthy Direct path
+                    // over a sub-second signalling delay.
+                    let in_grace = self.own_direct_at.is_some() && self.peer_direct_at.is_none()
+                        && now.saturating_sub(start) < DIRECT_CUTOFF_MS + PEER_READY_GRACE_MS;
+                    if !in_grace {
+                        let path = if self.own_direct_at.is_some() && self.peer_direct_at.is_some() { Path::Direct } else { Path::Turn };
+                        self.selected = Some(path); self.phase = Phase::Locked; self.decision_at = Some(now);
+                        let mut fx = vec![Effect::Cutoff(path)];
+                        if path == Path::Turn { fx.push(Effect::CreateTurnPeerConnection(self.epoch)); }
+                        fx.extend(self.send_pending(Wire::Decision, now)); return fx;
+                    }
                 }
                 if now.saturating_sub(self.last_send) < RETRANSMIT_MS { return vec![]; }
                 self.last_send = now;
@@ -301,7 +319,7 @@ impl RouteHandler {
             if !pre_direct && self.fence() != Some(e.fence) { return vec![Effect::IgnoreStale]; }
             self.peer.insert(e.fence.path, proof);
             if self.role == Role::Sender && self.phase == Phase::Gathering && pre_direct
-                && self.started_at.is_some_and(|s| now.saturating_sub(s) < DIRECT_CUTOFF_MS) {
+                && self.started_at.is_some_and(|s| now.saturating_sub(s) < DIRECT_CUTOFF_MS + PEER_READY_GRACE_MS) {
                 self.peer_direct_at.get_or_insert(now);
             }
             return self.maybe_request(now);
@@ -508,14 +526,41 @@ mod tests {
         for t in [0,1,2498,2499] { let mut p=Pair::new();p.ready(Path::Direct,t);p.drain(t);
             p.local(true,Event::Tick,2500);p.drain(2500);assert_eq!(p.s.selected(),Some(Path::Direct));assert_eq!(p.turns,0); }
     }
-    #[test] fn exact_cutoff_before_equal_after_uses_coordinator_receipt_time() {
-        for (t,want) in [(2499,Path::Direct),(2500,Path::Turn),(2501,Path::Turn)] {
+    #[test] fn peer_ready_within_grace_still_wins_direct() {
+        // Own READY is local at 100. The peer READY received before, at, or
+        // after the cutoff — while the grace window is open — still counts.
+        for t in [2499,2500,2501,4499] {
             let mut p=Pair::new();p.ready(Path::Direct,100);p.drain(t);
-            p.local(true,Event::Tick,t.max(2500));assert_eq!(p.s.selected(),Some(want));
+            p.local(true,Event::Tick,t.max(2500));assert_eq!(p.s.selected(),Some(Path::Direct));
         }
-        // Even if READY is delivered before the timer callback, receipt exactly at cutoff loses.
-        let mut p=Pair::new();p.ready(Path::Direct,2500);p.drain(2500);p.local(true,Event::Tick,2500);
-        assert_eq!(p.s.selected(),Some(Path::Turn));
+    }
+    #[test] fn grace_holds_decision_until_peer_ready_arrives() {
+        let mut p=Pair::new();p.ready(Path::Direct,100);
+        // Deliver only the sender's Ready; hold the peer's in the pool.
+        let held=p.pool.iter().position(|(from_s,e)| !from_s && matches!(e.message, Wire::Ready(_))).unwrap();
+        for i in 0..p.pool.len() { if i!=held { p.deliver(i,100); } }
+        p.local(true,Event::Tick,2500);
+        assert_eq!(p.s.selected(),None);assert_eq!(p.turns,0);
+        p.local(true,Event::Tick,4499);
+        assert_eq!(p.s.selected(),None);assert_eq!(p.turns,0);
+        // Peer Ready lands inside the grace: next tick decides Direct.
+        p.deliver(held,4499);
+        p.local(true,Event::Tick,4499);
+        assert_eq!(p.s.selected(),Some(Path::Direct));assert_eq!(p.turns,0);
+    }
+    #[test] fn grace_expires_to_turn_when_peer_ready_never_arrives() {
+        let mut p=Pair::new();p.ready(Path::Direct,100);
+        let held=p.pool.iter().position(|(from_s,e)| !from_s && matches!(e.message, Wire::Ready(_))).unwrap();
+        for i in 0..p.pool.len() { if i!=held { p.deliver(i,100); } }
+        p.local(true,Event::Tick,2500);assert_eq!(p.s.selected(),None);
+        p.local(true,Event::Tick,4500);
+        assert_eq!(p.s.selected(),Some(Path::Turn));assert_eq!(p.turns,1);
+    }
+    #[test] fn no_grace_without_own_direct_ready() {
+        // Nothing proven locally: the decision stays at the plain cutoff.
+        let mut p=Pair::new();
+        p.local(true,Event::Tick,2500);
+        assert_eq!(p.s.selected(),Some(Path::Turn));assert_eq!(p.turns,1);
     }
     #[test] fn acceptance_direct_ready_while_backup_select_is_in_flight() {
         let mut p=Pair::new();p.local(true,Event::Tick,2500);p.ready(Path::Direct,2501);p.drain(2501);
@@ -607,8 +652,11 @@ mod tests {
     }
     #[test] fn missing_ready_and_lost_ack_have_bounded_failure_or_same_transaction_retry() {
         let mut p=Pair::new();p.ready(Path::Direct,100); // Drop READY: not observed by arbiter.
-        p.local(true,Event::Tick,2500);assert_eq!(p.s.selected(),Some(Path::Turn));p.drain(2500);
-        p.ready(Path::Turn,2600);p.drain(2600);assert_eq!(p.permits,1);
+        // Own Direct is proven, so the grace holds the decision first; with
+        // the peer READY never observed, escalation is still bounded.
+        p.local(true,Event::Tick,2500);assert_eq!(p.s.selected(),None);
+        p.local(true,Event::Tick,4500);assert_eq!(p.s.selected(),Some(Path::Turn));p.drain(4500);
+        p.ready(Path::Turn,4600);p.drain(4600);assert_eq!(p.permits,1);
         // A fresh transaction whose decision is lost forever cannot gain permission.
         let mut q=Pair::new();q.local(true,Event::Tick,2500);
         for t in (2700..15000).step_by(200) { q.local(true,Event::Tick,t);assert_eq!(q.permits,0); }
