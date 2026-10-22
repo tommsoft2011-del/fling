@@ -181,7 +181,7 @@ async function startMain(): Promise<void> {
     log('app', 'fling started', { version: ver });
     log('app', 'diagnostic build identifier', {
       buildId: await invoke<string>('app_build_identity'),
-      frontendBuildId: `v0.6.36+${__FLING_BUILD_COMMIT__}`,
+      frontendBuildId: `v0.6.37+${__FLING_BUILD_COMMIT__}`,
       commit: __FLING_BUILD_COMMIT__,
     });
   } catch {
