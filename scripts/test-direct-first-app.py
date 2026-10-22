@@ -68,7 +68,7 @@ for case in a.cases.split(','):
         for role,ev in events.items()}
     if case not in ('repeat','cancel'):
         ok=ok and all(not errors for errors in teardown_errors.values())
-    identity_ok=all(x.get('version')=='0.6.34' and x.get('buildIdentity')==a.expected_build_id for x in probe.values())
+    identity_ok=all(x.get('version')=='0.6.35' and x.get('buildIdentity')==a.expected_build_id for x in probe.values())
     route_evidence={role:[x['event']['summary'] for x in ev if x.get('event',{}).get('kind')=='path-diagnostic' and x['event']['summary']['phase']=='selected_pair'] for role,ev in events.items()}
     if case=='turn':
         ok=ok and all(any(d['route']=='turn_relay' and d['nominated'] is True and d['pair_state']=='succeeded' and d['local_type']=='relay' and d['remote_type']=='relay' for d in ds) for ds in route_evidence.values())
