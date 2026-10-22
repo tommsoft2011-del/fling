@@ -1,6 +1,6 @@
 {
   "name": "@fling/desktop",
-  "version": "0.6.35",
+  "version": "0.6.36",
   "private": true,
   "type": "module",
   "scripts": {
@@ -19,8 +19,7 @@
     "@tauri-apps/plugin-clipboard-manager": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.0.0",
     "@tauri-apps/plugin-fs": "^2.0.0",
-    "@tauri-apps/plugin-notification": "^2.0.0",
-    "livekit-client": "^2.0.0"
+    "@tauri-apps/plugin-notification": "^2.0.0"
   },
   "devDependencies": {
     "typescript": "^7.0.2",
