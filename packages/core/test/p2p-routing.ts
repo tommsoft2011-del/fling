@@ -15,6 +15,7 @@ import { buildManifest, FILE_HASH_CHUNK_SIZE, FileReceiver, type FileLike, wrapW
 import { decodeDirectFileChunkFrame, encodeDirectFileChunkFrame, FILE_CHUNK_SIZE } from '../src/protocol.js';
 import { MANIFEST_PREPARATION_TIMEOUT_MS } from '../src/stage-timeout.js';
 import type { DataHandler, FlingTransport } from '../src/transport.js';
+import { deriveRoomKey, openText } from '../src/crypto.js';
 
 let failures = 0;
 function check(cond: unknown, msg: string): void {
@@ -42,6 +43,12 @@ class MockTransport implements FlingTransport {
   isConnected = false;
   publishDelayMs = 0;
   dropNextPublish = false;
+  // Deterministic message-level drop: when messageKey is set, relay payloads
+  // are decrypted and the first one matching the predicate is dropped
+  // (one-shot). Matching on content keeps the drop independent of publish
+  // scheduling order, which a "drop the next publish" hook cannot guarantee.
+  messageKey: CryptoKey | null = null;
+  dropNextMessageMatching: ((msg: { kind?: string; complete?: boolean }) => boolean) | null = null;
   droppedPublishes = 0;
   private dataHandler: DataHandler | null = null;
   constructor(
@@ -56,6 +63,19 @@ class MockTransport implements FlingTransport {
     this.isConnected = false;
   }
   async publish(payload: Uint8Array, topic: string): Promise<void> {
+    if (this.dropNextMessageMatching && this.messageKey) {
+      try {
+        const msg = JSON.parse(await openText(this.messageKey, dec.decode(payload))) as {
+          kind?: string;
+          complete?: boolean;
+        };
+        if (this.dropNextMessageMatching(msg)) {
+          this.dropNextMessageMatching = null;
+          this.droppedPublishes++;
+          return;
+        }
+      } catch { /* not a sealed room message: never drop */ }
+    }
     if (this.dropNextPublish) {
       this.dropNextPublish = false;
       this.droppedPublishes++;
@@ -367,6 +387,9 @@ async function main(): Promise<void> {
   const tB = new MockTransport('B', hub);
   const roomA = new FlingRoom(tA, 'devA');
   const roomB = new FlingRoom(tB, 'devB');
+  const roomKey = await deriveRoomKey('code123');
+  tA.messageKey = roomKey;
+  tB.messageKey = roomKey;
 
   let directA = new FakeDirect('A->B');
   let directB = new FakeDirect('B->A');
@@ -615,7 +638,13 @@ async function main(): Promise<void> {
   // Receiver progress precedes ACK enqueue; sender progress can race the final ACK.
   eventsB.onFileProgress = () => {
     if (!lossScheduled) {
-      tB.dropNextPublish = true;
+      // Drop a PROGRESS ack specifically. The receiver deliberately sends
+      // the final saved-file ACK out of band (it does not wait for the queued
+      // progress publish), so a plain "drop the next publish" races with the
+      // final ACK: dropping the final ACK instead wedges sendFile until the
+      // finalize timeout even though the repair path works. Matching the
+      // decrypted message makes the loss deterministic in either order.
+      tB.dropNextMessageMatching = (msg) => msg.kind === 'file-chunk-ack' && msg.complete !== true;
       lossScheduled = true;
     }
   };
@@ -626,6 +655,7 @@ async function main(): Promise<void> {
   }
   await lostAckSend;
   eventsB.onFileProgress = undefined;
+  tB.dropNextMessageMatching = null;
   check(lossScheduled && tB.droppedPublishes === droppedBefore + 1, 'simulated receiver progress ACK is lost');
   check(done.cur?.bytes.length === 100_000, 'later final ACK confirms saved file after a lost progress ACK');
 
