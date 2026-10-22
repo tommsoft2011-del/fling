@@ -619,9 +619,26 @@ impl OnlineSession {
             } else { self.receivers.lock().await.remove(&id); }
             emit(&self.app, &self.id, OnlineUiEvent::TransferDone { transfer_id: id.clone(), ok: true, error: None });
         } else {
-            let ack = self.fenced_ack(receiver, next_seq, received_bytes, false).await?;
-            if publish_progress_ack(receiver, &self.receiver_last_ack, next_seq, self.room.send(&ack)).await? {
-                if due { emit(&self.app, &self.id, OnlineUiEvent::Progress { transfer_id: id.clone(), sent_bytes: received_bytes, total_bytes: receiver.manifest().size, direction: "receiving".into() }); }
+            // Progress ACKs are cumulative: the next frame's ACK supersedes
+            // this one, and `receiver_last_ack` only advances after a
+            // successful publish, so a failed publish is retried implicitly.
+            // A transient publish failure (the room send carries a short
+            // setup-phase bound) must never fail the transfer or delete the
+            // partially received file; the sender's own no-progress timeout
+            // remains the guard against a genuinely dead ACK path. The final
+            // durable ACK above stays strict.
+            let published = match self.fenced_ack(receiver, next_seq, received_bytes, false).await {
+                Ok(ack) => publish_progress_ack(receiver, &self.receiver_last_ack, next_seq, self.room.send(&ack)).await,
+                Err(error) => Err(error),
+            };
+            match published {
+                Ok(true) => {
+                    if due { emit(&self.app, &self.id, OnlineUiEvent::Progress { transfer_id: id.clone(), sent_bytes: received_bytes, total_bytes: receiver.manifest().size, direction: "receiving".into() }); }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("fling progress ACK publish failed (non-fatal, will retry on next frame): {error}");
+                }
             }
         }
         Ok(())
@@ -819,11 +836,18 @@ impl OnlineSession {
         self.manifest_acks.lock().await.remove(&id);
         self.route_capabilities.lock().await.remove(&id);
         self.peer_progress_ui.lock().await.remove(&id);
-        if result.is_err() {
+        if let Err(error) = &result {
             self.note_transfer(&id,Phase::TransferFailed);
             let route={let mut current=self.route.lock().await;
                 if current.as_ref().is_some_and(|(tid,_)|tid==&id) {current.take()} else {None}};
-            if let Some((_,route))=route {route.close().await;}
+            if let Some((_,route))=route {
+                // Record the failure on the route (drives the AttemptEnd
+                // diagnostic reason and a prompt AttemptAbort to the peer)
+                // before closing it; a bare close left the peer waiting and
+                // the exported diagnostics reason-less.
+                route.fail(error.clone()).await;
+                route.close().await;
+            }
         }
         result
     }

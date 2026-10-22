@@ -45,6 +45,17 @@ const MAX_BUFFERED_BYTES: u64 = 2 * 1024 * 1024;
 /// How long to wait for a manifest ACK / file-complete ACK.
 const MANIFEST_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_COMPLETE_TIMEOUT: Duration = Duration::from_secs(60);
+/// No-progress budget for cumulative ACKs while the send window is full.
+/// The receiver writes every frame to disk under host antivirus/IO load, so
+/// 30 s of ACK silence is reachable on a healthy but slow receiver; a truly
+/// dead path still aborts promptly via the route failure event, which wakes
+/// `wait_for_ack` through `on_failed`. 90 s only bounds silent stalls.
+const ACK_PROGRESS_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long the DataChannel send buffer may stay above the backpressure
+/// threshold before the send is declared stalled. Draining is paced by the
+/// receiver's disk consumption, so this gets the same headroom rationale
+/// as ACK_PROGRESS_TIMEOUT.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Build a `FileManifest` for a local file: streams the file once to
 /// compute SHA-256 and the chunk count. Mirrors `buildManifest()`.
@@ -208,7 +219,7 @@ impl OnlineSender {
             let acked = self.acked.load(std::sync::atomic::Ordering::Acquire);
             if seq.saturating_sub(acked) >= SENDER_WINDOW_CHUNKS {
                 let target = acked.saturating_add(ACK_INTERVAL_CHUNKS);
-                if !self.wait_for_ack(target, Duration::from_secs(30)).await {
+                if !self.wait_for_ack(target, ACK_PROGRESS_TIMEOUT).await {
                     return Err("P2P cumulative ACK timeout".to_string());
                 }
                 continue;
@@ -261,7 +272,7 @@ impl OnlineSender {
             // Backpressure: poll buffered_amount() on a short sleep.
             let drain_started = Instant::now();
             while buffered_amount() > MAX_BUFFERED_BYTES {
-                if drain_started.elapsed() > Duration::from_secs(15) {
+                if drain_started.elapsed() > DRAIN_TIMEOUT {
                     return Err("P2P DataChannel send buffer did not drain".to_string());
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -307,7 +318,7 @@ impl OnlineSender {
             let acked = self.acked.load(std::sync::atomic::Ordering::Acquire);
             if seq.saturating_sub(acked) >= SENDER_WINDOW_CHUNKS {
                 let target = acked.saturating_add(ACK_INTERVAL_CHUNKS);
-                if !self.wait_for_ack(target, Duration::from_secs(30)).await {
+                if !self.wait_for_ack(target, ACK_PROGRESS_TIMEOUT).await {
                     return Err("relay cumulative ACK timeout".to_string());
                 }
                 continue;

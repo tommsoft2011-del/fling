@@ -73,6 +73,17 @@ pub fn sdp_ufrag(sdp: &str) -> Result<String, String> {
     value.map(str::to_owned).ok_or_else(||"missing SDP ufrag".into())
 }
 
+/// Coarse, privacy-safe classification of a stored route failure for the
+/// exported connection diagnostics. Raw error text never leaves the device;
+/// only the category does.
+fn classify_failure_reason(error: &str) -> Reason {
+    if error.to_lowercase().contains("timeout") || error.contains("超时") {
+        Reason::Timeout
+    } else {
+        Reason::OperationFailed
+    }
+}
+
 pub struct DirectAttempt {
     diagnostics: Arc<ConnectionDiagnostics>,
     pub capability: Capability,
@@ -401,7 +412,13 @@ impl DirectAttempt {
     pub fn terminal_watch(&self) -> watch::Receiver<bool> {self.terminal_notice.subscribe()}
     pub fn block_frames(&self) {
         if !self.terminal.swap(true,Ordering::AcqRel) {
-            self.diagnostics.scope(Path::Direct).note(Stage::AttemptEnd,Outcome::Observed,Reason::None);
+            // Surface why the attempt ended: exported diagnostics previously
+            // always recorded failure_category "none" here, which made the
+            // actual send/receive error invisible in user-supplied logs.
+            let reason = self.failure.try_lock().ok()
+                .and_then(|guard| guard.as_ref().map(|error| classify_failure_reason(error)))
+                .unwrap_or(Reason::None);
+            self.diagnostics.scope(Path::Direct).note(Stage::AttemptEnd,Outcome::Observed,reason);
             self.diagnostics.flush();
         }
         self.terminal_notice.send_replace(true);
