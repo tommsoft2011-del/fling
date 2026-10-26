@@ -402,6 +402,8 @@ mod tests {
     const E: Epoch = Epoch { attempt: 1, generation: 1 };
     const CUTOFF: u64 = DIRECT_CUTOFF_MS;
     const GRACE_END: u64 = DIRECT_CUTOFF_MS + PEER_READY_GRACE_MS;
+    const TURN_ACTIVE_AT: u64 = CUTOFF + 100;
+    const AFTER_TURN_ACTIVE: u64 = CUTOFF + 200;
     const DP: ReadyProof = ReadyProof { dc_open: true, pc_connected: true, selected: true, nominated: true, succeeded: true, known: true, relay: false };
     const TP: ReadyProof = ReadyProof { relay: true, ..DP };
     #[derive(Clone, Debug)]
@@ -458,7 +460,7 @@ mod tests {
         }
         fn turn_active() -> Self {
             let mut p=Self::new();p.local(true,Event::Tick,CUTOFF);p.drain(CUTOFF);
-            p.ready(Path::Turn,CUTOFF+100);p.drain(CUTOFF+100);
+            p.ready(Path::Turn,TURN_ACTIVE_AT);p.drain(TURN_ACTIVE_AT);
             assert_eq!(p.s.phase(),Phase::Active);assert_eq!(p.r.phase(),Phase::Active);assert_eq!(p.permits,1);p
         }
         fn direct_active() -> Self {
@@ -473,16 +475,16 @@ mod tests {
             let mut p=Pair::turn_active();
             let h=if sender {&mut p.s}else{&mut p.r};
             let fence=h.fence().unwrap();
-            assert_eq!(h.handle(Event::ApplicationCompleted {fence},2700),vec![Effect::ApplicationCompleted]);
+            assert_eq!(h.handle(Event::ApplicationCompleted {fence},TURN_ACTIVE_AT),vec![Effect::ApplicationCompleted]);
             for event in [Event::PathFailed {epoch:E,path:Path::Direct},
                 Event::PathFailed {epoch:E,path:Path::Turn},Event::Timeout {epoch:E},
                 Event::Wire(Envelope {fence:Fence {epoch:E,seq:0,path:Path::Direct},message:Wire::AttemptAbort}),
                 Event::Tick,Event::ApplicationCompleted {fence}] {
-                assert!(h.handle(event,2800).is_empty(),"completed teardown must not emit Abort/Failed");
+                assert!(h.handle(event,AFTER_TURN_ACTIVE).is_empty(),"completed teardown must not emit Abort/Failed");
                 assert_eq!(h.phase(),Phase::Active);
             }
             assert!(!h.permits_frame(fence),"no new sender bytes after completion");
-            if !sender {assert_eq!(h.handle(Event::Frame {fence},2900),vec![Effect::AcceptFrame(fence)]);}
+            if !sender {assert_eq!(h.handle(Event::Frame {fence},AFTER_TURN_ACTIVE+100),vec![Effect::AcceptFrame(fence)]);}
         }
     }
     #[test]
@@ -492,11 +494,11 @@ mod tests {
                 let mut p=Pair::turn_active();let h=if sender {&mut p.s}else{&mut p.r};
                 let fence=h.fence().unwrap();
                 assert!(h.confirm_bytes(fence,bytes));
-                let effects=h.handle(Event::PathFailed {epoch:E,path:Path::Turn},2700);
+                let effects=h.handle(Event::PathFailed {epoch:E,path:Path::Turn},TURN_ACTIVE_AT);
                 assert!(effects.contains(&Effect::Failed));
                 assert!(effects.iter().any(|e|matches!(e,Effect::Send(Envelope {message:Wire::AttemptAbort,..}))));
                 assert_eq!(h.phase(),Phase::Failed);
-                assert!(h.handle(Event::ApplicationCompleted {fence},2800).is_empty());
+                assert!(h.handle(Event::ApplicationCompleted {fence},AFTER_TURN_ACTIVE).is_empty());
                 assert!(!h.application_completed,"byte accounting is not durable/task completion");
             }
         }
@@ -508,19 +510,19 @@ mod tests {
         assert_eq!(h.handle(Event::ApplicationCompleted {fence},0),vec![Effect::IgnoreStale]);
         let mut p=Pair::turn_active();
         for bad in [Fence {epoch:Epoch {generation:0,..E},..fence},Fence {path:Path::Direct,..fence},Fence {seq:0,..fence}] {
-            assert_eq!(p.s.handle(Event::ApplicationCompleted {fence:bad},2700),vec![Effect::IgnoreStale]);
+            assert_eq!(p.s.handle(Event::ApplicationCompleted {fence:bad},TURN_ACTIVE_AT),vec![Effect::IgnoreStale]);
         }
-        assert!(p.s.handle(Event::PathFailed {epoch:E,path:Path::Turn},2800).contains(&Effect::Failed));
+        assert!(p.s.handle(Event::PathFailed {epoch:E,path:Path::Turn},AFTER_TURN_ACTIVE).contains(&Effect::Failed));
     }
     #[test]
     fn completion_preserves_duplicate_final_frame_and_ack_fences() {
         let mut p=Pair::turn_active();let f=p.r.fence().unwrap();
-        assert_eq!(p.r.handle(Event::ApplicationCompleted {fence:f},2700),vec![Effect::ApplicationCompleted]);
+        assert_eq!(p.r.handle(Event::ApplicationCompleted {fence:f},TURN_ACTIVE_AT),vec![Effect::ApplicationCompleted]);
         for _ in 0..3 {
-            assert_eq!(p.r.handle(Event::Frame {fence:f},2800),vec![Effect::AcceptFrame(f)]);
-            assert!(p.r.handle(Event::Wire(Envelope {fence:f,message:Wire::Start}),2800).is_empty());
+            assert_eq!(p.r.handle(Event::Frame {fence:f},AFTER_TURN_ACTIVE),vec![Effect::AcceptFrame(f)]);
+            assert!(p.r.handle(Event::Wire(Envelope {fence:f,message:Wire::Start}),AFTER_TURN_ACTIVE).is_empty());
         }
-        assert!(p.r.handle(Event::Frame {fence:Fence {path:Path::Direct,..f}},2800).is_empty());
+        assert!(p.r.handle(Event::Frame {fence:Fence {path:Path::Direct,..f}},AFTER_TURN_ACTIVE).is_empty());
         assert_eq!(p.r.fence(),Some(f));
     }
     #[test] fn direct_needs_peer_selection_not_candidate_open() {
@@ -627,9 +629,9 @@ mod tests {
         p.s.confirm_bytes(old,100);p.s.confirm_bytes(old,20);assert_eq!(p.s.confirmed_bytes(),100);
         p.local(true,Event::Timeout{epoch:E},2600);p.local(false,Event::Timeout{epoch:E},2600);
         let next=Epoch{attempt:2,generation:2};p.local(true,Event::Retry(next),2600);p.local(false,Event::Retry(next),2600);
-        for (_,e) in p.pool.clone() { p.s.handle(Event::Wire(e),2600);p.r.handle(Event::Wire(e),2600); }
+        for (_,e) in p.pool.clone() { p.s.handle(Event::Wire(e),TURN_ACTIVE_AT);p.r.handle(Event::Wire(e),TURN_ACTIVE_AT); }
         for event in [Event::OwnReady{epoch:E,path:Path::Direct,proof:DP},Event::PathFailed{epoch:E,path:Path::Direct},Event::OfferFailed{epoch:E,failure:OfferFailure::CreateOffer},Event::Frame{fence:old},Event::Timeout{epoch:E}] {
-            p.s.handle(event,2600);assert_eq!(p.s.phase(),Phase::Idle);
+            p.s.handle(event,AFTER_TURN_ACTIVE);assert_eq!(p.s.phase(),Phase::Idle);
         }
         assert_eq!(p.s.confirmed_bytes(),100);assert!(!p.s.permits_frame(old));assert!(!p.r.accepts_frame(old));
     }

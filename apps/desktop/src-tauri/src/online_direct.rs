@@ -652,7 +652,7 @@ mod native_tests {
         let send:SignalSender=Arc::new(|_|Box::pin(async {Err("injected publication failure".into())}));
         let (s,_)=DirectAttempt::new(Role::Sender,capability,vec![],send.clone());
         let (r,mut events)=DirectAttempt::new(Role::Receiver,capability,vec![],send);
-        r.expect_offer(Instant::now()-Duration::from_millis(14_950)).await.unwrap();
+        r.expect_offer(Instant::now()-crate::online_setup::SETUP_TIMEOUT+Duration::from_millis(50)).await.unwrap();
         assert!(s.start().await.is_err());assert!(s.is_terminal());
         let event=tokio::time::timeout(Duration::from_secs(1),events.recv()).await.unwrap().unwrap();
         assert!(matches!(event,TransportEvent::Failed(_)));assert!(r.is_terminal());

@@ -124,7 +124,7 @@ jobs:
           Add-Content $env:GITHUB_STEP_SUMMARY '```text'
           $log | Select-Object -Last 120 | Add-Content $env:GITHUB_STEP_SUMMARY
           Add-Content $env:GITHUB_STEP_SUMMARY '```'
-          $log | Select-String 'error:|FAILED|failures:|panicked at|test result:' | ForEach-Object {
+          $log | Select-String -CaseSensitive 'error:|FAILED|failures:|panicked at|test result:' | ForEach-Object {
             $message = $_.Line.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Output "::error title=Native transport test failure::$message"
           }
