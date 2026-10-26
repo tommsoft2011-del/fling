@@ -596,7 +596,7 @@ pub(crate) fn write_image_clipboard_from_path(path: &std::path::Path) -> Result<
         height: img.height() as usize,
         bytes: img.into_raw().into(),
     })
-    .map_err(|_| "写入系统剪贴板失败")
+    .map_err(|_| "写入系统剪贴板失败".to_owned())
 }
 
 #[tauri::command]
