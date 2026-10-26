@@ -25,6 +25,41 @@ pub enum Signal {
 pub enum TransportEvent { Started(Fence), TurnStarted, Frame { fence: Fence, bytes: Vec<u8> }, Failed(String) }
 type SendFuture = Pin<Box<dyn Future<Output=Result<(), String>> + Send>>;
 pub type SignalSender = Arc<dyn Fn(Signal) -> SendFuture + Send + Sync>;
+const READY_PROOF_RECHECK_LIMIT: Duration = Duration::from_millis(1_200);
+const READY_PROOF_RECHECK_INTERVAL: Duration = Duration::from_millis(80);
+
+/// ICE stats can briefly report the selected pair as in-progress while the
+/// PeerConnection and open DataChannel remain connected. Keep the strict
+/// proof requirements, but allow a short bounded window for stats to settle
+/// before failing the commit handshake.
+async fn wait_for_ready_proof<F, Fut>(
+    path: Path,
+    timeout: Duration,
+    mut probe: F,
+) -> Result<(), ()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = crate::online_route_choice::ReadyProof>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(());
+        }
+        match tokio::time::timeout(remaining, probe()).await {
+            Ok(proof) if proof.valid(path) => return Ok(()),
+            Ok(_) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(());
+                }
+                tokio::time::sleep(READY_PROOF_RECHECK_INTERVAL.min(remaining)).await;
+            }
+            Err(_) => return Err(()),
+        }
+    }
+}
 struct Peer {
     link: Arc<OnlineP2p>, dc: Option<DataChannel>, remote_sdp: Option<String>,
     remote_ufrag: Option<String>, local_sdp: String, local_ufrag: String,
@@ -120,8 +155,16 @@ impl EffectExecutor for Executor {
                         | crate::online_route_choice::Wire::Prepared(_) | crate::online_route_choice::Wire::StartAck) {
                         let selected = attempt.peers.lock().await.get(&envelope.fence.path)
                             .and_then(|p|p.dc.clone().map(|dc|(p.link.clone(),dc)));
-                        let Some((link,dc))=selected else {return Err("selected path missing at commit/start".into());};
-                        if !link.ready_proof(&dc).await.valid(envelope.fence.path) {
+                        let Some((link,dc))=selected else {
+                            attempt.diagnostics.scope(envelope.fence.path)
+                                .note(Stage::ReadyProof, Outcome::Failed, Reason::PeerClosed);
+                            return Err("selected path missing at commit/start".into());
+                        };
+                        if wait_for_ready_proof(envelope.fence.path, READY_PROOF_RECHECK_LIMIT, || {
+                            link.ready_proof(&dc)
+                        }).await.is_err() {
+                            attempt.diagnostics.scope(envelope.fence.path)
+                                .note(Stage::ReadyProof, Outcome::Failed, Reason::OperationFailed);
                             return Err("selected path no longer READY at commit/start".into());
                         }
                     }
@@ -438,6 +481,51 @@ impl DirectAttempt {
     pub async fn close(&self) {
         if self.is_completed() {self.close_peers().await;}
         else {self.fail("连接已关闭".into()).await;}
+    }
+}
+
+#[cfg(test)]
+mod ready_proof_retry_tests {
+    use super::*;
+    use crate::online_route_choice::ReadyProof;
+    use std::sync::atomic::AtomicUsize;
+
+    fn proof(succeeded: bool) -> ReadyProof {
+        ReadyProof {
+            dc_open: true,
+            pc_connected: true,
+            selected: true,
+            nominated: true,
+            succeeded,
+            known: true,
+            relay: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_in_progress_stats_are_rechecked_until_the_strict_proof_is_valid() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let result = wait_for_ready_proof(Path::Turn, Duration::from_millis(500), {
+            let attempts = attempts.clone();
+            move || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move { proof(attempt >= 2) }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn invalid_proof_still_fails_after_the_bounded_recheck_window() {
+        let result = wait_for_ready_proof(Path::Turn, Duration::from_millis(100), || async {
+            proof(false)
+        })
+        .await;
+
+        assert!(result.is_err());
     }
 }
 
