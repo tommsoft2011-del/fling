@@ -4,14 +4,19 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-pub const DIRECT_CUTOFF_MS: u64 = 2_500;
+/// Give trickled host/server-reflexive candidate checks enough time to
+/// complete before paying for a TURN allocation. Field logs showed multiple
+/// Direct pairs still in progress at the old 2.5s cutoff.
+pub const DIRECT_CUTOFF_MS: u64 = 5_000;
 /// Bounded grace after the cutoff when our own Direct path is fully proven
 /// (valid ReadyProof recorded) but the peer's pre-decision Ready is still in
 /// flight: the decision waits for the peer Ready instead of escalating to
 /// TURN on a hair-missed cutoff. No grace when our own Direct is unproven,
 /// so a genuinely unreachable peer still escalates at DIRECT_CUTOFF_MS.
 pub const PEER_READY_GRACE_MS: u64 = 2_000;
-pub const SETUP_LIMIT_MS: u64 = 15_000;
+/// Covers the extended Direct window, optional peer-ready grace and TURN
+/// startup when the receiver began waiting before the sender's offer.
+pub const SETUP_LIMIT_MS: u64 = 20_000;
 const HANDSHAKE_LIMIT_MS: u64 = 15_000;
 const RETRANSMIT_MS: u64 = 200;
 const MAX_CANDIDATES: usize = 256;
@@ -395,6 +400,8 @@ impl RouteHandler {
 mod tests {
     use super::*;
     const E: Epoch = Epoch { attempt: 1, generation: 1 };
+    const CUTOFF: u64 = DIRECT_CUTOFF_MS;
+    const GRACE_END: u64 = DIRECT_CUTOFF_MS + PEER_READY_GRACE_MS;
     const DP: ReadyProof = ReadyProof { dc_open: true, pc_connected: true, selected: true, nominated: true, succeeded: true, known: true, relay: false };
     const TP: ReadyProof = ReadyProof { relay: true, ..DP };
     #[derive(Clone, Debug)]
@@ -415,11 +422,16 @@ mod tests {
             self.check();
         }
         fn local(&mut self, sender: bool, event: Event, now: u64) {
+            // Production samples a monotonic attempt clock for every queued
+            // event. Keep later lifecycle tests monotonic when their times
+            // are unrelated to the longer Direct cutoff.
+            let now = if sender { now.max(self.s.last_now) } else { now.max(self.r.last_now) };
             let fx = if sender { self.s.handle(event,now) } else { self.r.handle(event,now) };
             self.effects(sender,fx);
         }
         fn deliver(&mut self, i: usize, now: u64) {
             let (from_s,e) = self.pool[i];
+            let now = if from_s { now.max(self.r.last_now) } else { now.max(self.s.last_now) };
             let fx = if from_s { self.r.handle(Event::Wire(e),now) } else { self.s.handle(Event::Wire(e),now) };
             self.effects(!from_s,fx);
         }
@@ -445,13 +457,13 @@ mod tests {
             }
         }
         fn turn_active() -> Self {
-            let mut p=Self::new();p.local(true,Event::Tick,2500);p.drain(2500);
-            p.ready(Path::Turn,2600);p.drain(2600);
+            let mut p=Self::new();p.local(true,Event::Tick,CUTOFF);p.drain(CUTOFF);
+            p.ready(Path::Turn,CUTOFF+100);p.drain(CUTOFF+100);
             assert_eq!(p.s.phase(),Phase::Active);assert_eq!(p.r.phase(),Phase::Active);assert_eq!(p.permits,1);p
         }
         fn direct_active() -> Self {
-            let mut p=Self::new();p.ready(Path::Direct,2499);p.drain(2499);
-            p.local(true,Event::Tick,2500);p.drain(2500);
+            let mut p=Self::new();p.ready(Path::Direct,CUTOFF-1);p.drain(CUTOFF-1);
+            p.local(true,Event::Tick,CUTOFF);p.drain(CUTOFF);
             assert_eq!(p.s.selected(),Some(Path::Direct));assert_eq!(p.s.phase(),Phase::Active);p
         }
     }
@@ -513,25 +525,26 @@ mod tests {
     }
     #[test] fn direct_needs_peer_selection_not_candidate_open() {
         let mut p=Pair::new();p.ready(Path::Direct,100);assert_eq!(p.permits,0);
-        p.drain(100);assert_eq!(p.permits,0);p.local(true,Event::Tick,2500);
-        assert_eq!(p.permits,0);p.drain(2500);assert_eq!(p.permits,1);
+        p.drain(100);assert_eq!(p.permits,0);p.local(true,Event::Tick,CUTOFF);
+        assert_eq!(p.permits,0);p.drain(CUTOFF);assert_eq!(p.permits,1);
     }
     #[test] fn backup_is_independent_and_candidate_ready_is_not_active() {
         let mut p=Pair::new();p.ready(Path::Turn,100);assert_eq!(p.turns,0);assert!(p.pool.is_empty());
-        p.local(true,Event::Tick,2499);assert_eq!(p.turns,0);
-        p.local(true,Event::Tick,2500);assert_eq!(p.turns,1);p.drain(2500);assert_eq!(p.turns,2);
-        p.ready(Path::Turn,2600);assert_eq!(p.permits,0);p.drain(2600);assert_eq!(p.permits,1);
+        p.local(true,Event::Tick,2_500);assert_eq!(p.turns,0);
+        p.local(true,Event::Tick,CUTOFF-1);assert_eq!(p.turns,0);
+        p.local(true,Event::Tick,CUTOFF);assert_eq!(p.turns,1);p.drain(CUTOFF);assert_eq!(p.turns,2);
+        p.ready(Path::Turn,CUTOFF+100);assert_eq!(p.permits,0);p.drain(CUTOFF+100);assert_eq!(p.permits,1);
     }
     #[test] fn direct_wins_every_backup_boundary_before_selection() {
-        for t in [0,1,2498,2499] { let mut p=Pair::new();p.ready(Path::Direct,t);p.drain(t);
-            p.local(true,Event::Tick,2500);p.drain(2500);assert_eq!(p.s.selected(),Some(Path::Direct));assert_eq!(p.turns,0); }
+        for t in [0,1,CUTOFF-2,CUTOFF-1] { let mut p=Pair::new();p.ready(Path::Direct,t);p.drain(t);
+            p.local(true,Event::Tick,CUTOFF);p.drain(CUTOFF);assert_eq!(p.s.selected(),Some(Path::Direct));assert_eq!(p.turns,0); }
     }
     #[test] fn peer_ready_within_grace_still_wins_direct() {
         // Own READY is local at 100. The peer READY received before, at, or
         // after the cutoff — while the grace window is open — still counts.
-        for t in [2499,2500,2501,4499] {
+        for t in [CUTOFF-1,CUTOFF,CUTOFF+1,GRACE_END-1] {
             let mut p=Pair::new();p.ready(Path::Direct,100);p.drain(t);
-            p.local(true,Event::Tick,t.max(2500));assert_eq!(p.s.selected(),Some(Path::Direct));
+            p.local(true,Event::Tick,t.max(CUTOFF));assert_eq!(p.s.selected(),Some(Path::Direct));
         }
     }
     #[test] fn grace_holds_decision_until_peer_ready_arrives() {
@@ -539,48 +552,48 @@ mod tests {
         // Deliver only the sender's Ready; hold the peer's in the pool.
         let held=p.pool.iter().position(|(from_s,e)| !from_s && matches!(e.message, Wire::Ready(_))).unwrap();
         for i in 0..p.pool.len() { if i!=held { p.deliver(i,100); } }
-        p.local(true,Event::Tick,2500);
+        p.local(true,Event::Tick,CUTOFF);
         assert_eq!(p.s.selected(),None);assert_eq!(p.turns,0);
-        p.local(true,Event::Tick,4499);
+        p.local(true,Event::Tick,GRACE_END-1);
         assert_eq!(p.s.selected(),None);assert_eq!(p.turns,0);
         // Peer Ready lands inside the grace: next tick decides Direct.
-        p.deliver(held,4499);
-        p.local(true,Event::Tick,4499);
+        p.deliver(held,GRACE_END-1);
+        p.local(true,Event::Tick,GRACE_END-1);
         assert_eq!(p.s.selected(),Some(Path::Direct));assert_eq!(p.turns,0);
     }
     #[test] fn grace_expires_to_turn_when_peer_ready_never_arrives() {
         let mut p=Pair::new();p.ready(Path::Direct,100);
         let held=p.pool.iter().position(|(from_s,e)| !from_s && matches!(e.message, Wire::Ready(_))).unwrap();
         for i in 0..p.pool.len() { if i!=held { p.deliver(i,100); } }
-        p.local(true,Event::Tick,2500);assert_eq!(p.s.selected(),None);
-        p.local(true,Event::Tick,4500);
+        p.local(true,Event::Tick,CUTOFF);assert_eq!(p.s.selected(),None);
+        p.local(true,Event::Tick,GRACE_END);
         assert_eq!(p.s.selected(),Some(Path::Turn));assert_eq!(p.turns,1);
     }
     #[test] fn no_grace_without_own_direct_ready() {
         // Nothing proven locally: the decision stays at the plain cutoff.
         let mut p=Pair::new();
-        p.local(true,Event::Tick,2500);
+        p.local(true,Event::Tick,CUTOFF);
         assert_eq!(p.s.selected(),Some(Path::Turn));assert_eq!(p.turns,1);
     }
     #[test] fn acceptance_direct_ready_while_backup_select_is_in_flight() {
-        let mut p=Pair::new();p.local(true,Event::Tick,2500);p.ready(Path::Direct,2501);p.drain(2501);
+        let mut p=Pair::new();p.local(true,Event::Tick,CUTOFF);p.ready(Path::Direct,CUTOFF+1);p.drain(CUTOFF+1);
         assert_eq!(p.s.selected(),Some(Path::Turn));assert_eq!(p.r.selected(),Some(Path::Turn));
-        p.ready(Path::Turn,2600);p.drain(2600);assert_eq!(p.permits,1);
+        p.ready(Path::Turn,CUTOFF+100);p.drain(CUTOFF+100);assert_eq!(p.permits,1);
     }
     #[test] fn acceptance_direct_ready_while_backup_selected_is_in_flight() {
-        let mut p=Pair::new();p.local(true,Event::Tick,2500);p.drain(2500);p.ready(Path::Turn,2600);
+        let mut p=Pair::new();p.local(true,Event::Tick,CUTOFF);p.drain(CUTOFF);p.ready(Path::Turn,CUTOFF+100);
         // Hold every receiver-to-sender acknowledgement while processing outbound preparation.
-        for i in 0..p.pool.len() { if p.pool[i].0 { p.deliver(i,2600); } }
-        p.ready(Path::Direct,2601);assert_eq!(p.permits,0);p.drain(2601);
+        for i in 0..p.pool.len() { if p.pool[i].0 { p.deliver(i,CUTOFF+100); } }
+        p.ready(Path::Direct,CUTOFF+101);assert_eq!(p.permits,0);p.drain(CUTOFF+101);
         assert_eq!(p.s.selected(),Some(Path::Turn));assert_eq!(p.permits,1);
     }
     #[test] fn ambiguous_publish_is_replayed_not_rolled_back() {
-        let mut p=Pair::new();p.local(true,Event::Tick,2500);
-        let decision=p.pool[0];let fx=p.s.handle(Event::Tick,2700);
+        let mut p=Pair::new();p.local(true,Event::Tick,CUTOFF);
+        let decision=p.pool[0];let fx=p.s.handle(Event::Tick,CUTOFF+200);
         assert!(fx.contains(&Effect::Send(decision.1)));p.effects(true,fx);
         assert_eq!(p.s.selected(),Some(Path::Turn));assert_eq!(p.permits,0);
-        p.drain(2700);p.ready(Path::Turn,2800);p.drain(2800);assert_eq!(p.permits,1);
-        let pool=p.pool.clone();for _ in 0..3 { for i in 0..pool.len() { p.deliver(i,2800); } }
+        p.drain(CUTOFF+200);p.ready(Path::Turn,CUTOFF+300);p.drain(CUTOFF+300);assert_eq!(p.permits,1);
+        let pool=p.pool.clone();for _ in 0..3 { for i in 0..pool.len() { p.deliver(i,CUTOFF+300); } }
         assert_eq!(p.permits,1);assert_eq!(p.s.phase(),Phase::Active);assert_eq!(p.r.phase(),Phase::Active);
     }
     #[test] fn all_waiting_states_expire_and_late_messages_cannot_resurrect() {
@@ -592,13 +605,13 @@ mod tests {
                 for (_,e) in &p.pool { h.handle(Event::Wire(*e),15000);assert_eq!(h.phase(),Phase::Failed); }
             }
         }
-        let mut p=Pair::new();p.local(true,Event::Tick,2500);p.local(true,Event::Tick,15000);p.drain(15000);
+        let mut p=Pair::new();p.local(true,Event::Tick,CUTOFF);p.local(true,Event::Tick,CUTOFF+HANDSHAKE_LIMIT_MS);p.drain(CUTOFF+HANDSHAKE_LIMIT_MS);
         assert_eq!(p.s.phase(),Phase::Failed);assert_eq!(p.r.phase(),Phase::Failed);
     }
     #[test] fn ready_proof_requires_every_field_and_turn_relay() {
         for i in 0..7 { let mut proof=DP;match i {0=>proof.dc_open=false,1=>proof.pc_connected=false,2=>proof.selected=false,3=>proof.nominated=false,4=>proof.succeeded=false,5=>proof.known=false,_=>proof.relay=true}
             let mut p=Pair::new();p.local(true,Event::OwnReady{epoch:E,path:Path::Direct,proof},10);p.drain(10);
-            p.local(true,Event::Tick,2500);assert_eq!(p.s.selected(),Some(Path::Turn)); }
+            p.local(true,Event::Tick,CUTOFF);assert_eq!(p.s.selected(),Some(Path::Turn)); }
     }
     #[test] fn offer_errors_and_selected_failure_fail_closed() {
         for failure in [OfferFailure::CreateOffer,OfferFailure::SetLocalDescription,OfferFailure::InitialOfferSend] {
@@ -626,14 +639,14 @@ mod tests {
         assert!(p.s.may_close(Path::Direct));assert!(!p.s.may_close(Path::Turn));
         assert!(p.s.confirm_bytes(selected,5));
         p.local(false,Event::Frame{fence:other},2700);assert_eq!(p.s.confirmed_bytes(),5);
-        let mut pre=Pair::new();pre.local(true,Event::Tick,2500);pre.drain(2500);
+        let mut pre=Pair::new();pre.local(true,Event::Tick,CUTOFF);pre.drain(CUTOFF);
         assert!(!pre.s.may_close(Path::Direct));assert!(!pre.r.may_close(Path::Direct));
     }
     #[test] fn ack_before_activation_and_wrong_epoch_are_ignored() {
-        let mut p=Pair::new();p.local(true,Event::Tick,2500);let f=p.s.fence().unwrap();
-        p.local(true,Event::Wire(Envelope{fence:f,message:Wire::Ack{bytes:100}}),2500);
+        let mut p=Pair::new();p.local(true,Event::Tick,CUTOFF);let f=p.s.fence().unwrap();
+        p.local(true,Event::Wire(Envelope{fence:f,message:Wire::Ack{bytes:100}}),CUTOFF);
         assert_eq!(p.s.confirmed_bytes(),0);assert_eq!(p.permits,0);
-        p.drain(2500);p.ready(Path::Turn,2600);p.drain(2600);
+        p.drain(CUTOFF);p.ready(Path::Turn,CUTOFF+100);p.drain(CUTOFF+100);
         let mut old=f;old.epoch.generation=0;
         p.local(true,Event::Wire(Envelope{fence:old,message:Wire::Ack{bytes:999}}),2600);
         assert_eq!(p.s.confirmed_bytes(),0);
@@ -654,16 +667,16 @@ mod tests {
         let mut p=Pair::new();p.ready(Path::Direct,100); // Drop READY: not observed by arbiter.
         // Own Direct is proven, so the grace holds the decision first; with
         // the peer READY never observed, escalation is still bounded.
-        p.local(true,Event::Tick,2500);assert_eq!(p.s.selected(),None);
-        p.local(true,Event::Tick,4500);assert_eq!(p.s.selected(),Some(Path::Turn));p.drain(4500);
-        p.ready(Path::Turn,4600);p.drain(4600);assert_eq!(p.permits,1);
+        p.local(true,Event::Tick,CUTOFF);assert_eq!(p.s.selected(),None);
+        p.local(true,Event::Tick,GRACE_END);assert_eq!(p.s.selected(),Some(Path::Turn));p.drain(GRACE_END);
+        p.ready(Path::Turn,GRACE_END+100);p.drain(GRACE_END+100);assert_eq!(p.permits,1);
         // A fresh transaction whose decision is lost forever cannot gain permission.
-        let mut q=Pair::new();q.local(true,Event::Tick,2500);
-        for t in (2700..15000).step_by(200) { q.local(true,Event::Tick,t);assert_eq!(q.permits,0); }
-        q.local(true,Event::Tick,15000);assert_eq!(q.s.phase(),Phase::Failed);
+        let mut q=Pair::new();q.local(true,Event::Tick,CUTOFF);
+        for t in ((CUTOFF+200)..(CUTOFF+HANDSHAKE_LIMIT_MS)).step_by(200) { q.local(true,Event::Tick,t);assert_eq!(q.permits,0); }
+        q.local(true,Event::Tick,CUTOFF+HANDSHAKE_LIMIT_MS);assert_eq!(q.s.phase(),Phase::Failed);
     }
     #[test] fn receiver_cannot_choose_route_or_gain_sender_permit() {
-        let mut p=Pair::new();p.local(false,Event::Tick,2500);assert_eq!(p.r.selected(),None);assert_eq!(p.turns,0);
+        let mut p=Pair::new();p.local(false,Event::Tick,CUTOFF);assert_eq!(p.r.selected(),None);assert_eq!(p.turns,0);
         let p=Pair::turn_active();assert!(!p.r.permits_frame(p.r.fence().unwrap()));
     }
     #[test] fn same_epoch_wrong_path_or_old_sequence_abort_cannot_kill_selected_route() {
@@ -678,15 +691,15 @@ mod tests {
     }
     #[test] fn attempt_abort_converges_even_if_turn_decision_was_lost() {
         let mut p=Pair::new();
-        p.local(true,Event::Tick,2500); // Decision deliberately not delivered.
-        p.local(true,Event::Timeout{epoch:E},2600);
+        p.local(true,Event::Tick,CUTOFF); // Decision deliberately not delivered.
+        p.local(true,Event::Timeout{epoch:E},CUTOFF+100);
         let abort=p.pool.iter().position(|(sender,e)| *sender && e.message==Wire::AttemptAbort).unwrap();
-        p.deliver(abort,2600);
+        p.deliver(abort,CUTOFF+100);
         assert_eq!(p.s.phase(),Phase::Failed);
         assert_eq!(p.r.phase(),Phase::Failed);
         assert_eq!(p.permits,0);
         // A delayed decision may not resurrect either side.
-        p.drain(2600);
+        p.drain(CUTOFF+100);
         assert_eq!(p.r.phase(),Phase::Failed);
     }
     #[test] fn attempt_abort_is_canonical_and_old_epoch_cannot_kill_retry() {
@@ -709,20 +722,20 @@ mod tests {
         receiver.handle(Event::SetupExpected{epoch:E},0);
         sender.handle(Event::OfferFailed{epoch:E,failure:OfferFailure::InitialOfferSend},0);
         assert_eq!(sender.phase(),Phase::Failed);
-        receiver.handle(Event::Tick,15_000);
+        receiver.handle(Event::Tick,SETUP_LIMIT_MS);
         assert_eq!(receiver.phase(),Phase::Failed,
             "a peer awaiting the initial offer needs an attempt-level setup watchdog independent of the Direct cutoff clock");
     }
     #[test] fn setup_expectation_is_idempotent_and_late_offer_cannot_resurrect() {
         let mut h=RouteHandler::new(Role::Receiver,E);
         h.handle(Event::SetupExpected{epoch:E},100);
-        h.handle(Event::SetupExpected{epoch:E},14_999);
-        let effects=h.handle(Event::GatheringStarted{epoch:E,now:15_100},15_100);
+        h.handle(Event::SetupExpected{epoch:E},SETUP_LIMIT_MS-1);
+        let effects=h.handle(Event::GatheringStarted{epoch:E,now:SETUP_LIMIT_MS+100},SETUP_LIMIT_MS+100);
         assert_eq!(h.phase(),Phase::Failed);
         assert!(effects.contains(&Effect::CloseAll(E)));
         assert!(effects.contains(&Effect::Failed));
-        for event in [Event::SetupExpected{epoch:E},Event::GatheringStarted{epoch:E,now:15_101},Event::Tick] {
-            h.handle(event,15_101);assert_eq!(h.phase(),Phase::Failed);
+        for event in [Event::SetupExpected{epoch:E},Event::GatheringStarted{epoch:E,now:SETUP_LIMIT_MS+101},Event::Tick] {
+            h.handle(event,SETUP_LIMIT_MS+101);assert_eq!(h.phase(),Phase::Failed);
         }
         assert_eq!(h.selected(),None);
     }
@@ -733,10 +746,10 @@ mod tests {
             assert!(h.handle(Event::Tick,2500).is_empty());
             assert_eq!(h.phase(),Phase::Idle);assert_eq!(h.selected(),None);
             assert_eq!(h.started_at,None);
-            h.handle(Event::GatheringStarted{epoch:E,now:14_999},14_999);
-            h.handle(Event::Tick,15_000);
+            h.handle(Event::GatheringStarted{epoch:E,now:SETUP_LIMIT_MS-1},SETUP_LIMIT_MS-1);
+            h.handle(Event::Tick,SETUP_LIMIT_MS);
             assert_eq!(h.phase(),Phase::Gathering);assert_eq!(h.selected(),None);
-            h.handle(Event::Tick,17_499);
+            h.handle(Event::Tick,SETUP_LIMIT_MS-1+CUTOFF);
             assert_eq!(h.selected(),if role==Role::Sender {Some(Path::Turn)}else{None});
         }
     }
@@ -745,12 +758,12 @@ mod tests {
         h.handle(Event::SetupExpected{epoch:E},0);h.handle(Event::Tick,SETUP_LIMIT_MS);
         assert_eq!(h.phase(),Phase::Failed);
         let next=Epoch{attempt:2,generation:2};
-        h.handle(Event::Retry(next),15_000);
-        h.handle(Event::SetupExpected{epoch:next},15_001);
-        for event in [Event::SetupExpected{epoch:E},Event::Timeout{epoch:E},Event::GatheringStarted{epoch:E,now:15_002}] {
-            h.handle(event,15_002);assert_eq!(h.phase(),Phase::Idle);
+        h.handle(Event::Retry(next),SETUP_LIMIT_MS);
+        h.handle(Event::SetupExpected{epoch:next},SETUP_LIMIT_MS+1);
+        for event in [Event::SetupExpected{epoch:E},Event::Timeout{epoch:E},Event::GatheringStarted{epoch:E,now:SETUP_LIMIT_MS+2}] {
+            h.handle(event,SETUP_LIMIT_MS+2);assert_eq!(h.phase(),Phase::Idle);
         }
-        h.handle(Event::GatheringStarted{epoch:next,now:15_003},15_003);
+        h.handle(Event::GatheringStarted{epoch:next,now:SETUP_LIMIT_MS+3},SETUP_LIMIT_MS+3);
         assert_eq!(h.phase(),Phase::Gathering);
         h.handle(Event::Tick,30_001);assert_eq!(h.phase(),Phase::Gathering);
     }
@@ -758,17 +771,18 @@ mod tests {
         let mut p=Pair::turn_active();
         // Simulate loss of the final confirmation and the absence of all file frames.
         p.r.close_confirmed=false;
-        p.local(false,Event::Tick,18000);assert_eq!(p.r.phase(),Phase::Failed);
-        p.drain(18000);assert_eq!(p.s.phase(),Phase::Failed);
+        let deadline=CUTOFF+100+15_000;
+        p.local(false,Event::Tick,deadline);assert_eq!(p.r.phase(),Phase::Failed);
+        p.drain(deadline);assert_eq!(p.s.phase(),Phase::Failed);
     }
     #[test] fn bounded_exhaustive_handler_safety_under_arbitrary_duplicates_and_reordering() {
         // Replayable pool is not consumed: models arbitrary duplicate delivery and reorder.
         // Explore reachable intermediate states from every prefix of a real dual-peer trace.
         // Depth is finite; this is evidence, not a proof for arbitrary executions.
-        let mut base=Pair::new();base.local(true,Event::Tick,2500);base.drain(2500);
-        base.ready(Path::Turn,2600);
-        let mut direct=Pair::new();direct.ready(Path::Direct,2499);direct.drain(2499);
-        direct.local(true,Event::Tick,2500);
+        let mut base=Pair::new();base.local(true,Event::Tick,CUTOFF);base.drain(CUTOFF);
+        base.ready(Path::Turn,CUTOFF+100);
+        let mut direct=Pair::new();direct.ready(Path::Direct,CUTOFF-1);direct.drain(CUTOFF-1);
+        direct.local(true,Event::Tick,CUTOFF);
         let mut frontier=vec![base,direct];let mut seen=HashSet::new();let mut visited=0usize;
         let mut reached_active=false;
         for _depth in 0..12 {
@@ -777,7 +791,7 @@ mod tests {
                 p.check();visited+=1;
                 reached_active |= p.s.phase()==Phase::Active;
                 for i in 0..p.pool.len() {
-                    let mut q=p.clone();q.deliver(i,2600);
+                    let mut q=p.clone();q.deliver(i,CUTOFF+100);
                     let key=format!("{:?}|{:?}|{:?}|{}",q.s,q.r,q.pool,q.permits);
                     if seen.insert(key) { next.push(q); }
                 }

@@ -2,7 +2,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Covers the longer direct-first probe plus TURN setup when the receiver's
+/// manifest/setup clock starts before the sender begins ICE gathering.
+pub const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const INITIAL_EFFECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A failure bound, never a gathering/route-selection clock. Publication errors

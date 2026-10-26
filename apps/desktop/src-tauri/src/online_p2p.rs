@@ -204,11 +204,17 @@ fn classify_stats(stats: &[RtcStats]) -> crate::online_diagnostics::RouteObserva
                 }
             }
             RtcStats::LocalCandidate(c) => {
+                if c.local_candidate.candidate_type == Some(IceCandidateType::Host) {
+                    aggregate.local_host = true;
+                }
                 if c.local_candidate.candidate_type == Some(IceCandidateType::Srflx) {
                     aggregate.local_srflx = true;
                 }
             }
             RtcStats::RemoteCandidate(c) => {
+                if c.remote_candidate.candidate_type == Some(IceCandidateType::Host) {
+                    aggregate.remote_host = true;
+                }
                 if c.remote_candidate.candidate_type == Some(IceCandidateType::Srflx) {
                     aggregate.remote_srflx = true;
                 }
@@ -882,6 +888,8 @@ mod tests {
         assert_eq!(summary.pairs_failed, 0);
         assert!(summary.local_srflx);
         assert!(!summary.remote_srflx);
+        assert!(!summary.local_host);
+        assert!(summary.remote_host);
         // And with a selected succeeded srflx pair, aggregates ride along.
         let input = stats(
             Some(IceCandidatePairState::Succeeded),

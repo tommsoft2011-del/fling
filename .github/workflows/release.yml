@@ -106,6 +106,16 @@ jobs:
         working-directory: apps/desktop
         run: bun run build
 
+      - name: Test native transport on Windows test branch
+        if: startsWith(github.ref, 'refs/heads/test/windows-desktop-')
+        working-directory: apps/desktop/src-tauri
+        run: cargo test --locked
+
+      - name: Test connection diagnostic privacy schema on Windows test branch
+        if: startsWith(github.ref, 'refs/heads/test/windows-desktop-')
+        working-directory: apps/desktop
+        run: bun test/connection-diagnostics.ts
+
       - name: Test native diagnostic and privacy contracts (isolated diagnostic branch)
         if: startsWith(github.ref, 'refs/heads/test/pairing-confirm-observability-')
         working-directory: apps/desktop/src-tauri

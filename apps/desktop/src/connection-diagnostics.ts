@@ -41,7 +41,7 @@ export function safeConnectionDiagnostic(value: unknown): Record<string, unknown
     if (typeof source.selected !== 'boolean' || !(source.nominated === null || typeof source.nominated === 'boolean')) return null;
     pair.selected = source.selected; pair.nominated = source.nominated;
     // Checklist aggregates emitted by the native summary: pair counts by
-    // state and srflx presence per side. Counts/flags only, never IDs or
+    // state and host/srflx candidate presence per side. Counts/flags only, never IDs or
     // addresses. Same strictness as elapsed_ms/count: a present but
     // malformed value invalidates the whole record.
     for (const key of ['pairs_total', 'pairs_succeeded', 'pairs_in_progress', 'pairs_failed', 'pairs_succeeded_direct', 'pairs_succeeded_relay']) {
@@ -50,7 +50,7 @@ export function safeConnectionDiagnostic(value: unknown): Record<string, unknown
       if (typeof v !== 'number' || !Number.isSafeInteger(v) || v < 0) return null;
       pair[key] = v;
     }
-    for (const key of ['local_srflx', 'remote_srflx']) {
+    for (const key of ['local_host', 'remote_host', 'local_srflx', 'remote_srflx']) {
       const v = source[key];
       if (v === undefined) continue;
       if (typeof v !== 'boolean') return null;

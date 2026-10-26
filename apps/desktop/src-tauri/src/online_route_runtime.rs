@@ -249,18 +249,18 @@ mod tests {
     async fn cutoff_must_include_time_since_actual_set_local_description_not_dispatch() {
         let runtime = sender(EffectFn(|_| Ok(())));
         let actual_origin = Instant::now();
-        tokio::time::sleep(Duration::from_millis(2700)).await;
+        tokio::time::sleep(Duration::from_millis(crate::online_route_choice::DIRECT_CUTOFF_MS + 200)).await;
         runtime.dispatch_gathering_started(E, actual_origin).await.unwrap();
         runtime.dispatch(Event::Tick).await.unwrap();
         let (_, selected, _) = runtime.snapshot().await.unwrap();
         assert_eq!(selected, Some(Path::Turn),
-            "the 2.5 second deadline must not restart when the start event is dequeued");
+            "the Direct cutoff must not restart when the start event is dequeued");
     }
 
     #[tokio::test]
     async fn duplicate_or_stale_start_cannot_reset_original_source_instant() {
         let runtime = sender(EffectFn(|_| Ok(())));
-        let actual_origin = Instant::now() - Duration::from_millis(2700);
+        let actual_origin = Instant::now() - Duration::from_millis(crate::online_route_choice::DIRECT_CUTOFF_MS + 200);
         runtime.dispatch_gathering_started(E, actual_origin).await.unwrap();
         runtime.dispatch_gathering_started(E, Instant::now()).await.unwrap();
         runtime.dispatch_gathering_started(Epoch { generation: 0, ..E }, Instant::now()).await.unwrap();
@@ -271,7 +271,7 @@ mod tests {
     #[tokio::test]
     async fn retry_binds_new_source_clock_without_inheriting_old_elapsed_time() {
         let runtime = sender(EffectFn(|_| Ok(())));
-        runtime.dispatch_gathering_started(E, Instant::now() - Duration::from_millis(2700)).await.unwrap();
+        runtime.dispatch_gathering_started(E, Instant::now() - Duration::from_millis(crate::online_route_choice::DIRECT_CUTOFF_MS + 200)).await.unwrap();
         runtime.dispatch(Event::Tick).await.unwrap();
         runtime.dispatch(Event::Timeout { epoch: E }).await.unwrap();
         let next = Epoch { attempt: 2, generation: 2 };
@@ -297,7 +297,7 @@ mod tests {
         let runtime=RouteRuntime::spawn(RouteHandler::new(Role::Receiver,E),EffectFn(move |e| {
             captured.lock().unwrap().push(e);Ok(())
         }),4);
-        runtime.dispatch_setup_expected(E,Instant::now()-Duration::from_millis(14_950)).await.unwrap();
+        runtime.dispatch_setup_expected(E,Instant::now()-Duration::from_millis(crate::online_route_choice::SETUP_LIMIT_MS-50)).await.unwrap();
         // No manual Tick and no signal is delivered. The local watchdog itself
         // must fence the attempt and author the terminal UI cleanup effect.
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -310,7 +310,7 @@ mod tests {
     #[tokio::test]
     async fn delayed_expectation_and_late_offer_cannot_rebase_expired_setup() {
         let runtime=RouteRuntime::spawn(RouteHandler::new(Role::Receiver,E),EffectFn(|_|Ok(())),4);
-        runtime.dispatch_setup_expected(E,Instant::now()-Duration::from_secs(16)).await.unwrap();
+        runtime.dispatch_setup_expected(E,Instant::now()-Duration::from_millis(crate::online_route_choice::SETUP_LIMIT_MS+1)).await.unwrap();
         assert_eq!(runtime.snapshot().await.unwrap().0,Phase::Failed);
         runtime.dispatch_setup_expected(E,Instant::now()).await.unwrap();
         runtime.dispatch_gathering_started(E,Instant::now()).await.unwrap();
@@ -339,7 +339,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_setup_cannot_extend_missing_offer_deadline() {
         let runtime=RouteRuntime::spawn(RouteHandler::new(Role::Receiver,E),EffectFn(|_|Ok(())),4);
-        runtime.dispatch_setup_expected(E,Instant::now()-Duration::from_millis(14_950)).await.unwrap();
+        runtime.dispatch_setup_expected(E,Instant::now()-Duration::from_millis(crate::online_route_choice::SETUP_LIMIT_MS-50)).await.unwrap();
         runtime.dispatch_setup_expected(E,Instant::now()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert_eq!(runtime.snapshot().await.unwrap().0,Phase::Failed);
@@ -353,7 +353,7 @@ mod tests {
             captured.lock().unwrap().push(effect.clone());
             if matches!(effect, Effect::Send(_)) { Err("ambiguous publication".into()) } else { Ok(()) }
         }));
-        runtime.dispatch_gathering_started(E, Instant::now() - Duration::from_millis(2700)).await.unwrap();
+        runtime.dispatch_gathering_started(E, Instant::now() - Duration::from_millis(crate::online_route_choice::DIRECT_CUTOFF_MS + 200)).await.unwrap();
         assert!(runtime.dispatch(Event::Tick).await.is_err());
         assert_eq!(runtime.snapshot().await.unwrap().0, Phase::Failed);
         runtime.dispatch(Event::Tick).await.unwrap();
@@ -371,7 +371,7 @@ mod tests {
             captured.lock().unwrap().push(effect.clone());
             if matches!(effect, Effect::CreateTurnPeerConnection(_)) { Err("create failed after partial allocation".into()) } else { Ok(()) }
         }));
-        runtime.dispatch_gathering_started(E, Instant::now() - Duration::from_millis(2700)).await.unwrap();
+        runtime.dispatch_gathering_started(E, Instant::now() - Duration::from_millis(crate::online_route_choice::DIRECT_CUTOFF_MS + 200)).await.unwrap();
         assert!(runtime.dispatch(Event::Tick).await.is_err());
         assert_eq!(runtime.snapshot().await.unwrap().0, Phase::Failed);
         let seen = seen.lock().unwrap();

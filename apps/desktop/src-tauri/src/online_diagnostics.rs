@@ -68,6 +68,9 @@ pub struct RouteSummary {
     /// pair ever connected, and when, without exposing pair identities.
     pub pairs_succeeded_direct: u32,
     pub pairs_succeeded_relay: u32,
+    /// Candidate type presence on each side; booleans only, never addresses.
+    pub local_host: bool,
+    pub remote_host: bool,
     pub local_srflx: bool,
     pub remote_srflx: bool,
 }
