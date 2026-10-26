@@ -712,7 +712,13 @@ export class SendTask {
             // It does not expose a mid-flight relay switch, so never pretend a
             // missing TypeScript fallback method replayed the file.
             const manifest = src.sourceId
-              ? await this.room!.sendRegisteredSource(src, onFileProgress)
+              ? await this.room!.sendRegisteredSource({
+                  sourceId: src.sourceId,
+                  name: src.name,
+                  size: src.size,
+                  relPath: src.relPath,
+                  kind: src.kind === 'clipboard-image' ? 'clipboard-image' : 'file',
+                }, onFileProgress)
               : await this.room!.sendFile(file!, onFileProgress, src.kind);
             st.sha256 = manifest.sha256;
             st.mimeType = manifest.mimeType;
