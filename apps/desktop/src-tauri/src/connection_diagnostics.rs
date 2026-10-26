@@ -2,7 +2,7 @@
 use crate::online_route_choice::{Path, Role, Wire};
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     sync::{Arc, Mutex},
     time::Instant,
@@ -31,6 +31,8 @@ pub enum Stage {
     IceAdd,
     IceSend,
     ChannelWait,
+    DirectIceCutoff,
+    DirectChannelWaitTerminal,
     ChannelOpen,
     PairObserve,
     ReadyProof,
@@ -77,6 +79,11 @@ pub enum Reason {
     Duplicate,
     StaleFence,
     PeerClosed,
+    IceStatsUnavailable,
+    NoSucceededPairs,
+    IceChecksInProgress,
+    IceChecksFailed,
+    IcePairSucceeded,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct PhaseEvent {
@@ -97,6 +104,7 @@ pub struct Diagnostics {
     observer: Observer,
     counts: Mutex<HashMap<(Path, Stage, Outcome, Reason), u32>>,
     pairs: Mutex<HashMap<Path, crate::online_diagnostics::RouteSummary>>,
+    checkpoints: Mutex<HashSet<(Path, Stage)>>,
 }
 #[derive(Clone)]
 pub struct Scope {
@@ -115,6 +123,7 @@ impl Diagnostics {
             observer,
             counts: Mutex::new(HashMap::new()),
             pairs: Mutex::new(HashMap::new()),
+            checkpoints: Mutex::new(HashSet::new()),
         })
     }
     pub fn scope(self: &Arc<Self>, path: Path) -> Scope {
@@ -204,6 +213,33 @@ impl Scope {
                 Some(summary),
             );
         }
+    }
+    /// Emit one Direct ICE checklist snapshot at a route decision/terminal.
+    /// Only finite pair counts, candidate-type flags and enums are serialized.
+    pub fn ice_checklist_checkpoint(
+        &self,
+        stage: Stage,
+        summary: Option<crate::online_diagnostics::RouteSummary>,
+    ) {
+        debug_assert_eq!(self.path, Path::Direct);
+        debug_assert!(matches!(stage, Stage::DirectIceCutoff | Stage::DirectChannelWaitTerminal));
+        let reason = match summary.as_ref() {
+            None => Reason::IceStatsUnavailable,
+            Some(summary) if summary.pairs_succeeded > 0 => Reason::IcePairSucceeded,
+            Some(summary) if summary.pairs_in_progress > 0 => Reason::IceChecksInProgress,
+            Some(summary) if summary.pairs_failed > 0 => Reason::IceChecksFailed,
+            Some(_) => Reason::NoSucceededPairs,
+        };
+        if !self
+            .diagnostics
+            .checkpoints
+            .lock()
+            .unwrap()
+            .insert((self.path, stage))
+        {
+            return;
+        }
+        self.diagnostics.emit(self.path, stage, Outcome::Observed, reason, 1, summary);
     }
     pub fn begin(&self, stage: Stage) -> Guard {
         self.note(stage, Outcome::Started, Reason::None);
@@ -364,6 +400,40 @@ mod tests {
             .note(Stage::PeerCreate, Outcome::Started, Reason::None);
         assert_eq!(next_events.lock().unwrap()[0].count, 1);
         assert!(next_events.lock().unwrap()[0].elapsed_ms < 100);
+    }
+    #[test]
+    fn direct_checkpoints_report_finite_ice_categories_and_aggregate_counts_once() {
+        let (d, events) = capture();
+        let scope = d.scope(Path::Direct);
+        let summary = crate::online_diagnostics::RouteSummary {
+            pairs_total: 5,
+            pairs_in_progress: 3,
+            local_host: true,
+            remote_host: true,
+            local_srflx: true,
+            remote_srflx: true,
+            ..Default::default()
+        };
+        scope.ice_checklist_checkpoint(Stage::DirectIceCutoff, Some(summary.clone()));
+        // A duplicate route decision must not emit a second, possibly stale snapshot.
+        scope.ice_checklist_checkpoint(Stage::DirectIceCutoff, None);
+        scope.ice_checklist_checkpoint(Stage::DirectChannelWaitTerminal, None);
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].reason, Reason::IceChecksInProgress);
+        assert_eq!(events[0].count, 1);
+        let pair = events[0].pair.as_ref().unwrap();
+        assert_eq!(pair.pairs_total, 5);
+        assert_eq!(pair.pairs_in_progress, 3);
+        assert!(pair.local_host && pair.remote_host && pair.local_srflx && pair.remote_srflx);
+        assert_eq!(events[1].reason, Reason::IceStatsUnavailable);
+        assert!(events[1].pair.is_none());
+
+        let json = serde_json::to_string(&*events).unwrap();
+        for private in ["candidate:", "192.0.2.1", "sdp", "username", "password", "pair-id"] {
+            assert!(!json.contains(private));
+        }
     }
     #[tokio::test]
     async fn bounded_timeout_is_distinct_from_operation_failure() {

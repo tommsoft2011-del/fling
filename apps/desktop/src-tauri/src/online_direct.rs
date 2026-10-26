@@ -31,7 +31,7 @@ const READY_PROOF_RECHECK_INTERVAL: Duration = Duration::from_millis(80);
 /// ICE stats can briefly report the selected pair as in-progress while the
 /// PeerConnection and open DataChannel remain connected. Keep the strict
 /// proof requirements, but allow a short bounded window for stats to settle
-/// before failing the commit handshake.
+/// before failing the commit handshake or releasing the first data frame.
 async fn wait_for_ready_proof<F, Fut>(
     path: Path,
     timeout: Duration,
@@ -60,6 +60,23 @@ where
         }
     }
 }
+
+async fn gate_first_frame_with_proof<F, Fut, G, GFut>(
+    path: Path,
+    timeout: Duration,
+    probe: F,
+    release: G,
+) -> Result<(), ()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = crate::online_route_choice::ReadyProof>,
+    G: FnOnce() -> GFut,
+    GFut: Future<Output = Result<(), ()>>,
+{
+    wait_for_ready_proof(path, timeout, probe).await?;
+    release().await
+}
+
 struct Peer {
     link: Arc<OnlineP2p>, dc: Option<DataChannel>, remote_sdp: Option<String>,
     remote_ufrag: Option<String>, local_sdp: String, local_ufrag: String,
@@ -187,16 +204,28 @@ impl EffectExecutor for Executor {
                         if let Err(e)=result { task.fail(e).await; }
                     });
                 }
+                Effect::Cutoff(_) => {
+                    attempt.schedule_direct_checklist(Stage::DirectIceCutoff, None);
+                }
                 Effect::FirstFramePermit(fence) => {
                     if attempt.terminal.load(Ordering::Acquire) { return Err("terminal attempt".into()); }
                     let selected=attempt.peers.lock().await.get(&fence.path)
                         .and_then(|p|p.dc.clone().map(|dc|(p.link.clone(),dc)));
                     let Some((link,dc))=selected else {return Err("selected channel missing at START_ACK".into());};
-                    if !link.ready_proof(&dc).await.valid(fence.path) {
+                    let release_attempt = attempt.clone();
+                    if gate_first_frame_with_proof(fence.path, READY_PROOF_RECHECK_LIMIT,
+                        || link.ready_proof(&dc), || async move {
+                            if release_attempt.terminal.load(Ordering::Acquire) { return Err(()); }
+                            release_attempt.diagnostics.scope(fence.path)
+                                .note(Stage::FirstFramePermit,Outcome::Ok,Reason::None);
+                            *release_attempt.permit.lock().await=Some(fence);
+                            release_attempt.changed.notify_waiters();
+                            Ok(())
+                        }).await.is_err() {
+                        attempt.diagnostics.scope(fence.path)
+                            .note(Stage::ReadyProof,Outcome::Failed,Reason::OperationFailed);
                         return Err("selected channel no longer READY at START_ACK".into());
                     }
-                    attempt.diagnostics.scope(fence.path).note(Stage::FirstFramePermit,Outcome::Ok,Reason::None);
-                    *attempt.permit.lock().await=Some(fence); attempt.changed.notify_waiters();
                 }
                 Effect::CloseUnselected(path) => {
                     if let Some(peer)=attempt.peers.lock().await.remove(&path) { peer.link.close(); }
@@ -273,6 +302,11 @@ impl DirectAttempt {
         if self.terminal.load(Ordering::Acquire) || self.is_completed() {return Ok(());}
         let result=match signal {
             Signal::Control(envelope) => {
+                if envelope.message == crate::online_route_choice::Wire::Decision
+                    && self.matches(envelope.fence)
+                {
+                    self.schedule_direct_checklist(Stage::DirectIceCutoff, None);
+                }
                 let scope=self.diagnostics.scope(envelope.fence.path);
                 if let Some(stage)=control_stage(envelope.message) {scope.note(stage,Outcome::Observed,if self.matches(envelope.fence) || (envelope.fence.epoch==self.capability.epoch && envelope.fence.seq==1) {Reason::None}else{Reason::StaleFence});}
                 scope.run(Stage::ControlReceive,async {self.runtime().dispatch(Event::Wire(envelope)).await.map(|_|())}).await
@@ -379,7 +413,13 @@ impl DirectAttempt {
         let weak=Arc::downgrade(self);
         tokio::spawn(async move {
             let dc=match link.wait_open().await {Ok(dc)=>dc,Err(_)=>{
-                if let Some(task)=weak.upgrade() {let _=task.runtime().dispatch(Event::PathFailed {epoch:task.capability.epoch,path}).await;} return;
+                if let Some(task)=weak.upgrade() {
+                    if path==Path::Direct {
+                        task.schedule_direct_checklist(Stage::DirectChannelWaitTerminal,Some(link.clone()));
+                    }
+                    let _=task.runtime().dispatch(Event::PathFailed {epoch:task.capability.epoch,path}).await;
+                }
+                return;
             }};
             let Some(task)=weak.upgrade() else {link.close();return;};
             task.diagnostics.scope(path).note(Stage::ChannelOpen,Outcome::Ok,Reason::None);
@@ -466,6 +506,20 @@ impl DirectAttempt {
         }
         self.terminal_notice.send_replace(true);
     }
+    fn schedule_direct_checklist(self: &Arc<Self>, stage: Stage, link: Option<Arc<OnlineP2p>>) {
+        let attempt=self.clone();
+        tokio::spawn(async move {
+            let link=match link {
+                Some(link)=>Some(link),
+                None=>attempt.peers.lock().await.get(&Path::Direct).map(|peer|peer.link.clone()),
+            };
+            let summary=match link {
+                Some(link)=>link.diagnostic_pair_snapshot().await,
+                None=>None,
+            };
+            attempt.diagnostics.scope(Path::Direct).ice_checklist_checkpoint(stage,summary);
+        });
+    }
     pub async fn fail(&self,error:String) {
         // Serialize against ApplicationCompleted; a late ICE/close callback
         // must not independently turn a completed task into a terminal failure.
@@ -526,6 +580,54 @@ mod ready_proof_retry_tests {
         .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn first_frame_gate_waits_for_transient_in_progress_pair_then_releases_once() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let permit = Arc::new(AtomicBool::new(false));
+        let frames = Arc::new(AtomicUsize::new(0));
+        let result = gate_first_frame_with_proof(Path::Turn, Duration::from_millis(500), {
+            let attempts = attempts.clone();
+            move || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move { proof(attempt >= 2) }
+            }
+        }, {
+            let permit = permit.clone();
+            let frames = frames.clone();
+            move || async move {
+                permit.store(true, Ordering::SeqCst);
+                frames.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }).await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(permit.load(Ordering::SeqCst));
+        assert_eq!(frames.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn exhausted_first_frame_proof_retries_release_no_permit_or_frame() {
+        let permit = Arc::new(AtomicBool::new(false));
+        let frames = Arc::new(AtomicUsize::new(0));
+        let result = gate_first_frame_with_proof(Path::Turn, Duration::from_millis(180), || async {
+            proof(false)
+        }, {
+            let permit = permit.clone();
+            let frames = frames.clone();
+            move || async move {
+                permit.store(true, Ordering::SeqCst);
+                frames.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }).await;
+
+        assert!(result.is_err());
+        assert!(!permit.load(Ordering::SeqCst));
+        assert_eq!(frames.load(Ordering::SeqCst), 0);
     }
 }
 

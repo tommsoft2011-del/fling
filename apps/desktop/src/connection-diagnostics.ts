@@ -3,12 +3,13 @@ const enums: Record<string, readonly string[]> = {
   role: ['sender', 'receiver'], path: ['Direct', 'Turn'],
   stage: ['turn_decision', 'peer_create', 'channel_create', 'offer_setup', 'offer_create', 'offer_set', 'offer_send',
     'answer_setup', 'offer_parse', 'offer_apply', 'answer_create', 'answer_set', 'answer_send', 'answer_parse', 'answer_apply',
-    'description_validate', 'ice_validate', 'ice_add', 'ice_send', 'channel_wait', 'channel_open',
+    'description_validate', 'ice_validate', 'ice_add', 'ice_send', 'channel_wait', 'direct_ice_cutoff', 'direct_channel_wait_terminal', 'channel_open',
     'pair_observe', 'ready_proof', 'ready', 'decision', 'decision_ack', 'request', 'request_ack', 'prepare', 'prepared',
     'commit', 'committed', 'start', 'start_ack', 'start_confirmed', 'abort', 'attempt_abort', 'control_receive', 'first_frame_permit', 'attempt_end'],
   outcome: ['started', 'ok', 'failed', 'rejected', 'observed'],
   reason: ['none', 'operation_failed', 'interrupted', 'timeout', 'bounds', 'generation', 'malformed', 'invalid_syntax',
-    'ufrag_mismatch', 'bucket_limit', 'duplicate', 'stale_fence', 'peer_closed'],
+    'ufrag_mismatch', 'bucket_limit', 'duplicate', 'stale_fence', 'peer_closed',
+    'ice_stats_unavailable', 'no_succeeded_pairs', 'ice_checks_in_progress', 'ice_checks_failed', 'ice_pair_succeeded'],
 };
 const pairEnums: Record<string, readonly string[]> = {
   route: ['direct', 'turn_relay', 'unknown'], pair_state: ['frozen', 'waiting', 'in_progress', 'failed', 'succeeded', 'unknown'],

@@ -665,6 +665,16 @@ impl OnlineP2p {
         }
     }
 
+    /// A privacy-safe checklist snapshot for terminal diagnostics. `None`
+    /// means stats could not be collected; `Some(default)` means collection
+    /// succeeded but the report contained no candidate pairs.
+    pub async fn diagnostic_pair_snapshot(&self) -> Option<crate::online_diagnostics::RouteSummary> {
+        match tokio::time::timeout(Duration::from_secs(2), self.peer.get_stats()).await {
+            Ok(Ok(stats)) => Some(classify_stats(&stats).summary),
+            _ => None,
+        }
+    }
+
     /// Determine the selected ICE route only after the DataChannel is open.
     /// Stats are never logged or exposed, and collection is bounded.
     pub async fn route_state(&self) -> crate::online_diagnostics::RouteObservation {

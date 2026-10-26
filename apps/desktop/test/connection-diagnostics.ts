@@ -21,6 +21,26 @@ assert.equal(safeConnectionDiagnostic({ ...base, pair: { ...pair, pairs_succeede
 assert.equal(safeConnectionDiagnostic({ ...base, pair: { ...pair, pairs_succeeded_relay: 'x' } }), null);
 assert.equal(safeConnectionDiagnostic({ ...base, pair: { ...pair, local_srflx: 'yes' } }), null);
 assert.equal(safeConnectionDiagnostic({ ...base, pair: { ...pair, remote_host: 'yes' } }), null);
+const iceCategories = [
+  ['ice_stats_unavailable', undefined],
+  ['no_succeeded_pairs', { pairs_total: 0, pairs_succeeded: 0, pairs_in_progress: 0, pairs_failed: 0 }],
+  ['ice_checks_in_progress', { pairs_total: 5, pairs_succeeded: 0, pairs_in_progress: 3, pairs_failed: 0 }],
+  ['ice_checks_failed', { pairs_total: 2, pairs_succeeded: 0, pairs_in_progress: 0, pairs_failed: 2 }],
+  ['ice_pair_succeeded', { pairs_total: 2, pairs_succeeded: 1, pairs_in_progress: 0, pairs_failed: 1 }],
+] as const;
+for (const [reason, counts] of iceCategories) {
+  const stage = reason === 'ice_stats_unavailable' ? 'direct_channel_wait_terminal' : 'direct_ice_cutoff';
+  const input = { ...base, stage, reason, ...(counts ? { pair: { ...pair, ...counts, address: secret, id: secret } } : {}) };
+  const safe = safeConnectionDiagnostic(input);
+  assert.ok(safe);
+  assert.equal(safe.stage, stage);
+  assert.equal(safe.failure_category, reason);
+  if (counts) {
+    const safePair = safe.pair as Record<string, unknown>;
+    assert.equal(safePair.pairs_total, counts.pairs_total);
+    assert.equal('address' in safePair || 'id' in safePair, false);
+  }
+}
 const source = readFileSync(new URL('../src/online-rust.ts', import.meta.url), 'utf8');
 assert.ok(source.includes("'connection-diagnostic'"));
 assert.match(source, /safeConnectionDiagnostic\(ev.summary\)/);
