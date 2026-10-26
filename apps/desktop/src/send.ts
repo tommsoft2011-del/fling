@@ -13,6 +13,7 @@ let selectedTarget: SendTarget | null = null;
 let remoteCode: string | null = null; // 已配对的远程设备（一次一个，新的替换旧的）
 const rows = new Map<string, CardHandle>();
 let inited = false;
+const isTauri = typeof window !== 'undefined' && !!(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
 
 export function initSendPage(): void {
   if (inited) return;
@@ -26,8 +27,15 @@ export function initSendPage(): void {
     const cd = e.clipboardData;
     if (!cd) return;
     let handled = false;
+    let sawImage = false;
     for (const item of Array.from(cd.items)) {
       if (item.kind !== 'file') continue;
+      if (isTauri) {
+        // Never materialize clipboard file bytes as a WebView Blob in the native app.
+        handled = true;
+        if (item.type.startsWith('image/')) sawImage = true;
+        continue;
+      }
       const f = item.getAsFile();
       if (!f) continue;
       if (item.type.startsWith('image/') && f.name === 'image.png') {
@@ -39,6 +47,15 @@ export function initSendPage(): void {
       handled = true;
     }
     if (handled) e.preventDefault();
+    if (isTauri && handled) {
+      if (sawImage) {
+        void invoke<NativeSourceMetadata>('online_pick_clipboard_image')
+          .then(addNativeClipItem)
+          .catch((error) => toast(`读取剪贴板图片失败：${String(error)}`, true));
+      } else {
+        toast('请使用文件选择或拖放添加文件，文件数据不会经过界面层');
+      }
+    }
     refreshSendBtn();
   });
 
@@ -258,8 +275,6 @@ function addFolderFileItem(
   return true;
 }
 
-const isTauri = typeof window !== 'undefined' && !!(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
-
 function addClipItem(blob: Blob): void {
   clipItems.push({
     uid: uid('c'),
@@ -268,6 +283,18 @@ function addClipItem(blob: Blob): void {
     size: blob.size,
     blob,
     previewUrl: URL.createObjectURL(blob),
+  });
+  renderChips();
+  refreshSendBtn();
+}
+
+function addNativeClipItem(source: NativeSourceMetadata): void {
+  clipItems.push({
+    uid: uid('c'),
+    kind: 'clipboard-image',
+    name: '剪贴板图片',
+    size: source.size,
+    sourceId: source.sourceId,
   });
   renderChips();
   refreshSendBtn();
@@ -288,6 +315,7 @@ function removeComposeItem(uid_: string): void {
   if (i >= 0) {
     const [c] = clipItems.splice(i, 1);
     if (c.previewUrl) URL.revokeObjectURL(c.previewUrl);
+    if (c.sourceId) releaseSource(c.sourceId);
     renderChips();
     refreshSendBtn();
   }
@@ -302,8 +330,8 @@ function renderChips(): void {
       const img = document.createElement('img');
       img.src = c.previewUrl;
       chip.appendChild(img);
-      chip.appendChild(el('span', 'ctag', '剪贴板'));
     }
+    chip.appendChild(el('span', 'ctag', '剪贴板'));
     const nm = el('span', 'cname', c.name);
     nm.title = c.name;
     chip.append(nm, el('span', 'csize', fmtSize(c.size)));

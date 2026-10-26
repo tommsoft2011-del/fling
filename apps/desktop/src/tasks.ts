@@ -147,7 +147,10 @@ export class SendTask {
   phase: SendPhase = 'preparing';
   nativeStage?: string;
   nativeRoute?: 'direct' | 'relay' | 'unknown';
-  get nativeSingleFile(): boolean { return this.source.length === 1 && !!this.source[0]?.sourceId && !this.source[0]?.relPath; }
+  get nativeSingleFile(): boolean {
+    const source = this.source[0];
+    return this.source.length === 1 && !!source?.sourceId && !source.relPath && source.kind === 'file';
+  }
   items: ItemState[];
   startedAt = Date.now();
   endedAt?: number;

@@ -557,6 +557,18 @@ impl OnlineSession {
             Ok(complete) => complete,
             Err(error) => { self.fail_receive(receiver, &error).await; return Err(error); }
         };
+        if complete && receiver.claim_clipboard_image_delivery() {
+            let path = receiver.target_path().to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                crate::write_image_clipboard_from_path(&path)?;
+                // Clipboard images are applied as images, not left as ordinary
+                // downloaded files. Keep the file if the OS refuses deletion.
+                let _ = std::fs::remove_file(path);
+                Ok::<(), String>(())
+            })
+            .await
+            .map_err(|_| "剪贴板图片处理线程失败")??;
+        }
         let due = should_emit_peer_progress(&self.peer_progress_ui, &id, received_bytes, complete).await;
         if !complete {
             if let Some(native) = &self.native {
@@ -1050,7 +1062,12 @@ impl OnlineSession {
         let session = self.clone();
         let (manifest, file) = tokio::task::spawn_blocking(move || {
             let mut file = lease.file;
-            let mut manifest = crate::online_transfer::build_manifest_handle(&mut file, lease.metadata.name, FileKind::File, &session.cancelled)?;
+            let kind = match lease.metadata.kind.as_deref() {
+                None | Some("file") => FileKind::File,
+                Some("clipboard-image") => FileKind::ClipboardImage,
+                Some(_) => return Err("不支持的原生文件类型".to_string()),
+            };
+            let mut manifest = crate::online_transfer::build_manifest_handle(&mut file, lease.metadata.name, kind, &session.cancelled)?;
             if manifest.size != lease.metadata.size { return Err("文件大小已改变，请重新选择".to_string()); }
             manifest.path = lease.metadata.rel_path;
             Ok::<_, String>((manifest, file))

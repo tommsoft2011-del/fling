@@ -8,13 +8,14 @@ name: release
 
 on:
   push:
+    branches: ['test/windows-desktop-*']
     tags: ['v*']
   workflow_dispatch:
 
 jobs:
   build:
-    # Diagnostic branches build only the desktop Windows EXE, never CLI packages.
-    if: ${{ !startsWith(github.ref, 'refs/heads/test/pairing-confirm-observability-') }}
+    # Test branches build only the desktop Windows app, never CLI packages.
+    if: ${{ !startsWith(github.ref, 'refs/heads/test/pairing-confirm-observability-') && !startsWith(github.ref, 'refs/heads/test/windows-desktop-') }}
     strategy:
       fail-fast: false
       matrix:
@@ -59,7 +60,7 @@ jobs:
   desktop:
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(startsWith(github.ref, 'refs/heads/test/pairing-confirm-observability-') && '{"include":[{"os":"windows-latest"}]}' || '{"include":[{"os":"ubuntu-latest"},{"os":"windows-latest"}]}') }}
+      matrix: ${{ fromJSON((startsWith(github.ref, 'refs/heads/test/pairing-confirm-observability-') || startsWith(github.ref, 'refs/heads/test/windows-desktop-')) && '{"include":[{"os":"windows-latest"}]}' || '{"include":[{"os":"ubuntu-latest"},{"os":"windows-latest"}]}') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -140,6 +141,13 @@ jobs:
           cd apps/desktop/src-tauri/target/release
           sha256sum Fling-portable-x64.exe > Fling-portable-x64.exe.sha256
           printf 'diagnostic-only, not a fix\ncommit=%s\n' "$GITHUB_SHA" > diagnostic-build.txt
+
+      - name: Checksum Windows test EXE
+        if: startsWith(github.ref, 'refs/heads/test/windows-desktop-')
+        shell: bash
+        run: |
+          cd apps/desktop/src-tauri/target/release
+          sha256sum Fling-portable-x64.exe > Fling-portable-x64.exe.sha256
       - name: Upload bundles
         uses: actions/upload-artifact@v4
         with:

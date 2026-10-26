@@ -1,4 +1,4 @@
-export interface NativeSourceMetadata { sourceId: string; name: string; size: number; relPath?: string; folder?: string }
+export interface NativeSourceMetadata { sourceId: string; name: string; size: number; kind?: 'clipboard-image'; relPath?: string; folder?: string }
 /** UI-only selection guard. Selection, authorization and handle ownership stay in Rust. */
 export class NativeSourcePicker {
   private busy = false;

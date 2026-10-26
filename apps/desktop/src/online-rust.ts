@@ -288,7 +288,7 @@ export class RustFlingRoom {
 
   /** Batch ordinary-file source: only capability + session IDs cross IPC. */
   async sendRegisteredSource(
-    source: { sourceId?: string; name: string; size: number; relPath?: string },
+    source: { sourceId?: string; name: string; size: number; relPath?: string; kind?: FileKind },
     onProgress?: (sent: number, total: number, receiverSaved?: boolean) => void,
   ): Promise<FileManifest> {
     if (!source.sourceId) throw new Error('Missing sourceId');
@@ -298,7 +298,7 @@ export class RustFlingRoom {
       id = await invoke<string>('online_send_registered_source', { sessionId: this.requireSession(), sourceId: source.sourceId });
     } finally { this.activeSendProgress = null; }
     return { id, name: source.name, size: source.size, sha256: '', chunkSize: 32 * 1024,
-      totalChunks: Math.ceil(source.size / (32 * 1024)), kind: 'file', path: source.relPath };
+      totalChunks: Math.ceil(source.size / (32 * 1024)), kind: source.kind ?? 'file', path: source.relPath };
   }
   async cancelNative(): Promise<void> {
     await invoke('online_cancel_native', { sessionId: this.requireSession() });

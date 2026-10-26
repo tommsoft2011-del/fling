@@ -497,6 +497,108 @@ async fn online_pick_source(app: tauri::AppHandle, window: tauri::WebviewWindow)
     }).await.map_err(|e| format!("picker worker: {e}"))?
 }
 
+/// Read and encode a clipboard bitmap entirely in Rust. The WebView receives
+/// only the registered source capability and its display metadata.
+fn clipboard_image_to_temp_png(image: arboard::ImageData<'_>) -> Result<std::path::PathBuf, String> {
+    use image::ImageEncoder;
+    let width = u32::try_from(image.width).map_err(|_| "剪贴板图片宽度无效")?;
+    let height = u32::try_from(image.height).map_err(|_| "剪贴板图片高度无效")?;
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .filter(|pixels| *pixels > 0 && *pixels <= 100_000_000)
+        .ok_or("剪贴板图片尺寸超出支持范围")?;
+    let expected_bytes = usize::try_from(pixels.checked_mul(4).ok_or("剪贴板图片尺寸无效")?)
+        .map_err(|_| "剪贴板图片尺寸超出支持范围")?;
+    let rgba = image::RgbaImage::from_raw(width, height, image.bytes.into_owned())
+        .filter(|rgba| rgba.as_raw().len() == expected_bytes)
+        .ok_or("剪贴板图片数据不完整")?;
+
+    let dir = std::env::temp_dir().join("fling-clipboard");
+    std::fs::create_dir_all(&dir).map_err(|_| "创建剪贴板临时目录失败")?;
+    for _ in 0..8 {
+        let path = dir.join(format!("{:032x}.png", rand::random::<u128>()));
+        let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err("创建剪贴板图片临时文件失败".into()),
+        };
+        let encoded = image::codecs::png::PngEncoder::new_with_quality(
+            &mut file,
+            image::codecs::png::CompressionType::Fast,
+            image::codecs::png::FilterType::NoFilter,
+        )
+        .write_image(rgba.as_raw(), width, height, image::ExtendedColorType::Rgba8);
+        if encoded.is_err() || file.flush().is_err() {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err("编码剪贴板图片失败".into());
+        }
+        return Ok(path);
+    }
+    Err("创建剪贴板图片临时文件失败".into())
+}
+
+#[tauri::command]
+async fn online_pick_clipboard_image(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<online_source::SourceMetadata, String> {
+    let owner = window.label().to_owned();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut clipboard = arboard::Clipboard::new().map_err(|_| "无法打开系统剪贴板")?;
+        let image = clipboard
+            .get_image()
+            .map_err(|_| "剪贴板中没有可用图片，请复制图片后重试")?;
+        let path = clipboard_image_to_temp_png(image)?;
+        let result = app
+            .state::<online_source::OnlineSources>()
+            .register_temporary(&owner, &path, "剪贴板图片.png", "clipboard-image");
+        if result.is_err() {
+            let _ = std::fs::remove_file(path);
+        }
+        result
+    })
+    .await
+    .map_err(|_| "剪贴板图片准备线程失败")?
+}
+
+/// Put a verified, Rust-received PNG on the native clipboard without exposing
+/// its bytes to the WebView.
+pub(crate) fn write_image_clipboard_from_path(path: &std::path::Path) -> Result<(), String> {
+    let file_size = std::fs::metadata(path)
+        .map_err(|_| "读取接收的剪贴板图片失败")?
+        .len();
+    if file_size > 512 * 1024 * 1024 {
+        return Err("接收的剪贴板图片文件过大".into());
+    }
+    let mut reader = image::ImageReader::open(path)
+        .map_err(|_| "读取接收的剪贴板图片失败")?;
+    reader.set_format(image::ImageFormat::Png);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(32_768);
+    limits.max_image_height = Some(32_768);
+    limits.max_alloc = Some(512 * 1024 * 1024);
+    reader.limits(limits);
+    let img = reader
+        .decode()
+        .map_err(|_| "接收的剪贴板图片格式无效或尺寸超出支持范围")?
+        .to_rgba8();
+    let pixels = u64::from(img.width())
+        .checked_mul(u64::from(img.height()))
+        .filter(|pixels| *pixels > 0 && *pixels <= 100_000_000)
+        .ok_or("接收的剪贴板图片尺寸超出支持范围")?;
+    if pixels.checked_mul(4).map(|n| n as usize) != Some(img.as_raw().len()) {
+        return Err("接收的剪贴板图片数据不完整".into());
+    }
+    let mut clip = arboard::Clipboard::new().map_err(|_| "无法打开系统剪贴板")?;
+    clip.set_image(arboard::ImageData {
+        width: img.width() as usize,
+        height: img.height() as usize,
+        bytes: img.into_raw().into(),
+    })
+    .map_err(|_| "写入系统剪贴板失败")
+}
+
 #[tauri::command]
 async fn online_pick_sources(app: tauri::AppHandle, window: tauri::WebviewWindow, folders: bool) -> Result<Vec<online_source::SourceMetadata>, String> {
     let owner = window.label().to_string();
@@ -2410,6 +2512,7 @@ fn main() {
             online_connect,
             online_pick_source,
             online_pick_sources,
+            online_pick_clipboard_image,
             online_send_registered_source,
             ui_events::ui_listen,
             ui_events::ui_unlisten,

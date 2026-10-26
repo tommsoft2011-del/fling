@@ -17,6 +17,8 @@ pub struct SourceMetadata {
     pub name: String,
     pub size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rel_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub folder: Option<String>,
@@ -27,6 +29,15 @@ struct Source {
     metadata: SourceMetadata,
     expires: Instant,
     busy: bool,
+    // Keep generated clipboard images in Rust-owned temp storage until every
+    // active lease has closed its cloned file handle.
+    cleanup: Option<Arc<TempSourceCleanup>>,
+}
+struct TempSourceCleanup(PathBuf);
+impl Drop for TempSourceCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 #[derive(Default)]
 pub struct OnlineSources {
@@ -35,6 +46,8 @@ pub struct OnlineSources {
 pub struct SourceLease {
     pub file: File,
     pub metadata: SourceMetadata,
+    // Declared after `file` so the file handle closes before the temp path is removed.
+    _cleanup: Option<Arc<TempSourceCleanup>>,
 }
 pub struct BusyGuard {
     sources: Arc<Mutex<HashMap<String, Source>>>,
@@ -143,6 +156,7 @@ fn open_source(
             source_id: format!("{:032x}", rand::random::<u128>()),
             name: display_name(path)?,
             size: stat.len(),
+            kind: None,
             rel_path,
             folder,
         },
@@ -200,6 +214,25 @@ impl OnlineSources {
         let pending = vec![open_source(path, None, None)?];
         Ok(self.commit(owner, pending)?.remove(0))
     }
+    /// Register a Rust-generated temporary file such as a PNG read directly
+    /// from the OS clipboard. Its bytes and path never cross the WebView.
+    pub fn register_temporary(
+        &self,
+        owner: &str,
+        path: &Path,
+        display_name: &str,
+        kind: &str,
+    ) -> Result<SourceMetadata, String> {
+        if !safe_component(display_name) || kind != "clipboard-image" {
+            return Err("文件名不支持安全传输".into());
+        }
+        let (file, mut metadata) = open_source(path, None, None)?;
+        metadata.name = display_name.to_owned();
+        metadata.kind = Some(kind.to_owned());
+        let cleanup = Arc::new(TempSourceCleanup(path.to_path_buf()));
+        let mut registered = self.commit_with_cleanup(owner, vec![(file, metadata, Some(cleanup))])?;
+        Ok(registered.remove(0))
+    }
     /// All-or-nothing transaction, including cancellation (None) and enumeration errors.
     pub fn register_selection(
         &self,
@@ -235,6 +268,19 @@ impl OnlineSources {
         owner: &str,
         pending: Vec<(File, SourceMetadata)>,
     ) -> Result<Vec<SourceMetadata>, String> {
+        self.commit_with_cleanup(
+            owner,
+            pending
+                .into_iter()
+                .map(|(file, metadata)| (file, metadata, None))
+                .collect(),
+        )
+    }
+    fn commit_with_cleanup(
+        &self,
+        owner: &str,
+        pending: Vec<(File, SourceMetadata, Option<Arc<TempSourceCleanup>>)>,
+    ) -> Result<Vec<SourceMetadata>, String> {
         let mut sources = self
             .sources
             .lock()
@@ -244,7 +290,7 @@ impl OnlineSources {
             return Err("已选择文件达到 1024 个上限，请移除后重试".into());
         }
         let mut result = Vec::with_capacity(pending.len());
-        for (file, mut metadata) in pending {
+        for (file, mut metadata, cleanup) in pending {
             while sources.contains_key(&metadata.source_id) {
                 metadata.source_id = format!("{:032x}", rand::random::<u128>());
             }
@@ -256,6 +302,7 @@ impl OnlineSources {
                     metadata: metadata.clone(),
                     expires: Instant::now() + SOURCE_TTL,
                     busy: false,
+                    cleanup,
                 },
             );
             result.push(metadata);
@@ -283,6 +330,7 @@ impl OnlineSources {
         Ok(SourceLease {
             file,
             metadata: source.metadata.clone(),
+            _cleanup: source.cleanup.clone(),
         })
     }
     pub fn busy_guard(&self, owner: &str, id: &str) -> BusyGuard {

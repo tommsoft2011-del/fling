@@ -380,6 +380,7 @@ pub struct OnlineReceiver {
     gate: Mutex<()>,
     cancelled: AtomicBool,
     committed: AtomicBool,
+    clipboard_image_claimed: AtomicBool,
 }
 
 /// Relative folder layout is display metadata, never a sender filesystem path.
@@ -442,6 +443,7 @@ impl OnlineReceiver {
             gate: Mutex::new(()),
             cancelled: AtomicBool::new(false),
             committed: AtomicBool::new(false),
+            clipboard_image_claimed: AtomicBool::new(false),
         })
     }
 
@@ -600,6 +602,12 @@ impl OnlineReceiver {
 
     pub fn target_path(&self) -> &Path { &self.target_path }
     pub fn is_committed(&self) -> bool { self.committed.load(Ordering::Acquire) }
+    /// A verified clipboard image is applied to the OS clipboard once before
+    /// the durable completion ACK is sent.
+    pub fn claim_clipboard_image_delivery(&self) -> bool {
+        self.manifest.kind == FileKind::ClipboardImage
+            && !self.clipboard_image_claimed.swap(true, Ordering::AcqRel)
+    }
 
     pub async fn abort(&self) {
         let _gate = self.gate.lock().await;
