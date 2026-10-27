@@ -49,6 +49,15 @@ pub struct SourceLease {
     // Declared after `file` so the file handle closes before the temp path is removed.
     _cleanup: Option<Arc<TempSourceCleanup>>,
 }
+impl SourceLease {
+    // Only the Linux debug-only internal acceptance probe builds a lease
+    // directly from an already-opened real file (no temp cleanup). Other
+    // callers must go through OnlineSources::acquire, which owns cleanup.
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    pub(crate) fn from_owned_file(file: File, metadata: SourceMetadata) -> Self {
+        Self { file, metadata, _cleanup: None }
+    }
+}
 pub struct BusyGuard {
     sources: Arc<Mutex<HashMap<String, Source>>>,
     owner: String,

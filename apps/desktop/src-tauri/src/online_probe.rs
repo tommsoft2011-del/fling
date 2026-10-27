@@ -72,7 +72,7 @@ async fn worker(app:tauri::AppHandle,spec:Spec)->Result<String,String> {
     if spec.role=="sending" {
         let source=spec.source.ok_or("sender missing source")?;
         let file=std::fs::File::open(source).map_err(|e|e.to_string())?;
-        let lease=SourceLease{file,metadata:SourceMetadata{source_id:"internal-probe".into(),name:spec.name,size:spec.size,rel_path:None,folder:None}};
+        let lease=SourceLease::from_owned_file(file,SourceMetadata{source_id:"internal-probe".into(),name:spec.name,size:spec.size,kind:None,rel_path:None,folder:None});
         let status=session.send_source(lease).await?;
         let stage=status.stage.clone();session.disconnect().await?;
         if stage=="done" {Ok(stage)}else{Err(format!("sender {stage}: {}",status.error.unwrap_or_default()))}
