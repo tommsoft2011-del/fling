@@ -223,6 +223,22 @@ impl Scope {
     }
     pub fn checklist(&self, stage: Stage, checklist: Checklist) {
         debug_assert_eq!(self.path, Path::Direct);
+        // A route decision is retransmitted until it is acknowledged, so the
+        // receiver used to emit one DirectIceCutoff snapshot per Decision
+        // (17 in the 2026-10-27 field log, against 1 on the sender) for a
+        // single unchanged checklist. Emit the cutoff snapshot once per
+        // attempt, sharing the checkpoint set with ice_checklist_checkpoint,
+        // while DirectSample and DirectPreClose keep their own cadence.
+        if stage == Stage::DirectIceCutoff
+            && !self
+                .diagnostics
+                .checkpoints
+                .lock()
+                .unwrap()
+                .insert((self.path, stage))
+        {
+            return;
+        }
         (self.diagnostics.observer)(PhaseEvent {
             attempt_no: self.diagnostics.attempt_no, checklist: Some(checklist),
             role:self.diagnostics.role, path:self.path, stage, outcome:Outcome::Observed,
@@ -499,6 +515,34 @@ mod tests {
         for private in ["candidate:", "192.0.2.1", "sdp", "username", "password", "pair-id"] {
             assert!(!json.contains(private));
         }
+    }
+    #[test]
+    fn checklist_cutoff_emits_once_per_attempt_despite_retransmitted_decisions() {
+        let (d, events) = capture();
+        let scope = d.scope(Path::Direct);
+        let checklist = Checklist {
+            status: ChecklistStatus::StillInProgress,
+            pc: LinkState::Connecting,
+            ice: LinkState::Checking,
+            dc: LinkState::Connecting,
+            pair: None,
+        };
+        // Mirrors the 2026-10-27 field log: the receiver emitted 17
+        // direct_ice_cutoff snapshots for one unchanged checklist because
+        // each retransmitted Decision scheduled a fresh snapshot.
+        for _ in 0..17 {
+            scope.checklist(Stage::DirectIceCutoff, checklist.clone());
+        }
+        scope.checklist(Stage::DirectSample, checklist.clone());
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events.iter().filter(|e| e.stage == Stage::DirectIceCutoff).count(),
+            1
+        );
+        assert_eq!(
+            events.iter().filter(|e| e.stage == Stage::DirectSample).count(),
+            1
+        );
     }
     #[tokio::test]
     async fn bounded_timeout_is_distinct_from_operation_failure() {

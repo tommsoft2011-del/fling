@@ -140,6 +140,50 @@ pub fn has_relay_candidate(sdp: &str) -> bool {
 }
 
 // Select only the pair referenced by a transport, never any candidate merely present.
+///
+/// Pair-matrix helpers: counts only, never candidate IDs, addresses or ports.
+/// A pair whose candidate type is missing on either side, or whose combination
+/// is not one of the four host/srflx combinations, lands in `Other`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PairCombo { HostHost, HostSrflx, SrflxHost, SrflxSrflx, Other }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatrixState { InProgress, Failed, Succeeded, Pending }
+fn pair_combo(local: Option<IceCandidateType>, remote: Option<IceCandidateType>) -> PairCombo {
+    use IceCandidateType::{Host, Srflx};
+    match (local, remote) {
+        (Some(Host), Some(Host)) => PairCombo::HostHost,
+        (Some(Host), Some(Srflx)) => PairCombo::HostSrflx,
+        (Some(Srflx), Some(Host)) => PairCombo::SrflxHost,
+        (Some(Srflx), Some(Srflx)) => PairCombo::SrflxSrflx,
+        _ => PairCombo::Other,
+    }
+}
+fn matrix_slot(summary: &mut crate::online_diagnostics::RouteSummary, state: MatrixState, combo: PairCombo) -> &mut u32 {
+    use MatrixState::{Failed, InProgress, Pending, Succeeded};
+    use PairCombo::{HostHost, HostSrflx, Other, SrflxHost, SrflxSrflx};
+    match (state, combo) {
+        (InProgress, HostHost) => &mut summary.pairs_in_progress_host_host,
+        (InProgress, HostSrflx) => &mut summary.pairs_in_progress_host_srflx,
+        (InProgress, SrflxHost) => &mut summary.pairs_in_progress_srflx_host,
+        (InProgress, SrflxSrflx) => &mut summary.pairs_in_progress_srflx_srflx,
+        (InProgress, Other) => &mut summary.pairs_in_progress_other,
+        (Failed, HostHost) => &mut summary.pairs_failed_host_host,
+        (Failed, HostSrflx) => &mut summary.pairs_failed_host_srflx,
+        (Failed, SrflxHost) => &mut summary.pairs_failed_srflx_host,
+        (Failed, SrflxSrflx) => &mut summary.pairs_failed_srflx_srflx,
+        (Failed, Other) => &mut summary.pairs_failed_other,
+        (Succeeded, HostHost) => &mut summary.pairs_succeeded_host_host,
+        (Succeeded, HostSrflx) => &mut summary.pairs_succeeded_host_srflx,
+        (Succeeded, SrflxHost) => &mut summary.pairs_succeeded_srflx_host,
+        (Succeeded, SrflxSrflx) => &mut summary.pairs_succeeded_srflx_srflx,
+        (Succeeded, Other) => &mut summary.pairs_succeeded_other,
+        (Pending, HostHost) => &mut summary.pairs_pending_host_host,
+        (Pending, HostSrflx) => &mut summary.pairs_pending_host_srflx,
+        (Pending, SrflxHost) => &mut summary.pairs_pending_srflx_host,
+        (Pending, SrflxSrflx) => &mut summary.pairs_pending_srflx_srflx,
+        (Pending, Other) => &mut summary.pairs_pending_other,
+    }
+}
 fn classify_stats(stats: &[RtcStats]) -> crate::online_diagnostics::RouteObservation {
     use crate::online_diagnostics::{Candidate, PairState, Protocol, Route, RouteObservation};
     fn candidate(t: Option<IceCandidateType>) -> Candidate {
@@ -174,20 +218,21 @@ fn classify_stats(stats: &[RtcStats]) -> crate::online_diagnostics::RouteObserva
         match stat {
             RtcStats::CandidatePair(p) => {
                 aggregate.pairs_total += 1;
+                let local_type = local_types
+                    .get(p.candidate_pair.local_candidate_id.as_str())
+                    .copied()
+                    .flatten();
+                let remote_type = remote_types
+                    .get(p.candidate_pair.remote_candidate_id.as_str())
+                    .copied()
+                    .flatten();
+                let combo = pair_combo(local_type, remote_type);
                 match p.candidate_pair.state {
                     Some(IceCandidatePairState::Succeeded) => {
                         aggregate.pairs_succeeded += 1;
                         // Split succeeded pairs by relay involvement so the
                         // diagnostic stream can prove whether a non-relay
                         // pair ever connected, not just the selected one.
-                        let local_type = local_types
-                            .get(p.candidate_pair.local_candidate_id.as_str())
-                            .copied()
-                            .flatten();
-                        let remote_type = remote_types
-                            .get(p.candidate_pair.remote_candidate_id.as_str())
-                            .copied()
-                            .flatten();
                         if let (Some(local_type), Some(remote_type)) = (local_type, remote_type) {
                             if local_type == IceCandidateType::Relay
                                 || remote_type == IceCandidateType::Relay
@@ -197,26 +242,57 @@ fn classify_stats(stats: &[RtcStats]) -> crate::online_diagnostics::RouteObserva
                                 aggregate.pairs_succeeded_direct += 1;
                             }
                         }
+                        *matrix_slot(&mut aggregate, MatrixState::Succeeded, combo) += 1;
                     }
-                    Some(IceCandidatePairState::InProgress) => aggregate.pairs_in_progress += 1,
-                    Some(IceCandidatePairState::Failed) => aggregate.pairs_failed += 1,
-                    _ => {}
+                    Some(IceCandidatePairState::InProgress) => {
+                        aggregate.pairs_in_progress += 1;
+                        *matrix_slot(&mut aggregate, MatrixState::InProgress, combo) += 1;
+                    }
+                    Some(IceCandidatePairState::Failed) => {
+                        aggregate.pairs_failed += 1;
+                        *matrix_slot(&mut aggregate, MatrixState::Failed, combo) += 1;
+                    }
+                    Some(IceCandidatePairState::Frozen) => {
+                        aggregate.pairs_frozen += 1;
+                        *matrix_slot(&mut aggregate, MatrixState::Pending, combo) += 1;
+                    }
+                    Some(IceCandidatePairState::Waiting) => {
+                        aggregate.pairs_waiting += 1;
+                        *matrix_slot(&mut aggregate, MatrixState::Pending, combo) += 1;
+                    }
+                    None => {
+                        aggregate.pairs_state_unknown += 1;
+                    }
                 }
             }
             RtcStats::LocalCandidate(c) => {
-                if c.local_candidate.candidate_type == Some(IceCandidateType::Host) {
-                    aggregate.local_host = true;
-                }
-                if c.local_candidate.candidate_type == Some(IceCandidateType::Srflx) {
-                    aggregate.local_srflx = true;
+                match c.local_candidate.candidate_type {
+                    Some(IceCandidateType::Host) => {
+                        aggregate.local_host = true;
+                        aggregate.local_candidates_host += 1;
+                    }
+                    Some(IceCandidateType::Srflx) => {
+                        aggregate.local_srflx = true;
+                        aggregate.local_candidates_srflx += 1;
+                    }
+                    Some(IceCandidateType::Prflx) => aggregate.local_candidates_prflx += 1,
+                    Some(IceCandidateType::Relay) => aggregate.local_candidates_relay += 1,
+                    None => {}
                 }
             }
             RtcStats::RemoteCandidate(c) => {
-                if c.remote_candidate.candidate_type == Some(IceCandidateType::Host) {
-                    aggregate.remote_host = true;
-                }
-                if c.remote_candidate.candidate_type == Some(IceCandidateType::Srflx) {
-                    aggregate.remote_srflx = true;
+                match c.remote_candidate.candidate_type {
+                    Some(IceCandidateType::Host) => {
+                        aggregate.remote_host = true;
+                        aggregate.remote_candidates_host += 1;
+                    }
+                    Some(IceCandidateType::Srflx) => {
+                        aggregate.remote_srflx = true;
+                        aggregate.remote_candidates_srflx += 1;
+                    }
+                    Some(IceCandidateType::Prflx) => aggregate.remote_candidates_prflx += 1,
+                    Some(IceCandidateType::Relay) => aggregate.remote_candidates_relay += 1,
+                    None => {}
                 }
             }
             _ => {}
@@ -978,6 +1054,58 @@ mod tests {
         assert_eq!(summary.pairs_succeeded, 1);
         assert_eq!(summary.pairs_succeeded_direct, 0);
         assert_eq!(summary.pairs_succeeded_relay, 1);
+    }
+
+    #[test]
+    fn classify_stats_reports_pair_matrix_and_candidate_counts() {
+        // The 2026-10-27 field log froze at total=5 with in_progress=4/3
+        // and no type breakdown for the unselected pairs, so the next
+        // diagnosis could not say which combination was stuck. These
+        // aggregates must answer that from a single snapshot, counts only.
+        let input = stats(
+            Some(IceCandidatePairState::InProgress),
+            Some(IceCandidateType::Srflx),
+            Some(IceCandidateType::Host),
+            false,
+        );
+        let summary = classify_stats(&input).summary;
+        assert_eq!(summary.pairs_in_progress_srflx_host, 1);
+        assert_eq!(summary.pairs_in_progress_host_host, 0);
+        assert_eq!(summary.pairs_in_progress_other, 0);
+        assert_eq!(summary.local_candidates_srflx, 1);
+        assert_eq!(summary.remote_candidates_host, 1);
+        assert_eq!(summary.local_candidates_host, 0);
+
+        let input = stats(
+            Some(IceCandidatePairState::Frozen),
+            Some(IceCandidateType::Host),
+            Some(IceCandidateType::Srflx),
+            false,
+        );
+        let summary = classify_stats(&input).summary;
+        assert_eq!(summary.pairs_frozen, 1);
+        assert_eq!(summary.pairs_pending_host_srflx, 1);
+        assert_eq!(summary.pairs_in_progress, 0);
+
+        let input = stats(None, Some(IceCandidateType::Host), Some(IceCandidateType::Host), false);
+        let summary = classify_stats(&input).summary;
+        assert_eq!(summary.pairs_total, 1);
+        assert_eq!(summary.pairs_state_unknown, 1);
+        assert_eq!(summary.pairs_in_progress_host_host, 0);
+
+        let input = stats(
+            Some(IceCandidatePairState::Succeeded),
+            Some(IceCandidateType::Srflx),
+            Some(IceCandidateType::Srflx),
+            false,
+        );
+        let summary = classify_stats(&input).summary;
+        assert_eq!(summary.pairs_succeeded_srflx_srflx, 1);
+        assert_eq!(summary.pairs_succeeded_direct, 1);
+        let json = serde_json::to_string(&summary).unwrap();
+        for forbidden in ["192.0.2.", "address", "port\"", "candidate:"] {
+            assert!(!json.contains(forbidden));
+        }
     }
 
     #[test]

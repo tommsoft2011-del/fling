@@ -45,7 +45,14 @@ export function safeConnectionDiagnostic(value: unknown): Record<string, unknown
     // state and host/srflx candidate presence per side. Counts/flags only, never IDs or
     // addresses. Same strictness as elapsed_ms/count: a present but
     // malformed value invalidates the whole record.
-    for (const key of ['pairs_total', 'pairs_succeeded', 'pairs_in_progress', 'pairs_failed', 'pairs_succeeded_direct', 'pairs_succeeded_relay']) {
+    for (const key of ['pairs_total', 'pairs_succeeded', 'pairs_in_progress', 'pairs_failed', 'pairs_succeeded_direct', 'pairs_succeeded_relay',
+      'pairs_frozen', 'pairs_waiting', 'pairs_state_unknown',
+      'local_candidates_host', 'local_candidates_srflx', 'local_candidates_prflx', 'local_candidates_relay',
+      'remote_candidates_host', 'remote_candidates_srflx', 'remote_candidates_prflx', 'remote_candidates_relay',
+      'pairs_in_progress_host_host', 'pairs_in_progress_host_srflx', 'pairs_in_progress_srflx_host', 'pairs_in_progress_srflx_srflx', 'pairs_in_progress_other',
+      'pairs_failed_host_host', 'pairs_failed_host_srflx', 'pairs_failed_srflx_host', 'pairs_failed_srflx_srflx', 'pairs_failed_other',
+      'pairs_succeeded_host_host', 'pairs_succeeded_host_srflx', 'pairs_succeeded_srflx_host', 'pairs_succeeded_srflx_srflx', 'pairs_succeeded_other',
+      'pairs_pending_host_host', 'pairs_pending_host_srflx', 'pairs_pending_srflx_host', 'pairs_pending_srflx_srflx', 'pairs_pending_other']) {
       const v = source[key];
       if (v === undefined) continue;
       if (typeof v !== 'number' || !Number.isSafeInteger(v) || v < 0) return null;

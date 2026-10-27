@@ -15,6 +15,13 @@ assert.equal(safeConnectionDiagnostic({ ...base, pair: { ...pair, local_type: se
 assert.equal(safeConnectionDiagnostic({ ...base, pair: { ...pair, selected: 'true' } }), null);
 const aggregates = { pairs_total: 6, pairs_succeeded: 0, pairs_in_progress: 2, pairs_failed: 4, pairs_succeeded_direct: 0, pairs_succeeded_relay: 0, local_host: true, remote_host: true, local_srflx: true, remote_srflx: false };
 assert.deepEqual(safeConnectionDiagnostic({ ...base, pair: { ...pair, ...aggregates, address: secret } }), { ...logged, pair: { ...pair, ...aggregates } });
+// v0.7.2 detailed checklist: pair-type matrix and per-type candidate counts
+// pass through as optional non-negative counts, and malformed values still
+// invalidate the whole record, so the next frozen checklist names its stuck pair.
+const detailed = { pairs_frozen: 1, pairs_waiting: 0, pairs_state_unknown: 0, local_candidates_host: 2, local_candidates_srflx: 1, local_candidates_prflx: 0, local_candidates_relay: 0, remote_candidates_host: 1, remote_candidates_srflx: 1, remote_candidates_prflx: 0, remote_candidates_relay: 0, pairs_in_progress_host_host: 0, pairs_in_progress_host_srflx: 1, pairs_in_progress_srflx_host: 1, pairs_in_progress_srflx_srflx: 0, pairs_in_progress_other: 0, pairs_failed_host_host: 0, pairs_failed_host_srflx: 0, pairs_failed_srflx_host: 0, pairs_failed_srflx_srflx: 0, pairs_failed_other: 0, pairs_succeeded_host_host: 0, pairs_succeeded_host_srflx: 0, pairs_succeeded_srflx_host: 0, pairs_succeeded_srflx_srflx: 0, pairs_succeeded_other: 0, pairs_pending_host_host: 1, pairs_pending_host_srflx: 0, pairs_pending_srflx_host: 0, pairs_pending_srflx_srflx: 0, pairs_pending_other: 0 };
+assert.deepEqual(safeConnectionDiagnostic({ ...base, pair: { ...pair, ...aggregates, ...detailed, address: secret } }), { ...logged, pair: { ...pair, ...aggregates, ...detailed } });
+assert.equal(safeConnectionDiagnostic({ ...base, pair: { ...pair, pairs_in_progress_srflx_host: -1 } }), null);
+assert.equal(safeConnectionDiagnostic({ ...base, pair: { ...pair, local_candidates_srflx: 'x' } }), null);
 assert.equal(safeConnectionDiagnostic({ ...base, pair: { ...pair, pairs_total: -1 } }), null);
 assert.equal(safeConnectionDiagnostic({ ...base, pair: { ...pair, pairs_failed: 0.5 } }), null);
 assert.equal(safeConnectionDiagnostic({ ...base, pair: { ...pair, pairs_succeeded_direct: -1 } }), null);

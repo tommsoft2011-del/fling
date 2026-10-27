@@ -1,4 +1,4 @@
-//! Privacy boundary: only finite enums, booleans and elapsed time leave this module.
+//! Privacy boundary: only finite enums, booleans, counts and elapsed time leave this module.
 //! TURN carries encrypted WebRTC DataChannel packets, NOT LiveKit file relay.
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -73,6 +73,51 @@ pub struct RouteSummary {
     pub remote_host: bool,
     pub local_srflx: bool,
     pub remote_srflx: bool,
+    /// Pair states that the three counters above do not cover, so a frozen
+    /// checklist can be fully accounted for: `pairs_total` should equal
+    /// succeeded + in_progress + failed + frozen + waiting + state_unknown
+    /// (a pair whose stats report no state at all).
+    pub pairs_frozen: u32,
+    pub pairs_waiting: u32,
+    pub pairs_state_unknown: u32,
+    /// Candidate counts by known type on each side. Unknown-type candidates
+    /// are not counted here, so the four counts per side may sum to less
+    /// than the number of candidates actually gathered. Counts only;
+    /// never addresses, ports, URLs or candidate IDs.
+    pub local_candidates_host: u32,
+    pub local_candidates_srflx: u32,
+    pub local_candidates_prflx: u32,
+    pub local_candidates_relay: u32,
+    pub remote_candidates_host: u32,
+    pub remote_candidates_srflx: u32,
+    pub remote_candidates_prflx: u32,
+    pub remote_candidates_relay: u32,
+    /// Pair counts split by candidate-type combination and pair state.
+    /// `other` covers every combination that is not host/host, host/srflx,
+    /// srflx/host or srflx/srflx (prflx, relay, or a missing candidate
+    /// type on either side). `pending` means frozen or waiting. This is
+    /// the field that answers "which kind of pair is stuck" for a PC that
+    /// never nominates a pair, where the selected-pair fields stay unknown.
+    pub pairs_in_progress_host_host: u32,
+    pub pairs_in_progress_host_srflx: u32,
+    pub pairs_in_progress_srflx_host: u32,
+    pub pairs_in_progress_srflx_srflx: u32,
+    pub pairs_in_progress_other: u32,
+    pub pairs_failed_host_host: u32,
+    pub pairs_failed_host_srflx: u32,
+    pub pairs_failed_srflx_host: u32,
+    pub pairs_failed_srflx_srflx: u32,
+    pub pairs_failed_other: u32,
+    pub pairs_succeeded_host_host: u32,
+    pub pairs_succeeded_host_srflx: u32,
+    pub pairs_succeeded_srflx_host: u32,
+    pub pairs_succeeded_srflx_srflx: u32,
+    pub pairs_succeeded_other: u32,
+    pub pairs_pending_host_host: u32,
+    pub pairs_pending_host_srflx: u32,
+    pub pairs_pending_srflx_host: u32,
+    pub pairs_pending_srflx_srflx: u32,
+    pub pairs_pending_other: u32,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RouteObservation {
