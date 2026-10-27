@@ -228,7 +228,7 @@ impl EffectExecutor for Executor {
                     }
                 }
                 Effect::CloseUnselected(path) => {
-                    if let Some(peer)=attempt.peers.lock().await.remove(&path) { peer.link.close(); }
+                    if let Some(peer)=attempt.peers.lock().await.remove(&path) { peer.link.close_for_path(path).await; }
                 }
                 Effect::ApplicationCompleted => {
                     attempt.completed.store(true, Ordering::Release);
@@ -288,7 +288,7 @@ impl DirectAttempt {
         let scope=self.diagnostics.scope(path);
         let (link,ice,sdp)=scope.bounded(Stage::OfferSetup,OnlineP2p::start_initiator_observed(self.servers.clone(),mode,Some(scope.clone()))).await?;
         let origin=link.gathering_origin();let ufrag=sdp_ufrag(&sdp)?;
-        if self.terminal.load(Ordering::Acquire) {link.close();return Err("terminal attempt".into());}
+        if self.terminal.load(Ordering::Acquire) {link.close_for_path(path).await;return Err("terminal attempt".into());}
         let link=Arc::new(link);
         self.peers.lock().await.insert(path,Peer { link:link.clone(),dc:None,remote_sdp:None,remote_ufrag:None,local_sdp:sdp.clone(),local_ufrag:ufrag.clone() });
         if path==Path::Direct {self.runtime().dispatch_gathering_started(self.capability.epoch,origin).await?;}
@@ -370,7 +370,7 @@ impl DirectAttempt {
             let mode=if path==Path::Direct {IceMode::Direct}else{IceMode::Turn};
             let (link,ice,local_sdp)=scope.bounded(Stage::AnswerSetup,OnlineP2p::accept_offer_observed(self.servers.clone(),mode,&sdp,frames_tx,Some(scope.clone()))).await?;
             let origin=link.gathering_origin();let local_ufrag=sdp_ufrag(&local_sdp)?;
-            if self.terminal.load(Ordering::Acquire) {link.close();return Err("terminal attempt".into());}
+            if self.terminal.load(Ordering::Acquire) {link.close_for_path(path).await;return Err("terminal attempt".into());}
             let link=Arc::new(link);
             self.peers.lock().await.insert(path,Peer {link:link.clone(),dc:None,remote_sdp:Some(sdp),remote_ufrag:Some(ufrag.clone()),local_sdp:local_sdp.clone(),local_ufrag:local_ufrag.clone()});
             if path==Path::Direct {self.runtime().dispatch_gathering_started(self.capability.epoch,origin).await?;}
@@ -403,6 +403,12 @@ impl DirectAttempt {
                 let Some(task)=monitor.upgrade() else {break;};
                 if task.terminal.load(Ordering::Acquire) || !task.peers.lock().await.get(&path).is_some_and(|p|Arc::ptr_eq(&p.link,&observed_link)) {break;}
                 let scope=task.diagnostics.scope(path);drop(task);
+                if path==Path::Direct {
+                    observed_link.direct_checklist(Stage::DirectSample).await;
+                    drop(scope);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
                 let summary=observed_link.diagnostic_pair_state().await;
                 let Some(task)=monitor.upgrade() else {break;};
                 if task.terminal.load(Ordering::Acquire) {break;}
@@ -421,9 +427,9 @@ impl DirectAttempt {
                 }
                 return;
             }};
-            let Some(task)=weak.upgrade() else {link.close();return;};
+            let Some(task)=weak.upgrade() else {link.close_for_path(path).await;return;};
             task.diagnostics.scope(path).note(Stage::ChannelOpen,Outcome::Ok,Reason::None);
-            if task.terminal.load(Ordering::Acquire) {link.close();return;}
+            if task.terminal.load(Ordering::Acquire) {link.close_for_path(path).await;return;}
             if let Some(peer)=task.peers.lock().await.get_mut(&path) {peer.dc=Some(dc.clone());}else{return;}
             if let Some(mut frames)=frames {
                 let frame_task=Arc::downgrade(&task);
@@ -514,7 +520,7 @@ impl DirectAttempt {
                 None=>attempt.peers.lock().await.get(&Path::Direct).map(|peer|peer.link.clone()),
             };
             let summary=match link {
-                Some(link)=>link.diagnostic_pair_snapshot().await,
+                Some(link)=>{link.direct_checklist(stage).await;return;},
                 None=>None,
             };
             attempt.diagnostics.scope(Path::Direct).ice_checklist_checkpoint(stage,summary);
@@ -529,7 +535,7 @@ impl DirectAttempt {
     async fn close_peers(&self) {
         self.block_frames();
         *self.permit.lock().await=None;
-        for (_,peer) in self.peers.lock().await.drain() {peer.link.close();}
+        for (path,peer) in self.peers.lock().await.drain() {peer.link.close_for_path(path).await;}
         self.changed.notify_waiters();
     }
     pub async fn close(&self) {

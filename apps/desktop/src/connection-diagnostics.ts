@@ -3,7 +3,7 @@ const enums: Record<string, readonly string[]> = {
   role: ['sender', 'receiver'], path: ['Direct', 'Turn'],
   stage: ['turn_decision', 'peer_create', 'channel_create', 'offer_setup', 'offer_create', 'offer_set', 'offer_send',
     'answer_setup', 'offer_parse', 'offer_apply', 'answer_create', 'answer_set', 'answer_send', 'answer_parse', 'answer_apply',
-    'description_validate', 'ice_validate', 'ice_add', 'ice_send', 'channel_wait', 'direct_ice_cutoff', 'direct_channel_wait_terminal', 'channel_open',
+    'description_validate', 'ice_validate', 'ice_add', 'ice_send', 'channel_wait', 'direct_pre_close', 'direct_state_change', 'direct_sample', 'ice_generated', 'direct_ice_cutoff', 'direct_channel_wait_terminal', 'channel_open',
     'pair_observe', 'ready_proof', 'ready', 'decision', 'decision_ack', 'request', 'request_ack', 'prepare', 'prepared',
     'commit', 'committed', 'start', 'start_ack', 'start_confirmed', 'abort', 'attempt_abort', 'control_receive', 'first_frame_permit', 'attempt_end'],
   outcome: ['started', 'ok', 'failed', 'rejected', 'observed'],
@@ -58,6 +58,29 @@ export function safeConnectionDiagnostic(value: unknown): Record<string, unknown
       pair[key] = v;
     }
     result.pair = pair;
+  }
+  if (input.attempt_no !== undefined) {
+    if (!Number.isSafeInteger(input.attempt_no) || (input.attempt_no as number) < 1) return null;
+    result.attempt_no = input.attempt_no;
+  }
+  if (input.checklist !== undefined) {
+    if (!input.checklist || typeof input.checklist !== 'object') return null;
+    const source = input.checklist as Record<string, unknown>;
+    const states = ['new', 'checking', 'connecting', 'connected', 'completed', 'disconnected', 'failed', 'closed', 'open', 'closing', 'unknown'];
+    const statuses = ['state_change', 'stats_unavailable', 'timeout', 'already_closed', 'zero_pairs', 'still_in_progress', 'failed_pairs', 'succeeded_direct', 'other_pairs'];
+    if (!statuses.includes(source.status as string)) return null;
+    const checklist: Record<string, unknown> = { status: source.status };
+    for (const key of ['pc', 'ice', 'dc']) {
+      if (!states.includes(source[key] as string)) return null;
+      checklist[key] = source[key];
+    }
+    if (source.pair === null) checklist.pair = null;
+    else {
+      const validated = safeConnectionDiagnostic({ ...input, checklist: undefined, pair: source.pair });
+      if (!validated?.pair) return null;
+      checklist.pair = validated.pair;
+    }
+    result.checklist = checklist;
   }
   // The global logger deliberately strips generic path/reason keys. These
   // aliases carry ONLY validated finite enums; do not relax its privacy filter.

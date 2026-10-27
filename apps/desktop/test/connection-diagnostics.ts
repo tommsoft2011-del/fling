@@ -57,3 +57,16 @@ assert.ok(tasks.includes('连接未建立：') && tasks.includes('可重试。')
 const card = readFileSync(new URL('../src/taskcard.ts', import.meta.url), 'utf8');
 assert.ok(card.includes("task.error?.includes('连接未建立')") && card.includes('重试连接'));
 console.log('connection diagnostics privacy, phase allowlist, sanitized native errors and retry UI contract passed');
+
+for (const status of ['stats_unavailable', 'timeout', 'already_closed', 'zero_pairs', 'still_in_progress', 'failed_pairs', 'succeeded_direct', 'other_pairs']) {
+  const checklist = { status, pc:'connected', ice:'checking', dc:'connecting', pair:null };
+  const input = { ...base, stage:'direct_pre_close', attempt_no:2, checklist:{ ...checklist, sdp:secret, address:secret } };
+  const out = safeConnectionDiagnostic(input);
+  assert.deepEqual(out?.checklist, checklist);
+  assert.equal(out?.attempt_no, 2);
+  assert.equal(JSON.stringify(out).includes(secret), false);
+  assert.equal(safeConnectionDiagnostic({ ...input, checklist:{...checklist, pc:secret} }), null);
+  assert.equal(safeConnectionDiagnostic({ ...input, attempt_no:-1 }), null);
+}
+const preclose = safeConnectionDiagnostic({ ...base, stage:'direct_pre_close', checklist:{status:'succeeded_direct',pc:'connected',ice:'connected',dc:'open',pair:{...pair, address:secret}} });
+assert.deepEqual((preclose?.checklist as Record<string, unknown>).pair, pair);

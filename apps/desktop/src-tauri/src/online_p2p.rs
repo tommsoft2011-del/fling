@@ -345,6 +345,7 @@ pub enum P2pState {
 /// A direct P2P link. The initiator creates the offer; the responder
 /// answers. Both sides feed remote ICE candidates via `add_remote_ice`.
 pub struct OnlineP2p {
+    diagnostic_dc: Arc<StdMutex<crate::connection_diagnostics::LinkState>>,
     diagnostics: Option<Scope>,
     gathering_origin: Option<Instant>,
     channel_closed: Arc<std::sync::atomic::AtomicBool>,
@@ -385,7 +386,9 @@ impl OnlineP2p {
 
         // Forward gathered ICE candidates to the signaling channel.
         let ice_tx_cb = ice_tx.clone();
+        let generated_diagnostics = diagnostics.clone();
         peer.on_ice_candidate(Some(Box::new(move |candidate: IceCandidate| {
+            if let Some(scope)=&generated_diagnostics {scope.note(Stage::IceGenerated,Outcome::Observed,Reason::None);}
             let sig = SignalingIceCandidate {
                 candidate: candidate.candidate(),
                 sdp_mid: Some(candidate.sdp_mid()),
@@ -395,11 +398,24 @@ impl OnlineP2p {
             let _ = ice_tx_cb.send(Some(json));
         })));
 
+        // Transition events contain enums only; checklist reads remain at most 1 Hz.
+        let state_scope=diagnostics.clone();
+        peer.on_ice_connection_state_change(Some(Box::new(move |state| {
+            use crate::connection_diagnostics::LinkState as S;
+            if let Some(scope)=&state_scope {scope.transition(S::Unknown,S::from_native(state),S::Unknown);}
+        })));
+        let state_scope=diagnostics.clone();
+        peer.on_connection_state_change(Some(Box::new(move |state| {
+            use crate::connection_diagnostics::LinkState as S;
+            if let Some(scope)=&state_scope {scope.transition(S::from_native(state),S::Unknown,S::Unknown);}
+        })));
+
         // Connection failure surfaces via the wait_open timeout; the data
         // channel state is the authoritative signal.
         let state = Arc::new(Mutex::new(P2pState::Connecting));
 
         Ok(Self {
+            diagnostic_dc: Arc::new(StdMutex::new(crate::connection_diagnostics::LinkState::Unknown)),
             diagnostics,
             gathering_origin: None,
             channel_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -507,6 +523,7 @@ impl OnlineP2p {
         let link_msg_handler = link.msg_handler.clone();
         let link_closed = link.channel_closed.clone();
         let link_diagnostics = link.diagnostics.clone();
+        let diagnostic_dc = link.diagnostic_dc.clone();
         link.peer
             .on_data_channel(Some(Box::new(move |dc: DataChannel| {
                 if let Some(d)=&link_diagnostics {d.note(Stage::ChannelCreate,Outcome::Started,Reason::None);}
@@ -524,8 +541,14 @@ impl OnlineP2p {
                 // Wire open-state delivery like the initiator path.
                 let open_tx = link_open_tx.clone();
                 let dc_for_open = dc.clone();
+                *diagnostic_dc.lock().unwrap()=crate::connection_diagnostics::LinkState::from_native(dc.state());
+                let dc_scope=link_diagnostics.clone();
+                let diagnostic_dc=diagnostic_dc.clone();
                 let closed = link_closed.clone();
                 dc.on_state_change(Some(Box::new(move |state| {
+                    let finite=crate::connection_diagnostics::LinkState::from_native(state);
+                    *diagnostic_dc.lock().unwrap()=finite;
+                    if let Some(scope)=&dc_scope {scope.transition(crate::connection_diagnostics::LinkState::Unknown,crate::connection_diagnostics::LinkState::Unknown,finite);}
                     if state == DataChannelState::Closed { closed.store(true, std::sync::atomic::Ordering::Release); }
                     if state == DataChannelState::Open {
                         let _ = open_tx.send(dc_for_open.clone());
@@ -700,8 +723,14 @@ impl OnlineP2p {
         // Deliver the channel via open_tx only once it reaches Open state.
         let open_tx = self.open_tx.clone();
         let dc_for_open = dc.clone();
+        *self.diagnostic_dc.lock().unwrap()=crate::connection_diagnostics::LinkState::from_native(dc.state());
+        let dc_scope=self.diagnostics.clone();
+        let diagnostic_dc=self.diagnostic_dc.clone();
         let closed = self.channel_closed.clone();
         dc.on_state_change(Some(Box::new(move |state| {
+            let finite=crate::connection_diagnostics::LinkState::from_native(state);
+            *diagnostic_dc.lock().unwrap()=finite;
+            if let Some(scope)=&dc_scope {scope.transition(crate::connection_diagnostics::LinkState::Unknown,crate::connection_diagnostics::LinkState::Unknown,finite);}
             if state == DataChannelState::Closed { closed.store(true, std::sync::atomic::Ordering::Release); }
             if state == DataChannelState::Open {
                 let _ = open_tx.send(dc_for_open.clone());
@@ -709,6 +738,30 @@ impl OnlineP2p {
         })));
     }
 
+    pub async fn direct_checklist(&self, stage: Stage) {
+        use crate::connection_diagnostics::{Checklist, ChecklistStatus, LinkState, checklist_status};
+        let pc=LinkState::from_native(self.peer.connection_state());
+        let ice=LinkState::from_native(self.peer.ice_connection_state());
+        let dc=*self.diagnostic_dc.lock().unwrap();
+        let (mut status,mut pair)=if pc==LinkState::Closed {
+            (ChecklistStatus::AlreadyClosed,None)
+        } else {
+            match tokio::time::timeout(Duration::from_millis(200),self.peer.get_stats()).await {
+                Ok(Ok(stats))=>{let pair=classify_stats(&stats).summary;(checklist_status(&pair),Some(pair))},
+                Ok(Err(_))=>(ChecklistStatus::StatsUnavailable,None),
+                Err(_)=>(ChecklistStatus::Timeout,None),
+            }
+        };
+        let pc_after=LinkState::from_native(self.peer.connection_state());
+        if pc_after==LinkState::Closed {status=ChecklistStatus::AlreadyClosed;pair=None;}
+        if let Some(scope)=&self.diagnostics {scope.checklist(stage,Checklist {status,pc:pc_after,ice,dc,pair});}
+    }
+    pub async fn close_for_path(&self,path:crate::online_route_choice::Path) {
+        if path==crate::online_route_choice::Path::Direct {
+            crate::connection_diagnostics::observe_before_close(
+                self.direct_checklist(Stage::DirectPreClose),||self.close()).await;
+        } else {self.close();}
+    }
     pub fn close(&self) {
         self.channel_closed.store(true, std::sync::atomic::Ordering::Release);
         self.peer.close();
@@ -996,5 +1049,25 @@ mod isolation_tests {
         enqueue_frame(&tx,b"first",&closed);assert!(!closed.load(Ordering::Acquire));
         enqueue_frame(&tx,b"overflow",&closed);assert!(closed.load(Ordering::Acquire));
         assert_eq!(rx.try_recv().unwrap(),b"first");assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod preclose_diagnostic_regression {
+    use super::*;
+    #[tokio::test] async fn real_direct_pc_is_sampled_before_native_close() {
+        use crate::connection_diagnostics::Diagnostics;
+        use crate::online_route_choice::{Path,Role};
+        let records=Arc::new(StdMutex::new(Vec::new()));let output=records.clone();
+        let diagnostics=Diagnostics::new(Role::Sender,Arc::new(move |event| {
+            output.lock().unwrap().push(serde_json::to_value(event).unwrap());
+        }));
+        let (link,_,_)=OnlineP2p::start_initiator_observed(vec![],IceMode::Direct,Some(diagnostics.scope(Path::Direct))).await.unwrap();
+        link.close_for_path(Path::Direct).await;
+        let records=records.lock().unwrap();
+        let snapshot=records.iter().find(|e|e["stage"]=="direct_pre_close").expect("production close snapshot");
+        assert_ne!(snapshot["checklist"]["pc"],"closed");
+        assert_ne!(snapshot["checklist"]["status"],"already_closed");
+        assert_eq!(link.peer.connection_state(),livekit::webrtc::peer_connection::PeerConnectionState::Closed);
     }
 }

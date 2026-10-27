@@ -32,6 +32,10 @@ pub enum Stage {
     IceSend,
     ChannelWait,
     DirectIceCutoff,
+    DirectPreClose,
+    DirectStateChange,
+    DirectSample,
+    IceGenerated,
     DirectChannelWaitTerminal,
     ChannelOpen,
     PairObserve,
@@ -87,6 +91,9 @@ pub enum Reason {
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct PhaseEvent {
+    attempt_no: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checklist: Option<Checklist>,
     role: &'static str,
     path: Path,
     stage: Stage,
@@ -97,8 +104,45 @@ pub struct PhaseEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pair: Option<crate::online_diagnostics::RouteSummary>,
 }
+/// Independent diagnostic observation; never passed to route selection or its cache.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct Checklist {
+    pub status: ChecklistStatus,
+    pub pc: LinkState,
+    pub ice: LinkState,
+    pub dc: LinkState,
+    pub pair: Option<crate::online_diagnostics::RouteSummary>,
+}
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all="snake_case")]
+pub enum ChecklistStatus { StateChange, StatsUnavailable, Timeout, AlreadyClosed, ZeroPairs, StillInProgress, FailedPairs, SucceededDirect, OtherPairs }
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all="snake_case")]
+pub enum LinkState { New, Checking, Connecting, Connected, Completed, Disconnected, Failed, Closed, Open, Closing, Unknown }
+impl LinkState {
+    pub fn from_native(value: impl std::fmt::Debug) -> Self {
+        match format!("{value:?}").as_str() {
+            "New"=>Self::New,"Checking"=>Self::Checking,"Connecting"=>Self::Connecting,
+            "Connected"=>Self::Connected,"Completed"=>Self::Completed,"Disconnected"=>Self::Disconnected,
+            "Failed"=>Self::Failed,"Closed"=>Self::Closed,"Open"=>Self::Open,"Closing"=>Self::Closing,_=>Self::Unknown,
+        }
+    }
+}
+pub fn checklist_status(pair: &crate::online_diagnostics::RouteSummary) -> ChecklistStatus {
+    if pair.pairs_succeeded_direct>0 {ChecklistStatus::SucceededDirect}
+    else if pair.pairs_in_progress>0 {ChecklistStatus::StillInProgress}
+    else if pair.pairs_failed>0 {ChecklistStatus::FailedPairs}
+    else if pair.pairs_total==0 {ChecklistStatus::ZeroPairs}
+    else {ChecklistStatus::OtherPairs}
+}
+/// Await the diagnostic observation before invoking the real close, including timeout/error observations.
+pub async fn observe_before_close(observe: impl Future<Output=()>, close: impl FnOnce()) {
+    observe.await;
+    close();
+}
 pub type Observer = Arc<dyn Fn(PhaseEvent) + Send + Sync>;
 pub struct Diagnostics {
+    attempt_no: u64,
     started: Instant,
     role: &'static str,
     observer: Observer,
@@ -113,7 +157,9 @@ pub struct Scope {
 }
 impl Diagnostics {
     pub fn new(role: Role, observer: Observer) -> Arc<Self> {
+        static NEXT_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Arc::new(Self {
+            attempt_no: NEXT_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             started: Instant::now(),
             role: if role == Role::Sender {
                 "sender"
@@ -135,7 +181,7 @@ impl Diagnostics {
     pub fn flush(&self) {
         let counts = self.counts.lock().unwrap().clone();
         for ((path, stage, outcome, reason), count) in counts {
-            if matches!(stage, Stage::IceValidate | Stage::IceAdd | Stage::IceSend) {
+            if matches!(stage, Stage::IceValidate | Stage::IceAdd | Stage::IceSend | Stage::IceGenerated) {
                 self.emit(path, stage, outcome, reason, count, None);
             }
         }
@@ -150,6 +196,8 @@ impl Diagnostics {
         pair: Option<crate::online_diagnostics::RouteSummary>,
     ) {
         (self.observer)(PhaseEvent {
+            attempt_no: self.attempt_no,
+            checklist: None,
             role: self.role,
             path,
             stage,
@@ -166,6 +214,23 @@ impl Diagnostics {
     }
 }
 impl Scope {
+    pub fn transition(&self, pc: LinkState, ice: LinkState, dc: LinkState) {
+        if self.path!=Path::Direct {return;}
+        let mut counts=self.diagnostics.counts.lock().unwrap();
+        let n=counts.entry((self.path,Stage::DirectStateChange,Outcome::Observed,Reason::None)).or_default();
+        *n=n.saturating_add(1);let emit=*n<=32;drop(counts);
+        if emit {self.checklist(Stage::DirectStateChange,Checklist {status:ChecklistStatus::StateChange,pc,ice,dc,pair:None});}
+    }
+    pub fn checklist(&self, stage: Stage, checklist: Checklist) {
+        debug_assert_eq!(self.path, Path::Direct);
+        (self.diagnostics.observer)(PhaseEvent {
+            attempt_no: self.diagnostics.attempt_no, checklist: Some(checklist),
+            role:self.diagnostics.role, path:self.path, stage, outcome:Outcome::Observed,
+            reason:Reason::None, elapsed_ms:self.diagnostics.started.elapsed().as_millis().min(9_007_199_254_740_991) as u64,
+            count:1, pair:None,
+        });
+    }
+
     /// Milestones emit once per tuple; ICE emits at powers of two plus terminal totals.
     pub fn note(&self, stage: Stage, outcome: Outcome, reason: Reason) {
         let mut counts = self.diagnostics.counts.lock().unwrap();
@@ -176,7 +241,7 @@ impl Scope {
         let n = *count;
         drop(counts);
         if n == 1
-            || (matches!(stage, Stage::IceValidate | Stage::IceAdd | Stage::IceSend)
+            || (matches!(stage, Stage::IceValidate | Stage::IceAdd | Stage::IceSend | Stage::IceGenerated)
                 && n.is_power_of_two())
         {
             self.diagnostics
@@ -448,5 +513,29 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| e.reason == Reason::Timeout));
+    }
+}
+
+#[cfg(test)]
+mod checklist_regressions {
+    use super::*;
+    #[test] fn classify_checklist_without_conflating_empty_with_failure() {
+        use crate::online_diagnostics::RouteSummary;
+        let mut p=RouteSummary::default();
+        assert_eq!(checklist_status(&p),ChecklistStatus::ZeroPairs);
+        p.pairs_total=5;p.pairs_in_progress=4;
+        assert_eq!(checklist_status(&p),ChecklistStatus::StillInProgress);
+        p.pairs_in_progress=0;p.pairs_failed=5;
+        assert_eq!(checklist_status(&p),ChecklistStatus::FailedPairs);
+        p.pairs_succeeded_direct=1;
+        assert_eq!(checklist_status(&p),ChecklistStatus::SucceededDirect);
+        p.pairs_succeeded_direct=0;p.pairs_failed=0;p.pairs_succeeded_relay=1;
+        assert_eq!(checklist_status(&p),ChecklistStatus::OtherPairs);
+    }
+    #[tokio::test] async fn snapshot_finishes_before_real_close() {
+        let events=std::sync::Mutex::new(Vec::new());
+        observe_before_close(async {tokio::task::yield_now().await;events.lock().unwrap().push("snapshot");},
+            ||events.lock().unwrap().push("close")).await;
+        assert_eq!(*events.lock().unwrap(),vec!["snapshot","close"]);
     }
 }

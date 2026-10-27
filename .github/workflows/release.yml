@@ -114,6 +114,11 @@ jobs:
           cargo test --locked 2>&1 | Tee-Object -FilePath cargo-test.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Check release diagnostic code on Windows test branch
+        if: startsWith(github.ref, 'refs/heads/test/windows-desktop-')
+        working-directory: apps/desktop/src-tauri
+        run: cargo check --release --locked
+
       - name: Publish native test failure details
         if: failure() && startsWith(github.ref, 'refs/heads/test/windows-desktop-')
         working-directory: apps/desktop/src-tauri
