@@ -39,16 +39,24 @@ async fn receive_sync_verify_commit_then_final_ack_and_no_overwrite() {
             ..
         }
     ));
-    assert!(!dir.join(format!(".{}.part", meta.id)).exists());
+    assert!(!dir.join(format!(".{}.tmp", meta.id)).exists());
     assert!(receiver.check_complete().await.unwrap()); // idempotent terminal state
+    // Same name, second transfer: the target already exists, so the
+    // rename must NOT overwrite it — it lands on received(1).bin and the
+    // first file is untouched. The .tmp is gone and target_path() reports
+    // the actual (suffixed) path, which is what the UI must display.
     let second = Arc::new(OnlineReceiver::new(manifest(&data), &dir).unwrap());
     let frame =
         encode_direct_file_frame(&second.manifest.id, 0, &data, NATIVE_CHUNK_SIZE as u16, 2)
             .unwrap();
     second.on_p2p_frame(&frame).await.unwrap();
-    assert!(second.check_complete().await.is_err());
-    second.abort().await;
+    assert!(second.check_complete().await.unwrap());
+    assert_eq!(second.target_path(), dir.join("received(1).bin"));
+    assert_eq!(std::fs::read(dir.join("received(1).bin")).unwrap(), data);
     assert_eq!(std::fs::read(receiver.target_path()).unwrap(), data);
+    assert!(!dir.join(format!(".{}.tmp", second.manifest.id)).exists());
+    second.abort().await; // committed file must survive abort
+    assert_eq!(std::fs::read(dir.join("received(1).bin")).unwrap(), data);
     std::fs::remove_dir_all(dir).unwrap();
 }
 #[tokio::test]
@@ -56,9 +64,15 @@ async fn disk_corruption_rejected_and_abort_cleans_temporary_file() {
     let dir = directory();
     let data = b"verify actual disk";
     let receiver = Arc::new(OnlineReceiver::new(manifest(data), &dir).unwrap());
-    receiver.on_relay_chunk(0, &B64.encode(data)).await.unwrap();
-    // Mutate after append: verification must read disk rather than trust the incremental hash.
-    std::fs::write(&receiver.temp_path, vec![0; data.len()]).unwrap();
+    // Receive bytes that differ from the manifest (same length): the
+    // incremental hash must disagree with the manifest SHA at commit
+    // time, so nothing is published and the .tmp is cleaned on abort.
+    // NOTE: this no longer covers a post-write disk mutation — the new
+    // design verifies the incremental hash, not a re-read of the .tmp
+    // (same rule as ReceivedFileStore). Wire bytes are still fully
+    // verified; only an external process rewriting the .tmp after the
+    // write (or an unreported disk fault) would escape detection.
+    receiver.on_relay_chunk(0, &B64.encode(vec![0u8; data.len()])).await.unwrap();
     assert!(receiver.check_complete().await.is_err());
     assert!(!receiver.target_path().exists());
     receiver.abort().await;
@@ -95,7 +109,7 @@ async fn empty_file_commits_and_early_completion_ack_is_sticky() {
     let meta = manifest(b"");
     let receiver = Arc::new(OnlineReceiver::new(meta.clone(), &dir).unwrap());
     assert!(receiver.check_complete().await.unwrap());
-    let sender = OnlineSender::new(meta, receiver.target_path()).unwrap();
+    let sender = OnlineSender::new(meta, &receiver.target_path()).unwrap();
     sender.on_complete();
     tokio::time::timeout(
         Duration::from_millis(100),
@@ -284,7 +298,7 @@ async fn registered_folder_layout_persists_exact_bytes_before_completion() {
     assert!(receiver.check_complete().await.unwrap());
     assert_eq!(std::fs::read(root.join("docs/子目录/测试.txt")).unwrap(), data);
     assert!(receiver.is_committed());
-    assert!(!root.join(format!("docs/子目录/.{}.part", meta.id)).exists());
+    assert!(!root.join(format!("docs/子目录/.{}.tmp", meta.id)).exists());
     drop(receiver); std::fs::remove_dir_all(root).unwrap();
 }
 #[test]
@@ -346,8 +360,7 @@ async fn diagnostic_hash_failure_never_reports_commit_and_sync_failure_is_silent
     let dir = directory();
     let data = b"corruption must not be success";
     let receiver = OnlineReceiver::new(manifest(data), &dir).unwrap();
-    receiver.on_relay_chunk(0, &B64.encode(data)).await.unwrap();
-    std::fs::write(&receiver.temp_path, vec![0; data.len()]).unwrap();
+    receiver.on_relay_chunk(0, &B64.encode(vec![0u8; data.len()])).await.unwrap();
     let phases = std::sync::Mutex::new(Vec::new());
     assert!(receiver.check_complete_observed(|p| phases.lock().unwrap().push(p)).await.is_err());
     assert_eq!(*phases.lock().unwrap(), vec![Phase::DiskSynced]);

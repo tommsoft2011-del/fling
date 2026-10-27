@@ -4,7 +4,7 @@
 // - config file (server URL + API key/secret + device identity + download dir),
 // - LiveKit token minting (HS256 JWT — the secret never enters the webview),
 // - mDNS nearby discovery (service type `_fling._tcp.local.`),
-// - clipboard image writes,
+// - clipboard image encoding (in memory, never a temp file),
 // - small OS helpers (folder picker, open folder, write file).
 // Text clipboard goes through the official Tauri clipboard plugin.
 
@@ -497,10 +497,15 @@ async fn online_pick_source(app: tauri::AppHandle, window: tauri::WebviewWindow)
     }).await.map_err(|e| format!("picker worker: {e}"))?
 }
 
-/// Read and encode a clipboard bitmap entirely in Rust. The WebView receives
-/// only the registered source capability and its display metadata.
-fn clipboard_image_to_temp_png(image: arboard::ImageData<'_>) -> Result<std::path::PathBuf, String> {
+/// Read and encode a clipboard bitmap entirely in Rust, into memory.
+/// The WebView receives only the registered source capability and its
+/// display metadata. No disk file is created for the PNG at any point:
+/// previously this wrote a temp PNG under the system temp directory and
+/// registered it as a file source; now the bytes are registered as a
+/// memory source and streamed from RAM by the sender.
+fn clipboard_image_to_png_bytes(image: arboard::ImageData<'_>) -> Result<Vec<u8>, String> {
     use image::ImageEncoder;
+    use std::io::Cursor;
     let width = u32::try_from(image.width).map_err(|_| "剪贴板图片宽度无效")?;
     let height = u32::try_from(image.height).map_err(|_| "剪贴板图片高度无效")?;
     let pixels = u64::from(width)
@@ -513,29 +518,15 @@ fn clipboard_image_to_temp_png(image: arboard::ImageData<'_>) -> Result<std::pat
         .filter(|rgba| rgba.as_raw().len() == expected_bytes)
         .ok_or("剪贴板图片数据不完整")?;
 
-    let dir = std::env::temp_dir().join("fling-clipboard");
-    std::fs::create_dir_all(&dir).map_err(|_| "创建剪贴板临时目录失败")?;
-    for _ in 0..8 {
-        let path = dir.join(format!("{:032x}.png", rand::random::<u128>()));
-        let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return Err("创建剪贴板图片临时文件失败".into()),
-        };
-        let encoded = image::codecs::png::PngEncoder::new_with_quality(
-            &mut file,
-            image::codecs::png::CompressionType::Fast,
-            image::codecs::png::FilterType::NoFilter,
-        )
-        .write_image(rgba.as_raw(), width, height, image::ExtendedColorType::Rgba8);
-        if encoded.is_err() || file.flush().is_err() {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
-            return Err("编码剪贴板图片失败".into());
-        }
-        return Ok(path);
-    }
-    Err("创建剪贴板图片临时文件失败".into())
+    let mut buf = Cursor::new(Vec::new());
+    image::codecs::png::PngEncoder::new_with_quality(
+        &mut buf,
+        image::codecs::png::CompressionType::Fast,
+        image::codecs::png::FilterType::NoFilter,
+    )
+    .write_image(rgba.as_raw(), width, height, image::ExtendedColorType::Rgba8)
+    .map_err(|_| "编码剪贴板图片失败".to_string())?;
+    Ok(buf.into_inner())
 }
 
 #[tauri::command]
@@ -549,14 +540,9 @@ async fn online_pick_clipboard_image(
         let image = clipboard
             .get_image()
             .map_err(|_| "剪贴板中没有可用图片，请复制图片后重试")?;
-        let path = clipboard_image_to_temp_png(image)?;
-        let result = app
-            .state::<online_source::OnlineSources>()
-            .register_temporary(&owner, &path, "剪贴板图片.png", "clipboard-image");
-        if result.is_err() {
-            let _ = std::fs::remove_file(path);
-        }
-        result
+        let bytes = clipboard_image_to_png_bytes(image)?;
+        app.state::<online_source::OnlineSources>()
+            .register_memory(&owner, bytes, "剪贴板图片.png", "clipboard-image")
     })
     .await
     .map_err(|_| "剪贴板图片准备线程失败")?
@@ -660,35 +646,6 @@ async fn online_send_text(
     session.send_text(text).await
 }
 
-/// Send a file in an online session. Returns the transfer id.
-/// Progress arrives via `fling://online/event`.
-#[tauri::command]
-async fn online_send_file(
-    window: tauri::WebviewWindow,
-    registry: tauri::State<'_, online_session::OnlineSessionRegistry>,
-    session_id: String,
-    path: String,
-    name: String,
-    kind: String,
-) -> Result<String, String> {
-    let session = registry
-        .get(&session_id)
-        .await
-        .ok_or_else(|| "unknown online session".to_string())?;
-    let file_kind = match kind.as_str() {
-        "clipboard-image" => online_proto::FileKind::ClipboardImage,
-        _ => online_proto::FileKind::File,
-    };
-    session.authorize(window.label())?;
-    if session.native.is_some() { return Err("native task accepts high-level actions only".into()); }
-    let spill = std::path::Path::new(&path).canonicalize().map_err(|_| "兼容临时文件不可用")?;
-    let temp = fling_temp_dir()?.canonicalize().map_err(|_| "兼容临时目录不可用")?;
-    if spill.parent() != Some(temp.as_path()) { return Err("ordinary files require sourceId".into()); }
-    session
-        .send_file(&spill, name, file_kind)
-        .await
-}
-
 /// Send an arbitrary Fling protocol message (offer, task-ack, etc.).
 /// The message is a JSON value matching the `FlingMessage` schema.
 #[tauri::command]
@@ -709,91 +666,131 @@ async fn online_send_message(
     session.send_raw(msg).await
 }
 
-/// Legacy memory-Blob compatibility only, NOT a Rust-owned ordinary file source.
-/// Write in-memory bytes (clipboard image) to a temp file so
-/// the Rust transfer engine can stream it. Returns the temp path.
-#[tauri::command]
-fn write_temp_file(_app: tauri::AppHandle, name: String, data: Vec<u8>) -> Result<String, String> {
-    let dir = std::env::temp_dir().join("fling-online");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create temp dir: {e}"))?;
-    // Sanitize the name to avoid path traversal.
-    let safe_name: String = name
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
-        .collect();
-    let path = dir.join(format!(
-        "{:x}-{safe_name}",
-        rand::random::<u64>()
-    ));
-    std::fs::write(&path, &data).map_err(|e| format!("write temp file: {e}"))?;
-    Ok(path.to_string_lossy().to_string())
+/// In-memory staging for WebView-owned Blob bytes (the only bytes that
+/// originate in the WebView). This replaces the old `fling-online` disk
+/// spill: bytes cross IPC once, in raw 4 MiB frames, are held in RAM in
+/// this store, and are then streamed by the Rust sender from memory.
+/// Ordinary disk files NEVER use this path — they use source leases
+/// (read-only handles, no copy). Entries are single-use (consumed by
+/// `online_send_memory`) and stale entries older than 30 minutes are
+/// purged when a new entry begins, so an abandoned upload cannot hold
+/// RAM forever.
+#[derive(Default)]
+struct MemoryStore {
+    entries: Arc<Mutex<HashMap<String, MemoryEntry>>>,
 }
 
-/// Directory that holds spilled in-memory files for Rust-side sending.
-fn fling_temp_dir() -> Result<std::path::PathBuf, String> {
-    let dir = std::env::temp_dir().join("fling-online");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create temp dir: {e}"))?;
-    Ok(dir)
+struct MemoryEntry {
+    owner: String,
+    name: String,
+    kind: String,
+    bytes: Vec<u8>,
+    created: std::time::Instant,
 }
 
-/// Begin a chunked spill: create an empty temp file and return its path.
-/// Chunked append (below) replaces the old one-shot `write_temp_file`
-/// IPC, whose whole-file JSON payload made large files impossible.
-#[tauri::command]
-fn online_temp_begin(name: String) -> Result<String, String> {
-    let dir = fling_temp_dir()?;
-    let safe_name: String = name
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
-        .collect();
-    let path = dir.join(format!("{:x}-{safe_name}", rand::random::<u64>()));
-    std::fs::write(&path, b"").map_err(|e| format!("create temp file: {e}"))?;
-    Ok(path.to_string_lossy().to_string())
+impl MemoryStore {
+    fn begin(&self, owner: &str, name: String, kind: String) -> Result<String, String> {
+        if name.is_empty() || name.len() > 255 {
+            return Err("内存源文件名无效".into());
+        }
+        let mut entries = self.entries.lock().map_err(|_| "内存源锁失败")?;
+        entries.retain(|_, e| e.created.elapsed() < std::time::Duration::from_secs(30 * 60));
+        let id = loop {
+            let id = format!("{:032x}", rand::random::<u128>());
+            if !entries.contains_key(&id) {
+                break id;
+            }
+        };
+        entries.insert(
+            id.clone(),
+            MemoryEntry { owner: owner.into(), name, kind, bytes: Vec::new(), created: std::time::Instant::now() },
+        );
+        Ok(id)
+    }
+
+    fn append(&self, owner: &str, id: &str, chunk: &[u8]) -> Result<(), String> {
+        let mut entries = self.entries.lock().map_err(|_| "内存源锁失败")?;
+        let entry = entries.get_mut(id).ok_or("内存源不存在")?;
+        if entry.owner != owner {
+            return Err("内存源未授权".into());
+        }
+        entry.bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn take(&self, owner: &str, id: &str) -> Result<MemoryEntry, String> {
+        let mut entries = self.entries.lock().map_err(|_| "内存源锁失败")?;
+        let entry = entries.remove(id).ok_or("内存源不存在")?;
+        if entry.owner != owner {
+            return Err("内存源未授权".into());
+        }
+        Ok(entry)
+    }
 }
 
-/// Append one raw-bytes chunk to a temp file created by `online_temp_begin`.
-/// The invoke payload is a raw octet-stream frame (Tauri 2 ships a bare
-/// Uint8Array arg as application/octet-stream, no JSON/base64 in the path):
-/// `[u32 LE path_len][path UTF-8 bytes][chunk bytes]`.
-/// Only paths inside the spill directory are allowed.
+/// Begin an in-memory staging entry for a WebView Blob. Returns its id.
 #[tauri::command]
-fn online_temp_append(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+fn online_memory_begin(
+    window: tauri::WebviewWindow,
+    store: tauri::State<'_, MemoryStore>,
+    name: String,
+    kind: String,
+) -> Result<String, String> {
+    store.begin(window.label(), name, kind)
+}
+
+/// Append one raw-bytes chunk to a memory staging entry created by
+/// `online_memory_begin`. Frame format mirrors the old temp-append frame
+/// but carries a staging id instead of a filesystem path, and nothing is
+/// written to disk: `[u32 LE id_len][id UTF-8 bytes][chunk bytes]`.
+#[tauri::command]
+fn online_memory_append(
+    window: tauri::WebviewWindow,
+    store: tauri::State<'_, MemoryStore>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), String> {
     let body = match request.body() {
         tauri::ipc::InvokeBody::Raw(b) => b,
         tauri::ipc::InvokeBody::Json(_) => {
-            return Err("temp append expects a raw bytes payload".to_string())
+            return Err("memory append expects a raw bytes payload".to_string())
         }
     };
     if body.len() < 4 {
-        return Err("temp append frame too short".to_string());
+        return Err("memory append frame too short".to_string());
     }
-    let path_len =
-        u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
-    if path_len > 4096 || body.len() < 4 + path_len {
-        return Err("temp append frame malformed".to_string());
+    let id_len = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    if id_len > 64 || body.len() < 4 + id_len {
+        return Err("memory append frame malformed".to_string());
     }
-    let path = std::str::from_utf8(&body[4..4 + path_len])
-        .map_err(|_| "temp append path not utf8".to_string())?;
-    let dir = fling_temp_dir()?;
-    let target = std::path::PathBuf::from(path);
-    let canonical_dir = dir.canonicalize().map_err(|e| format!("temp dir: {e}"))?;
-    let parent = target
-        .parent()
-        .ok_or_else(|| "temp path has no parent".to_string())?;
-    let canonical_parent = parent
-        .canonicalize()
-        .map_err(|e| format!("temp path parent: {e}"))?;
-    if canonical_parent != canonical_dir {
-        return Err("temp append path outside spill dir".to_string());
-    }
-    use std::io::Write as _;
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&target)
-        .map_err(|e| format!("open temp for append: {e}"))?;
-    f.write_all(&body[4 + path_len..])
-        .map_err(|e| format!("append temp: {e}"))?;
-    Ok(())
+    let id = std::str::from_utf8(&body[4..4 + id_len])
+        .map_err(|_| "memory append id not utf8".to_string())?;
+    store.append(window.label(), id, &body[4 + id_len..])
+}
+
+/// Send a staged in-memory source through an online session. The bytes
+/// are registered as a memory source (no disk file) and sent by the Rust
+/// sender from RAM. Returns the transfer id.
+#[tauri::command]
+async fn online_send_memory(
+    window: tauri::WebviewWindow,
+    store: tauri::State<'_, MemoryStore>,
+    sources: tauri::State<'_, online_source::OnlineSources>,
+    registry: tauri::State<'_, online_session::OnlineSessionRegistry>,
+    session_id: String,
+    memory_id: String,
+) -> Result<String, String> {
+    let session = registry.get(&session_id).await.ok_or("unknown online session")?;
+    session.authorize(window.label())?;
+    if session.native.is_some() { return Err("native task accepts high-level actions only".into()); }
+    let entry = store.take(window.label(), &memory_id)?;
+    let kind = match entry.kind.as_str() {
+        "clipboard-image" => "clipboard-image",
+        _ => "file",
+    };
+    let meta = sources.register_memory(window.label(), entry.bytes, &entry.name, kind)?;
+    let lease = sources.acquire(window.label(), &meta.source_id)?;
+    let _busy = sources.busy_guard(window.label(), &meta.source_id);
+    session.send_registered_source(lease).await
 }
 
 /// Disconnect an online session and release its resources.
@@ -844,7 +841,7 @@ fn write_binary_file(path: String, data_b64: String) -> Result<(), String> {
 }
 
 /// Save a received file into `dir`: sanitizes the name, never overwrites
-/// (appends " (1)", " (2)", … on collision), returns the final path.
+/// (appends "(1)", "(2)", … on collision), returns the final path.
 /// `rel_path`: 文件夹发送时的相对路径（如 "docs/report.pdf"），按此重建子目录；
 /// 为空时保持旧行为（直接存 dir 下）。
 #[derive(Serialize)]
@@ -911,8 +908,12 @@ fn save_received_file(
     };
 
     // First write and fsync a unique temporary file in the destination
-    // directory. Then hard-link it to the first unused name: link creation is
-    // atomic and fails rather than overwriting a file created concurrently.
+    // directory, then rename it once to the first unused name. The rename
+    // is the only publish step: no hard link, no second copy, and an
+    // existing target is never overwritten (it gets a (n) suffix instead).
+    // On Unix the existence check and rename are not atomic together, so
+    // a racing creator could still be overwritten; that window is shared
+    // with the online receiver and is called out in the final report.
     let (temp_path, mut temp_file) = loop {
         let temp = target_dir.join(format!(".fling-{}.tmp", new_device_id()));
         match std::fs::OpenOptions::new()
@@ -940,73 +941,18 @@ fn save_received_file(
     let sync_all_ms = sync_started.elapsed().as_secs_f64() * 1000.0;
     drop(temp_file);
 
-    let (stem, ext) = match clean.rfind('.') {
-        Some(i) if i > 0 => (clean[..i].to_string(), clean[i..].to_string()),
-        _ => (clean.clone(), String::new()),
-    };
-    for i in 0..10_000u32 {
-        let filename = if i == 0 {
-            clean.clone()
-        } else {
-            format!("{stem} ({i}){ext}")
-        };
-        let candidate = target_dir.join(filename);
-        match std::fs::hard_link(&temp_path, &candidate) {
-            Ok(()) => {
-                let _ = std::fs::remove_file(&temp_path);
-                return Ok(SaveReceivedFileResult {
-                    path: candidate.to_string_lossy().into_owned(),
-                    write_all_ms,
-                    sync_all_ms,
-                });
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
-                ) =>
-            {
-                // Some removable/network filesystems do not implement hard
-                // links. Reserve the final path with create_new before copy;
-                // this fallback still never overwrites a concurrent file.
-                match std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&candidate)
-                {
-                    Ok(mut destination) => {
-                        let mut source = std::fs::File::open(&temp_path)
-                            .map_err(|err| format!("重开临时文件失败: {err}"))?;
-                        if let Err(err) = std::io::copy(&mut source, &mut destination)
-                            .and_then(|_| destination.sync_all())
-                        {
-                            let _ = std::fs::remove_file(&candidate);
-                            let _ = std::fs::remove_file(&temp_path);
-                            return Err(format!("写入失败: {err}"));
-                        }
-                        let _ = std::fs::remove_file(&temp_path);
-                        return Ok(SaveReceivedFileResult {
-                            path: candidate.to_string_lossy().into_owned(),
-                            write_all_ms,
-                            sync_all_ms,
-                        });
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(err) => {
-                        let _ = std::fs::remove_file(&temp_path);
-                        return Err(format!("创建目标文件失败: {err}"));
-                    }
-                }
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(format!("原子保存失败: {e}"));
-            }
+    let final_path = match crate::online_transfer::rename_with_sequence(&temp_path, &target_dir, &clean) {
+        Ok(path) => path,
+        Err(err) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(format!("原子保存失败: {err}"));
         }
-    }
-    let _ = std::fs::remove_file(&temp_path);
-    Err("无法生成不重名的文件名".to_string())
+    };
+    Ok(SaveReceivedFileResult {
+        path: final_path.to_string_lossy().into_owned(),
+        write_all_ms,
+        sync_all_ms,
+    })
 }
 
 fn received_file_target(
@@ -1059,7 +1005,7 @@ fn received_file_target(
     Ok((target_dir, clean))
 }
 
-fn create_received_temp_file(
+fn create_destination_tmp_file(
     target_dir: &std::path::Path,
 ) -> Result<(std::path::PathBuf, std::fs::File), String> {
     loop {
@@ -1076,6 +1022,13 @@ fn create_received_temp_file(
     }
 }
 
+/// Publish a received temp file with a single rename. The temp file is
+/// written once (in the destination directory) and renamed once; there is
+/// no hard link and no copy. If the target name exists, or the rename
+/// fails, the next `name (n).ext` candidate is tried, up to 10,000.
+/// Only when every candidate fails is the temp file removed and an error
+/// returned. The (n) suffix goes before the extension, exactly like the
+/// online receiver's `rename_with_sequence`.
 fn commit_received_temp_file(
     temp_path: &std::path::Path,
     target_dir: &std::path::Path,
@@ -1083,76 +1036,18 @@ fn commit_received_temp_file(
     write_all_ms: f64,
     sync_all_ms: f64,
 ) -> Result<SaveReceivedFileResult, String> {
-    let (stem, ext) = match clean.rfind('.') {
-        Some(i) if i > 0 => (clean[..i].to_string(), clean[i..].to_string()),
-        _ => (clean.to_string(), String::new()),
-    };
-    for i in 0..10_000u32 {
-        let filename = if i == 0 {
-            clean.to_string()
-        } else {
-            format!("{stem} ({i}){ext}")
-        };
-        let candidate = target_dir.join(filename);
-        match std::fs::hard_link(temp_path, &candidate) {
-            Ok(()) => {
-                let _ = std::fs::remove_file(temp_path);
-                return Ok(SaveReceivedFileResult {
-                    path: candidate.to_string_lossy().into_owned(),
-                    write_all_ms,
-                    sync_all_ms,
-                });
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
-                ) =>
-            {
-                match std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&candidate)
-                {
-                    Ok(mut destination) => {
-                        let copied = (|| -> Result<(), String> {
-                            let mut source = std::fs::File::open(temp_path)
-                                .map_err(|err| format!("重开临时文件失败: {err}"))?;
-                            std::io::copy(&mut source, &mut destination)
-                                .map_err(|err| format!("写入失败: {err}"))?;
-                            destination
-                                .sync_all()
-                                .map_err(|err| format!("写入失败: {err}"))?;
-                            Ok(())
-                        })();
-                        if let Err(err) = copied {
-                            let _ = std::fs::remove_file(&candidate);
-                            let _ = std::fs::remove_file(temp_path);
-                            return Err(err);
-                        }
-                        let _ = std::fs::remove_file(temp_path);
-                        return Ok(SaveReceivedFileResult {
-                            path: candidate.to_string_lossy().into_owned(),
-                            write_all_ms,
-                            sync_all_ms,
-                        });
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(err) => {
-                        let _ = std::fs::remove_file(temp_path);
-                        return Err(format!("创建目标文件失败: {err}"));
-                    }
-                }
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(temp_path);
-                return Err(format!("原子保存失败: {e}"));
-            }
+    let final_path = match crate::online_transfer::rename_with_sequence(temp_path, target_dir, clean) {
+        Ok(path) => path,
+        Err(err) => {
+            let _ = std::fs::remove_file(temp_path);
+            return Err(format!("原子保存失败: {err}"));
         }
-    }
-    let _ = std::fs::remove_file(temp_path);
-    Err("无法生成不重名的文件名".to_string())
+    };
+    Ok(SaveReceivedFileResult {
+        path: final_path.to_string_lossy().into_owned(),
+        write_all_ms,
+        sync_all_ms,
+    })
 }
 
 struct StreamingReceivedFile {
@@ -1230,7 +1125,7 @@ impl ReceivedFileStore {
             .sessions
             .lock()
             .map_err(|e| format!("receive file lock: {e}"))?;
-        let (temp_path, file) = create_received_temp_file(&target_dir)?;
+        let (temp_path, file) = create_destination_tmp_file(&target_dir)?;
         let session_id = loop {
             let id = new_device_id();
             if !sessions.contains_key(&id) {
@@ -1271,12 +1166,20 @@ impl ReceivedFileStore {
                 return Err("received more bytes than declared".to_string());
             }
             let started = std::time::Instant::now();
-            session
-                .file
-                .as_mut()
-                .ok_or_else(|| "receive file is already closed".to_string())?
-                .write_all(data)
-                .map_err(|e| format!("写入失败: {e}"))?;
+            {
+                // LAN frames arrive in order, so the write position is
+                // always the bytes already written; seek explicitly so a
+                // future out-of-order caller cannot silently append at a
+                // stale offset.
+                use std::io::Seek;
+                let file = session
+                    .file
+                    .as_mut()
+                    .ok_or_else(|| "receive file is already closed".to_string())?;
+                file.seek(std::io::SeekFrom::Start(session.written))
+                    .map_err(|e| format!("写入失败: {e}"))?;
+                file.write_all(data).map_err(|e| format!("写入失败: {e}"))?;
+            }
             let write_elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
             session.write_all_ms += write_elapsed_ms;
             session.hasher.update(data);
@@ -2480,6 +2383,7 @@ fn main() {
             app.manage(DiscoveryState { tx });
             app.manage(online_session::OnlineSessionRegistry::new());
             app.manage(online_source::OnlineSources::default());
+            app.manage(MemoryStore::default());
             app.manage(ui_events::UiListeners::default());
             app.manage(native_drop::DropState::default());
             let source_app = app.handle().clone();
@@ -2520,12 +2424,11 @@ fn main() {
             online_send_source,
             online_cancel_native,
             online_send_text,
-            online_send_file,
+            online_memory_begin,
+            online_memory_append,
+            online_send_memory,
             online_send_message,
             online_disconnect,
-            write_temp_file,
-            online_temp_begin,
-            online_temp_append,
             server_url,
             pick_save_path,
             write_binary_file,

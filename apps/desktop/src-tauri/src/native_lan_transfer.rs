@@ -1377,7 +1377,7 @@ async fn finalize_zero_byte_receive(
         );
         result
     };
-    store.finish(&store_session_id)?;
+    let saved = store.finish(&store_session_id)?;
     if let Ok(mut transfer) = session.transfer.lock() {
         if let Some(incoming) = transfer.incoming.as_mut() {
             incoming.complete = true;
@@ -1390,11 +1390,15 @@ async fn finalize_zero_byte_receive(
     if !session.claim_terminal() {
         return Ok(());
     }
+    let saved_name = std::path::Path::new(&saved.path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| manifest.name.clone());
     emit_lan_event(
         app,
         runtime,
         "fling://lan/progress",
-        task_event_with_metadata(session, "complete", 0, 0, 0, None, Some(manifest.name)),
+        task_event_with_metadata(session, "complete", 0, 0, 0, None, Some(saved_name)),
     );
     Ok(())
 }
@@ -1864,10 +1868,12 @@ async fn finalize_received_file(
         let store_session_id = incoming.store_session_id.clone();
         (manifest, store, store_session_id)
     };
-    // finish() verifies SHA-256, syncs the temporary file and atomically commits
-    // without overwriting an existing destination. Only after it succeeds is the
-    // durable-completion ACK sent.
-    store.finish(&store_session_id)?;
+    // finish() verifies SHA-256, syncs the destination-directory .tmp file
+    // and renames it once to the first unused name (never overwriting an
+    // existing destination). Only after it succeeds is the
+    // durable-completion ACK sent. The completion event below reports the
+    // actual saved filename, which may carry a (n) suffix on conflict.
+    let saved = store.finish(&store_session_id)?;
     if let Ok(mut transfer) = session.transfer.lock() {
         if let Some(incoming) = transfer.incoming.as_mut() {
             incoming.complete = true;
@@ -1889,6 +1895,10 @@ async fn finalize_received_file(
     if !session.claim_terminal() {
         return Ok(());
     }
+    let saved_name = std::path::Path::new(&saved.path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| manifest.name.clone());
     emit_lan_event(
         app,
         runtime,
@@ -1900,7 +1910,7 @@ async fn finalize_received_file(
             manifest.size,
             manifest.size,
             None,
-            Some(manifest.name),
+            Some(saved_name),
         ),
     );
     Ok(())

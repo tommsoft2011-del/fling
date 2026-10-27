@@ -6,7 +6,7 @@
 //! The WebView only displays progress; all signaling and bytes flow here.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,7 @@ use crate::online_diagnostics::{Diagnostic, Diagnostics, Phase, Role, Route, Rou
 use crate::online_p2p::{has_relay_candidate, OnlineP2p};
 use crate::online_proto::{FileKind, FlingMessage};
 use crate::online_room::{OnlineRoom, OnlineRoomEvent};
-use crate::online_transfer::{build_manifest, chunk_ack_message, OnlineReceiver, OnlineSender};
+use crate::online_transfer::{build_manifest_source, chunk_ack_message, OnlineReceiver, OnlineSender};
 
 fn connection_failure() -> &'static str {
     "CONNECTION_FAILED: 未能建立安全连接，文件尚未开始传输；此路径不支持自动文件中继，请点击重试"
@@ -98,12 +98,18 @@ enum OnlineUiEvent {
     PathDiagnostic { summary: Diagnostic },
     #[serde(rename = "connection-diagnostic")]
     ConnectionDiagnostic { summary: crate::connection_diagnostics::PhaseEvent },
-    /// A transfer finished (or failed).
+    /// A transfer finished (or failed). On receiver completion,
+    /// `saved_path` is the ACTUAL final path after the rename step —
+    /// which may carry a `(n)` sequence suffix if the intended name
+    /// was taken. The UI must display this path/name, not the
+    /// pre-rename manifest name.
     #[serde(rename = "transfer-done")]
     TransferDone {
         transfer_id: String,
         ok: bool,
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        saved_path: Option<String>,
     },
     /// The room disconnected.
     #[serde(rename = "disconnected")]
@@ -629,7 +635,7 @@ impl OnlineSession {
                 // Retain committed metadata for idempotent final ACK replay.
                 // It is released on peer departure/disconnect, not by the UI.
             } else { self.receivers.lock().await.remove(&id); }
-            emit(&self.app, &self.id, OnlineUiEvent::TransferDone { transfer_id: id.clone(), ok: true, error: None });
+            emit(&self.app, &self.id, OnlineUiEvent::TransferDone { transfer_id: id.clone(), ok: true, error: None, saved_path: Some(receiver.target_path().to_string_lossy().into_owned()) });
         } else {
             // Progress ACKs are cumulative: the next frame's ACK supersedes
             // this one, and `receiver_last_ack` only advances after a
@@ -827,19 +833,13 @@ impl OnlineSession {
         });
     }
 
-    /// Sender: transmit one file. Builds the manifest, exchanges it, tries
-    /// P2P with optional configured TURN. Native single-file never falls back to LiveKit file relay.
-    pub async fn send_file(
-        self: &Arc<Self>,
-        path: &Path,
-        name: String,
-        kind: FileKind,
-    ) -> Result<String, String> {
-        let manifest = build_manifest(path, name, kind)?;
-        let sender = Arc::new(OnlineSender::new(manifest, path)?);
-        self.send_prepared(sender).await
-    }
-
+    // NOTE: there is deliberately no `send_file(path)` entry point any
+    // more. The old one required the WebView to spill bytes into the
+    // system temp directory (`fling-online`) first, which is exactly the
+    // staging copy this speed-up removes. All senders now go through a
+    // source lease: a read-only disk handle (`send_registered_source` /
+    // `send_source`, ordinary files) or in-memory bytes
+    // (`register_memory`, clipboard / Blob). See `online_source`.
     async fn send_prepared(self: &Arc<Self>, sender: Arc<OnlineSender>) -> Result<String, String> {
         let id=sender.manifest().id.clone();
         let result=self.send_prepared_inner(sender).await;
@@ -975,6 +975,7 @@ impl OnlineSession {
                         transfer_id: transfer_id.clone(),
                         ok: true,
                         error: None,
+                        saved_path: None,
                     },
                 );
             }
@@ -986,6 +987,7 @@ impl OnlineSession {
                         transfer_id: transfer_id.clone(),
                         ok: false,
                         error: Some(e.clone()),
+                        saved_path: None,
                     },
                 );
             }
@@ -1052,7 +1054,7 @@ impl OnlineSession {
             let mut status = native.status.lock().await;
             if !status.terminal() { status.stage = "error".into(); status.error = Some(error.into()); emit(&self.app, &self.id, OnlineUiEvent::NativeTask { status: status.clone() }); }
         }
-        emit(&self.app, &self.id, OnlineUiEvent::TransferDone { transfer_id: id, ok: false, error: Some(error.into()) });
+        emit(&self.app, &self.id, OnlineUiEvent::TransferDone { transfer_id: id, ok: false, error: Some(error.into()), saved_path: None });
     }
 
     /// Batch-source migration: TS still orchestrates the legacy task envelope, but
@@ -1060,20 +1062,23 @@ impl OnlineSession {
     pub async fn send_registered_source(self: &Arc<Self>, lease: SourceLease) -> Result<String, String> {
         if self.cancelled.load(Ordering::Acquire) { return Err("已取消".into()); }
         let session = self.clone();
-        let (manifest, file) = tokio::task::spawn_blocking(move || {
-            let mut file = lease.file;
+        let (manifest, source) = tokio::task::spawn_blocking(move || {
             let kind = match lease.metadata.kind.as_deref() {
                 None | Some("file") => FileKind::File,
                 Some("clipboard-image") => FileKind::ClipboardImage,
                 Some(_) => return Err("不支持的原生文件类型".to_string()),
             };
-            let mut manifest = crate::online_transfer::build_manifest_handle(&mut file, lease.metadata.name, kind, &session.cancelled)?;
-            if manifest.size != lease.metadata.size { return Err("文件大小已改变，请重新选择".to_string()); }
-            manifest.path = lease.metadata.rel_path;
-            Ok::<_, String>((manifest, file))
+            let name = lease.metadata.name.clone();
+            let rel_path = lease.metadata.rel_path.clone();
+            let registered_size = lease.metadata.size;
+            let mut source = lease.into_send_source();
+            let mut manifest = build_manifest_source(&mut source, name, kind, &session.cancelled)?;
+            if manifest.size != registered_size { return Err("文件大小已改变，请重新选择".to_string()); }
+            manifest.path = rel_path;
+            Ok::<_, String>((manifest, source))
         }).await.map_err(|_| "源文件准备失败")??;
         if self.cancelled.load(Ordering::Acquire) { return Err("已取消".into()); }
-        self.send_prepared(Arc::new(OnlineSender::from_handle(manifest, file))).await
+        self.send_prepared(Arc::new(OnlineSender::from_source(manifest, source))).await
     }
     pub async fn send_source(self: &Arc<Self>, lease: SourceLease) -> Result<NativeTaskStatus, String> {
         self.diagnostics.set_role(Role::Initiator);
@@ -1095,10 +1100,11 @@ impl OnlineSession {
             }).await.map_err(|_| "等待对方加入超时".to_string())??;
             self.native_stage("preparing").await;
             let cancel = native.source_cancelled.clone();
-            let (manifest, file) = tokio::task::spawn_blocking(move || {
-                let mut file = lease.file;
-                let manifest = crate::online_transfer::build_manifest_handle(&mut file, lease.metadata.name, FileKind::File, &cancel)?;
-                Ok::<_, String>((manifest, file))
+            let (manifest, source) = tokio::task::spawn_blocking(move || {
+                let name = lease.metadata.name.clone();
+                let mut source = lease.into_send_source();
+                let manifest = build_manifest_source(&mut source, name, FileKind::File, &cancel)?;
+                Ok::<_, String>((manifest, source))
             }).await.map_err(|e| format!("hash worker failed: {e}"))??;
             {
                 let mut status = native.status.lock().await;
@@ -1106,7 +1112,7 @@ impl OnlineSession {
                 status.sha256 = Some(manifest.sha256.clone());
             }
             if self.cancelled.load(Ordering::Acquire) { return Err("已取消".into()); }
-            let sender = Arc::new(OnlineSender::from_handle(manifest, file));
+            let sender = Arc::new(OnlineSender::from_source(manifest, source));
             tokio::select! {
                 result = self.send_prepared(sender) => { result?; }
                 _ = self.cancel_notify.notified() => { return Err("已取消".into()); }

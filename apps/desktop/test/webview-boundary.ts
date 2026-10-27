@@ -16,7 +16,11 @@ export function checkOrdinaryIngress(send: string, tasks: string, bridge: string
   assert.match(registered, /sessionId: this\.requireSession\(\), sourceId: source\.sourceId/);
   assert.doesNotMatch(registered, /ensureFilePath|arrayBuffer|Uint8Array|buildManifest|\bslice\(/);
   assert.doesNotMatch(bridge, /\bdiskPath\b/);
-  assert.match(bridge, /Legacy Blob compatibility[\s\S]*NOT Rust-only/);
+  // The old disk-spill exception is gone: WebView-owned Blob bytes are
+  // staged in Rust memory only (online_memory_begin/append + send_memory),
+  // and ordinary files never regain a path-based send command.
+  assert.match(bridge, /online_memory_begin[\s\S]*?online_send_memory/);
+  assert.doesNotMatch(bridge, /invoke\('online_temp_begin'|invoke\('online_temp_append'|invoke\('online_send_file'|function ensureFilePath/);
 }
 const send = read('../src/send.ts'); const tasks = read('../src/tasks.ts'); const bridge = read('../src/online-rust.ts');
 checkOrdinaryIngress(send, tasks, bridge);
@@ -37,7 +41,11 @@ assert.match(checks, /cargo clippy --locked --all-targets/);
 const native = read('../src-tauri/src/main.rs');
 const handlers = native.slice(native.indexOf('.invoke_handler(tauri::generate_handler!['), native.indexOf('])\n', native.indexOf('.invoke_handler(tauri::generate_handler![')));
 for (const command of ['read_file_bytes', 'file_size', 'is_dir', 'list_dir_recursive']) assert.doesNotMatch(handlers, new RegExp(`\\b${command}\\b`));
-assert.match(native, /ordinary files require sourceId/);
+// The path-based send command (which enforced sourceId by rejecting
+// non-temp paths) is deleted outright: ordinary files can only enter via
+// sourceId commands, and the handler list must not contain it at all.
+assert.doesNotMatch(handlers, /\bonline_send_file\b/);
+assert.match(handlers, /\bonline_send_registered_source\b/);
 assert.match(native, /sources\.busy_guard\(window.label\(\), &source_id\)/);
 assert.match(native, /online_pick_sources[\s\S]*blocking_pick_folders[\s\S]*blocking_pick_files/);
 const drop = read('../src-tauri/src/native_drop.rs');
@@ -68,4 +76,4 @@ select = async () => [{ sourceId: 'folder-id', name: 'a.txt', size: 1, relPath: 
 assert.equal((await picker.pick(true))[0].relPath, 'docs/a.txt');
 assert.deepEqual(modes, [false, true, false, true, true]);
 console.log('ok - ordinary WebView boundary guard, six negative controls, denied raw path events, sourceId-only IPC and batch picker lifecycle');
-console.log('Batch task orchestration remains compatible TypeScript; memory Blob/clipboard sources are NOT Rust-owned.');
+console.log('Batch task orchestration remains compatible TypeScript; memory Blob/clipboard sources are staged in Rust memory, never on disk.');

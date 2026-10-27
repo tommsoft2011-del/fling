@@ -23,39 +23,56 @@ pub struct SourceMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub folder: Option<String>,
 }
+/// A sender source, in place and never copied to a staging directory:
+/// an already-open read-only disk handle, or in-memory bytes that have
+/// no source file (OS clipboard image, WebView Blob staged in RAM).
+/// See `online_transfer::SendSource` for the transfer-side counterpart.
+// No Clone derive: a File handle cannot be cloned by value. Callers
+// that need a second handle use File::try_clone (acquire) or Arc clone
+// (memory), explicitly, per variant.
+pub enum SourceData {
+    File(File),
+    Memory(Arc<Vec<u8>>),
+}
+
 struct Source {
     owner: String,
-    file: File,
+    data: SourceData,
     metadata: SourceMetadata,
     expires: Instant,
     busy: bool,
-    // Keep generated clipboard images in Rust-owned temp storage until every
-    // active lease has closed its cloned file handle.
-    cleanup: Option<Arc<TempSourceCleanup>>,
-}
-struct TempSourceCleanup(PathBuf);
-impl Drop for TempSourceCleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
 }
 #[derive(Default)]
 pub struct OnlineSources {
     sources: Arc<Mutex<HashMap<String, Source>>>,
 }
 pub struct SourceLease {
-    pub file: File,
+    pub data: SourceData,
     pub metadata: SourceMetadata,
-    // Declared after `file` so the file handle closes before the temp path is removed.
-    _cleanup: Option<Arc<TempSourceCleanup>>,
 }
 impl SourceLease {
     // Only the Linux debug-only internal acceptance probe builds a lease
-    // directly from an already-opened real file (no temp cleanup). Other
-    // callers must go through OnlineSources::acquire, which owns cleanup.
+    // directly from an already-opened real file. Other callers must go
+    // through OnlineSources::acquire.
     #[cfg(all(target_os = "linux", debug_assertions))]
     pub(crate) fn from_owned_file(file: File, metadata: SourceMetadata) -> Self {
-        Self { file, metadata, _cleanup: None }
+        Self { data: SourceData::File(file), metadata }
+    }
+
+    /// Convert this lease into the transfer engine's source. Ordinary
+    /// files become a read-only handle read in place (never copied);
+    /// memory sources become their in-memory buffer (never written to
+    /// disk). The metadata size is only a fallback length if a metadata
+    /// read fails; callers check the built manifest size against it.
+    pub fn into_send_source(self) -> crate::online_transfer::SendSource {
+        use crate::online_transfer::SendSource;
+        match self.data {
+            SourceData::File(file) => {
+                let len = file.metadata().map(|m| m.len()).unwrap_or(self.metadata.size);
+                SendSource::from_file_len(file, len)
+            }
+            SourceData::Memory(data) => SendSource::from_memory(data),
+        }
     }
 }
 pub struct BusyGuard {
@@ -178,7 +195,7 @@ fn collect(
     folder: Option<String>,
     depth: usize,
     visited: &mut usize,
-    pending: &mut Vec<(File, SourceMetadata)>,
+    pending: &mut Vec<(SourceData, SourceMetadata)>,
 ) -> Result<(), String> {
     *visited += 1;
     if *visited > 16384 {
@@ -214,32 +231,48 @@ fn collect(
         if pending.len() >= MAX_SOURCES {
             return Err("一次最多选择 1024 个文件，未添加任何文件".into());
         }
-        pending.push(open_source(path, rel, folder)?);
+        let (file, metadata) = open_source(path, rel, folder)?;
+        pending.push((SourceData::File(file), metadata));
     }
     Ok(())
 }
 impl OnlineSources {
     pub fn register(&self, owner: &str, path: &Path) -> Result<SourceMetadata, String> {
-        let pending = vec![open_source(path, None, None)?];
+        let (file, metadata) = open_source(path, None, None)?;
+        let pending = vec![(SourceData::File(file), metadata)];
         Ok(self.commit(owner, pending)?.remove(0))
     }
-    /// Register a Rust-generated temporary file such as a PNG read directly
-    /// from the OS clipboard. Its bytes and path never cross the WebView.
-    pub fn register_temporary(
+    /// Register in-memory bytes that have no source file (OS clipboard
+    /// PNG encoded in Rust, or a WebView Blob staged in RAM). No disk
+    /// file is created for these bytes at any point: the sender streams
+    /// them from this buffer. Ordinary disk files must use `register` /
+    /// `register_selection` (read-only handle, also never copied).
+    pub fn register_memory(
         &self,
         owner: &str,
-        path: &Path,
+        data: Vec<u8>,
         display_name: &str,
         kind: &str,
     ) -> Result<SourceMetadata, String> {
-        if !safe_component(display_name) || kind != "clipboard-image" {
+        // Only the two memory-source kinds exist: "clipboard-image" (OS
+        // clipboard PNG encoded in Rust) and "file" (a WebView Blob staged
+        // in RAM via online_memory_begin). Anything else is rejected, so a
+        // memory source can never masquerade as another source type.
+        // Ordinary disk files must still use `register` /
+        // `register_selection` — this function takes bytes, not a path,
+        // so it cannot be used to smuggle a disk file past the lease.
+        if !safe_component(display_name) || (kind != "clipboard-image" && kind != "file") {
             return Err("文件名不支持安全传输".into());
         }
-        let (file, mut metadata) = open_source(path, None, None)?;
-        metadata.name = display_name.to_owned();
-        metadata.kind = Some(kind.to_owned());
-        let cleanup = Arc::new(TempSourceCleanup(path.to_path_buf()));
-        let mut registered = self.commit_with_cleanup(owner, vec![(file, metadata, Some(cleanup))])?;
+        let metadata = SourceMetadata {
+            source_id: format!("{:032x}", rand::random::<u128>()),
+            name: display_name.to_owned(),
+            size: data.len() as u64,
+            kind: Some(kind.to_owned()),
+            rel_path: None,
+            folder: None,
+        };
+        let mut registered = self.commit(owner, vec![(SourceData::Memory(Arc::new(data)), metadata)])?;
         Ok(registered.remove(0))
     }
     /// All-or-nothing transaction, including cancellation (None) and enumeration errors.
@@ -275,20 +308,7 @@ impl OnlineSources {
     fn commit(
         &self,
         owner: &str,
-        pending: Vec<(File, SourceMetadata)>,
-    ) -> Result<Vec<SourceMetadata>, String> {
-        self.commit_with_cleanup(
-            owner,
-            pending
-                .into_iter()
-                .map(|(file, metadata)| (file, metadata, None))
-                .collect(),
-        )
-    }
-    fn commit_with_cleanup(
-        &self,
-        owner: &str,
-        pending: Vec<(File, SourceMetadata, Option<Arc<TempSourceCleanup>>)>,
+        pending: Vec<(SourceData, SourceMetadata)>,
     ) -> Result<Vec<SourceMetadata>, String> {
         let mut sources = self
             .sources
@@ -299,7 +319,7 @@ impl OnlineSources {
             return Err("已选择文件达到 1024 个上限，请移除后重试".into());
         }
         let mut result = Vec::with_capacity(pending.len());
-        for (file, mut metadata, cleanup) in pending {
+        for (data, mut metadata) in pending {
             while sources.contains_key(&metadata.source_id) {
                 metadata.source_id = format!("{:032x}", rand::random::<u128>());
             }
@@ -307,11 +327,10 @@ impl OnlineSources {
                 metadata.source_id.clone(),
                 Source {
                     owner: owner.into(),
-                    file,
+                    data,
                     metadata: metadata.clone(),
                     expires: Instant::now() + SOURCE_TTL,
                     busy: false,
-                    cleanup,
                 },
             );
             result.push(metadata);
@@ -334,12 +353,14 @@ impl OnlineSources {
             sources.remove(id);
             return Err("sourceId 已过期，请重新选择文件".into());
         }
-        let file = source.file.try_clone().map_err(|_| "复制源句柄失败")?;
+        let data = match &source.data {
+            SourceData::File(file) => SourceData::File(file.try_clone().map_err(|_| "复制源句柄失败")?),
+            SourceData::Memory(data) => SourceData::Memory(data.clone()),
+        };
         source.busy = true;
         Ok(SourceLease {
-            file,
+            data,
             metadata: source.metadata.clone(),
-            _cleanup: source.cleanup.clone(),
         })
     }
     pub fn busy_guard(&self, owner: &str, id: &str) -> BusyGuard {
@@ -421,7 +442,12 @@ mod tests {
         std::fs::write(&path, b"replacement").unwrap();
         let mut lease = registry.acquire("main", &metadata.source_id).unwrap();
         let mut bytes = Vec::new();
-        lease.file.read_to_end(&mut bytes).unwrap();
+        match &mut lease.data {
+            SourceData::File(file) => {
+                file.read_to_end(&mut bytes).unwrap();
+            }
+            SourceData::Memory(data) => bytes.extend_from_slice(data),
+        }
         assert_eq!(bytes, b"selected bytes");
         drop(lease);
         registry.release("main", &metadata.source_id);
@@ -436,6 +462,31 @@ mod tests {
         assert!(registry.sources.lock().unwrap().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn memory_source_streams_without_any_disk_file() {
+        let registry = OnlineSources::default();
+        let meta = registry
+            .register_memory("main", b"clipboard bytes".to_vec(), "剪贴板图片.png", "clipboard-image")
+            .unwrap();
+        assert_eq!(meta.size, 15);
+        assert_eq!(meta.kind.as_deref(), Some("clipboard-image"));
+        let lease = registry.acquire("main", &meta.source_id).unwrap();
+        match &lease.data {
+            SourceData::Memory(data) => assert_eq!(data.as_slice(), b"clipboard bytes"),
+            SourceData::File(_) => panic!("memory source must not be a file handle"),
+        }
+        // A WebView Blob staged in RAM is the other memory kind: it must
+        // register as "file" (this is what online_send_memory passes), and
+        // an unknown kind must still be rejected.
+        let blob = registry
+            .register_memory("main", b"blob bytes".to_vec(), "note.txt", "file")
+            .unwrap();
+        assert_eq!(blob.kind.as_deref(), Some("file"));
+        assert!(registry
+            .register_memory("main", b"x".to_vec(), "x.bin", "folder")
+            .is_err());
+    }
+
     #[test]
     fn invalid_selection_does_not_poison_retry() {
         let registry = OnlineSources::default();

@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
@@ -57,24 +57,142 @@ const ACK_PROGRESS_TIMEOUT: Duration = Duration::from_secs(90);
 /// as ACK_PROGRESS_TIMEOUT.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Build a `FileManifest` for a local file: streams the file once to
-/// compute SHA-256 and the chunk count. Mirrors `buildManifest()`.
+/// A sender-side source that is read **only** in place, never copied to a
+/// staging directory:
+///
+/// * `File` — an already-open, read-only handle to the user's source file.
+///   The sender seeks/reads from this handle directly; the source file is
+///   never modified, moved, or copied anywhere (no `fling-online` spill,
+///   no temp copy). The handle is opened read-only by the source registry.
+/// * `Memory` — bytes that have no source file at all (OS clipboard image,
+///   or a WebView-owned Blob staged in RAM by the new memory commands).
+///   These are the only sources that are not a disk file, and they never
+///   touch disk either: they are streamed from the in-memory buffer.
+///
+/// Protocol note: the chunk size (32 KiB, `NATIVE_CHUNK_SIZE`) is unchanged,
+/// so manifests, chunk indices, FLNG frames and ACK geometry are identical
+/// to already-published versions. Only the in-process reading path changed.
+pub enum SendSource {
+    File { file: File, pos: u64, len: u64 },
+    Memory { data: Arc<Vec<u8>>, pos: usize },
+}
+
+impl SendSource {
+    pub fn from_file(file: File) -> Result<Self, String> {
+        let len = file.metadata().map_err(|e| format!("stat source: {e}"))?.len();
+        Ok(Self::File { file, pos: 0, len })
+    }
+
+    pub fn from_memory(data: Arc<Vec<u8>>) -> Self {
+        Self::Memory { data, pos: 0 }
+    }
+
+    /// Build a file source when the length is already known (source
+    /// registry: the metadata size is the fallback if a metadata read
+    /// fails; the manifest builder then checks the built size against
+    /// the registered size, so a changed file still fails loudly).
+    pub fn from_file_len(file: File, len: u64) -> Self {
+        Self::File { file, pos: 0, len }
+    }
+
+    pub fn len(&self) -> u64 {
+        match self {
+            Self::File { len, .. } => *len,
+            Self::Memory { data, .. } => data.len() as u64,
+        }
+    }
+
+    fn rewind(&mut self) -> Result<(), String> {
+        match self {
+            Self::File { file, pos, .. } => {
+                file.seek(SeekFrom::Start(0)).map_err(|e| format!("rewind source: {e}"))?;
+                *pos = 0;
+            }
+            Self::Memory { pos, .. } => *pos = 0,
+        }
+        Ok(())
+    }
+
+    /// Sequential stream read used by the manifest hash pass. Advances the
+    /// read position; callers rewind before the send pass.
+    fn read_stream(&mut self, buf: &mut [u8]) -> Result<usize, String> {
+        match self {
+            Self::File { file, pos, .. } => {
+                let n = file.read(buf).map_err(|e| format!("read source: {e}"))?;
+                *pos += n as u64;
+                Ok(n)
+            }
+            Self::Memory { data, pos } => {
+                let n = (*pos + buf.len()).min(data.len()) - (*pos).min(data.len());
+                buf[..n].copy_from_slice(&data[*pos..*pos + n]);
+                *pos += n;
+                Ok(n)
+            }
+        }
+    }
+
+    /// Read exactly `buf.len()` bytes starting at `offset`. For a file this
+    /// seeks only when the current position differs from `offset`, so the
+    /// normal in-order send path is a pure sequential read (no seek syscall
+    /// per 32 KiB chunk, OS readahead stays effective). For memory this is
+    /// a slice copy, never a disk operation.
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), String> {
+        match self {
+            Self::File { file, pos, .. } => {
+                if *pos != offset {
+                    file.seek(SeekFrom::Start(offset)).map_err(|e| format!("seek source: {e}"))?;
+                    *pos = offset;
+                }
+                file.read_exact(buf).map_err(|e| format!("read source: {e}"))?;
+                *pos += buf.len() as u64;
+                Ok(())
+            }
+            Self::Memory { data, pos } => {
+                let start = usize::try_from(offset).map_err(|_| "source offset overflow")?;
+                let end = start.checked_add(buf.len()).ok_or("source offset overflow")?;
+                if end > data.len() {
+                    return Err("source ended before declared chunk count".into());
+                }
+                buf.copy_from_slice(&data[start..end]);
+                *pos = end;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Build a `FileManifest` for a source: streams it once to compute SHA-256
+/// and the chunk count. This is the one mandatory hash pass — the manifest
+/// must carry the SHA before any byte is sent, so it cannot be skipped.
+/// The send pass does NOT hash again (see `send_via_p2p`); the receiver is
+/// the authoritative verifier against this manifest SHA.
 pub fn build_manifest(path: &Path, name: String, kind: FileKind) -> Result<FileManifest, String> {
-    let mut file = File::open(path).map_err(|e| format!("open file for manifest: {e}"))?;
-    build_manifest_handle(&mut file, name, kind, &AtomicBool::new(false))
+    let file = File::open(path).map_err(|e| format!("open file for manifest: {e}"))?;
+    let mut source = SendSource::from_file(file)?;
+    build_manifest_source(&mut source, name, kind, &AtomicBool::new(false))
 }
 
 pub fn build_manifest_handle(file: &mut File, name: String, kind: FileKind, cancelled: &AtomicBool) -> Result<FileManifest, String> {
-    file.seek(SeekFrom::Start(0)).map_err(|e| format!("rewind source: {e}"))?;
-    let size = file
-        .metadata()
-        .map_err(|e| format!("stat file for manifest: {e}"))?
-        .len();
+    // Kept for callers/tests that still hold a raw File handle: wrap it
+    // (read-only, in place) and delegate to the shared manifest builder.
+    let len = file.metadata().map_err(|e| format!("stat file for manifest: {e}"))?.len();
+    // The caller retains ownership of `file`; clone the handle so the
+    // manifest pass does not move it.
+    let cloned = file.try_clone().map_err(|e| format!("clone source handle: {e}"))?;
+    let mut source = SendSource::File { file: cloned, pos: 0, len };
+    build_manifest_source(&mut source, name, kind, cancelled)
+}
+
+pub fn build_manifest_source(source: &mut SendSource, name: String, kind: FileKind, cancelled: &AtomicBool) -> Result<FileManifest, String> {
+    source.rewind()?;
+    let size = source.len();
     let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 128 * 1024];
+    // 1 MiB hash buffer (was 128 KiB): fewer read syscalls on the one
+    // mandatory hash pass, no protocol effect.
+    let mut buf = vec![0u8; 1024 * 1024];
     loop {
         if cancelled.load(Ordering::Acquire) { return Err("已取消".into()); }
-        let n = file.read(&mut buf).map_err(|e| format!("hash file: {e}"))?;
+        let n = source.read_stream(&mut buf).map_err(|e| format!("hash source: {e}"))?;
         if n == 0 {
             break;
         }
@@ -83,7 +201,7 @@ pub fn build_manifest_handle(file: &mut File, name: String, kind: FileKind, canc
     let sha256 = format!("{:x}", hasher.finalize());
     let chunk_size = NATIVE_CHUNK_SIZE as u32;
     let total_chunks = u32::try_from(size.div_ceil(u64::from(chunk_size))).map_err(|_| "file too large")?;
-    file.seek(SeekFrom::Start(0)).map_err(|e| format!("rewind source: {e}"))?;
+    source.rewind()?;
     // Transfer id: 24 hex chars (12 bytes), matching the FLNG id format.
     let mut id_bytes = [0u8; 12];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut id_bytes);
@@ -101,10 +219,69 @@ pub fn build_manifest_handle(file: &mut File, name: String, kind: FileKind, canc
     })
 }
 
+/// Length in bytes of chunk `seq` in a manifest (full size except the last
+/// chunk, which may be short).
+fn chunk_len(manifest: &FileManifest, seq: u32) -> u64 {
+    manifest.size.saturating_sub(u64::from(seq) * u64::from(manifest.chunk_size))
+        .min(u64::from(manifest.chunk_size))
+}
+
+/// Split a display file name into (stem, extension-with-dot) for the
+/// sequence-rename rule: `report.pdf` -> (`report`, `.pdf`),
+/// `archive.tar.gz` -> (`archive.tar`, `.gz`), `notes` -> (`notes`, "").
+/// A leading dot (`.gitignore`) is a stem, not an extension.
+fn split_name_ext(name: &str) -> (String, String) {
+    match name.rfind('.') {
+        Some(i) if i > 0 => (name[..i].to_string(), name[i..].to_string()),
+        _ => (name.to_string(), String::new()),
+    }
+}
+
+/// Rename `tmp_path` into `target_dir` under `name`, never overwriting:
+/// if the candidate exists, or the rename fails (target occupied,
+/// unwritable, …), try `name(1)`, `name(2)`, … with the sequence inserted
+/// before the extension, until one rename succeeds. Only after every
+/// candidate (up to 10 000, mirroring the old hard-link loop) has been
+/// tried does this return an error — the caller then deletes the .tmp
+/// file and reports failure. Returns the actual final path, which the
+/// caller must report to the UI (it may differ from the original name).
+/// This is a same-directory rename: no second copy, no hard link, and the
+/// .tmp file itself is the only written copy.
+pub fn rename_with_sequence(tmp_path: &Path, target_dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let (stem, ext) = split_name_ext(name);
+    for i in 0..10_000u32 {
+        let candidate = if i == 0 {
+            target_dir.join(name)
+        } else {
+            target_dir.join(format!("{stem}({i}){ext}"))
+        };
+        // Existence check first: on Unix rename() would otherwise silently
+        // overwrite. The check-then-rename window is the same one any
+        // rename-based publisher has; a concurrent creator in the same
+        // download directory during this millisecond loop is not a
+        // supported scenario (the old hard-link loop had the same race
+        // only in reverse — it failed instead of renaming).
+        if std::fs::symlink_metadata(&candidate).is_ok() {
+            continue;
+        }
+        match std::fs::rename(tmp_path, &candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            // Occupied / unwritable / any other rename failure: do not
+            // discard the transfer, try the next sequence name instead.
+            Err(_) => continue,
+        }
+    }
+    Err("rename failed after all sequence attempts".into())
+}
+
 /// Sender-side state for one file transfer.
 pub struct OnlineSender {
     manifest: FileManifest,
-    file: Mutex<File>,
+    /// Read-only, in-place source (disk handle or in-memory bytes). Never
+    /// a copy: ordinary files are read from their own handle, memory
+    /// sources from their buffer.
+    source: Mutex<SendSource>,
     /// Next chunk sequence to send.
     seq: Mutex<u32>,
     /// Highest cumulatively ACKed chunk (from `file-chunk-ack`).
@@ -119,14 +296,26 @@ pub struct OnlineSender {
 
 impl OnlineSender {
     pub fn new(manifest: FileManifest, path: &Path) -> Result<Self, String> {
-        let file = File::open(path).map_err(|e| format!("open source file: {e}"))?;
-        Ok(Self::from_handle(manifest, file))
+        // Read-only open of the user's own file: no copy, no move, no temp.
+        let file = std::fs::OpenOptions::new().read(true).open(path)
+            .map_err(|e| format!("open source file: {e}"))?;
+        Ok(Self::from_source(manifest, SendSource::from_file(file)?))
     }
 
+    /// Legacy name kept for callers/tests that hold a File handle.
     pub fn from_handle(manifest: FileManifest, file: File) -> Self {
+        // from_file only fails on a metadata read; fall back to the
+        // manifest size so a send attempt still fails loudly on the first
+        // short read instead of silently sending an empty source.
+        let len = file.metadata().map(|m| m.len()).unwrap_or(manifest.size);
+        let source = SendSource::File { file, pos: 0, len };
+        Self::from_source(manifest, source)
+    }
+
+    pub fn from_source(manifest: FileManifest, source: SendSource) -> Self {
         Self {
             manifest,
-            file: Mutex::new(file),
+            source: Mutex::new(source),
             seq: Mutex::new(0),
             acked: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             ack_notify: Arc::new(Notify::new()),
@@ -212,9 +401,13 @@ impl OnlineSender {
         let mut seq = *seq_guard;
         drop(seq_guard);
 
-        let mut hasher = Sha256::new();
-        let mut hashed_seq: u32 = 0;
-
+        // NOTE: no sender-side re-hash here. The manifest pass already
+        // hashed the source once, and the receiver verifies every byte
+        // against that manifest SHA before it ACKs completion. Re-hashing
+        // during send was a second full SHA pass (and a second full read
+        // in the old per-chunk code) for no protocol benefit: if the
+        // source changes mid-send, the receiver's hash check — not the
+        // sender's — is what must fail the transfer.
         while seq < total_chunks {
             let acked = self.acked.load(std::sync::atomic::Ordering::Acquire);
             if seq.saturating_sub(acked) >= SENDER_WINDOW_CHUNKS {
@@ -234,31 +427,34 @@ impl OnlineSender {
                 .max(1);
             let batch_seq = seq;
 
-            let mut batch = Vec::with_capacity(batch_chunks as usize * NATIVE_CHUNK_SIZE as usize);
+            // Read the whole batch straight into its final buffer: one
+            // allocation per 128 KiB frame, no per-32 KiB chunk Vec and no
+            // extend copy. SendSource::read_at seeks only if the position
+            // moved, so the in-order path is a sequential read.
+            let batch_len: usize = (0..batch_chunks)
+                .map(|i| chunk_len(&self.manifest, seq + i) as usize)
+                .sum();
+            if batch_len == 0 {
+                return Err("source ended before declared chunk count".to_string());
+            }
+            let mut batch = vec![0u8; batch_len];
             {
-                let mut file = self.file.lock().await;
-                for _ in 0..batch_chunks {
-                    let chunk_offset = u64::from(seq)
+                let mut source = self.source.lock().await;
+                let mut at = 0usize;
+                for i in 0..batch_chunks {
+                    let chunk_seq = seq + i;
+                    let chunk_offset = u64::from(chunk_seq)
                         .checked_mul(u64::from(NATIVE_CHUNK_SIZE))
                         .ok_or_else(|| "source offset overflow".to_string())?;
-                    let remaining = size_bytes.saturating_sub(chunk_offset);
-                    let expected = remaining.min(u64::from(NATIVE_CHUNK_SIZE)) as usize;
+                    let expected = chunk_len(&self.manifest, chunk_seq) as usize;
                     if expected == 0 {
                         return Err("source ended before declared chunk count".to_string());
                     }
-                    let mut chunk = vec![0u8; expected];
-                    file.seek(SeekFrom::Start(chunk_offset))
-                        .map_err(|e| format!("seek source: {e}"))?;
-                    file.read_exact(&mut chunk)
-                        .map_err(|e| format!("read source: {e}"))?;
-                    if seq == hashed_seq {
-                        hasher.update(&chunk);
-                        hashed_seq += 1;
-                    }
-                    batch.extend_from_slice(&chunk);
-                    seq += 1;
+                    source.read_at(chunk_offset, &mut batch[at..at + expected])?;
+                    at += expected;
                 }
             }
+            seq += batch_chunks;
 
             let frame = encode_direct_file_frame(
                 &transfer_id,
@@ -290,18 +486,16 @@ impl OnlineSender {
             *self.seq.lock().await = seq;
         }
 
-        // Verify the running hash matches the manifest (sender-side sanity).
-        let digest = format!("{:x}", hasher.finalize());
-        if digest != self.manifest.sha256 {
-            return Err("sender hash mismatch after P2P send".to_string());
-        }
-
-        // Wait for the receiver's persistence confirmation.
+        // Wait for the receiver's persistence confirmation (the receiver
+        // has verified the manifest SHA by now; see the note above).
         self.wait_complete().await
     }
 
     /// Send the file via the LiveKit relay: base64 `file-chunk` messages.
-    /// Mirrors the TS relay path in `FlingRoom.sendFile()`.
+    /// Mirrors the TS relay path in `FlingRoom.sendFile()`. Not used by the
+    /// current online session (its route is always a DataChannel, even for
+    /// TURN relay); kept for protocol completeness. Same no-rehash rule as
+    /// `send_via_p2p`: the receiver verifies against the manifest SHA.
     pub async fn send_via_relay(
         &self,
         send_chunk: impl Fn(u32, String) -> Result<(), String>,
@@ -312,7 +506,6 @@ impl OnlineSender {
         let transfer_id = self.manifest.id.clone();
 
         let mut seq: u32 = 0;
-        let mut hasher = Sha256::new();
 
         while seq < total_chunks {
             let acked = self.acked.load(std::sync::atomic::Ordering::Acquire);
@@ -327,20 +520,15 @@ impl OnlineSender {
             let chunk_offset = u64::from(seq)
                 .checked_mul(u64::from(NATIVE_CHUNK_SIZE))
                 .ok_or_else(|| "source offset overflow".to_string())?;
-            let remaining = size_bytes.saturating_sub(chunk_offset);
-            let expected = remaining.min(u64::from(NATIVE_CHUNK_SIZE)) as usize;
+            let expected = chunk_len(&self.manifest, seq) as usize;
             if expected == 0 {
                 return Err("source ended before declared chunk count".to_string());
             }
             let mut chunk = vec![0u8; expected];
             {
-                let mut file = self.file.lock().await;
-                file.seek(SeekFrom::Start(chunk_offset))
-                    .map_err(|e| format!("seek source: {e}"))?;
-                file.read_exact(&mut chunk)
-                    .map_err(|e| format!("read source: {e}"))?;
+                let mut source = self.source.lock().await;
+                source.read_at(chunk_offset, &mut chunk)?;
             }
-            hasher.update(&chunk);
             let b64 = B64.encode(&chunk);
             send_chunk(seq, b64)?;
 
@@ -352,10 +540,6 @@ impl OnlineSender {
             let _ = &transfer_id;
         }
 
-        let digest = format!("{:x}", hasher.finalize());
-        if digest != self.manifest.sha256 {
-            return Err("sender hash mismatch after relay send".to_string());
-        }
         self.wait_complete().await
     }
 }
@@ -363,18 +547,41 @@ impl OnlineSender {
 /// Receiver-side state for one file transfer.
 pub struct OnlineReceiver {
     manifest: FileManifest,
-    /// Reassembly buffer for out-of-order chunks (relay path).
-    chunks: Mutex<HashMap<u32, Vec<u8>>>,
+    /// Out-of-order relay chunks held ONLY until the incremental hash
+    /// catches up to them (see `on_relay_chunk`). Their bytes are already
+    /// on disk at the right offset; this map is hash bookkeeping, not
+    /// reassembly storage, and it is bounded by the sender window
+    /// (256 chunks x 32 KiB = 8 MiB). P2P frames are contiguous, so this
+    /// map stays empty on the live path.
+    pending: Mutex<HashMap<u32, Vec<u8>>>,
+    /// Per-chunk receipt bitmap (true = already seek-written to the .tmp).
+    received_map: Mutex<Vec<bool>>,
+    received_count: Mutex<u32>,
+    /// Next contiguous chunk still needed (ACK geometry + hash cursor).
+    /// `received_bytes` is the contiguous byte count for this cursor, so
+    /// ACKs keep exactly the old wire meaning; bytes already written
+    /// beyond the cursor are on disk but not yet ACK-counted.
     next_seq: Mutex<u32>,
     received_bytes: Mutex<u64>,
     hasher: Mutex<Sha256>,
-    /// Where the completed file goes.
+    /// Intended final path (manifest name in the target directory).
     target_path: PathBuf,
+    /// Actual final path after a successful rename — may carry a
+    /// `(n)` sequence suffix if the intended name was taken. Callers
+    /// must use `target_path()` (which returns this when set) for the
+    /// UI/saved-path, never the manifest name alone. A std RwLock (not
+    /// a tokio Mutex) so `target_path()` can be read synchronously by
+    /// session/UI code without awaiting.
+    final_path: std::sync::RwLock<Option<PathBuf>>,
+    /// The single .tmp file in the target directory (NOT the system temp
+    /// directory, NOT a second staging copy): chunks are seek-written
+    /// here, then this file is renamed once into place. No hard link,
+    /// no copy, no second write pass.
     temp_path: PathBuf,
-    /// Lazily opened append handle for the temp file. Opening the file
-    /// per frame cost tens of ms per 128 KiB frame on Windows (file open
-    /// + AV scan) and capped P2P receive at ~2 MB/s; the handle is now
-    /// opened once and dropped before the final rename.
+    /// Persistent handle for the .tmp file. Opening the file per frame
+    /// cost tens of ms per 128 KiB frame on Windows (file open + AV
+    /// scan) and capped P2P receive at ~2 MB/s; the handle is opened
+    /// once and dropped before the final rename.
     file: Mutex<Option<std::fs::File>>,
     complete_notify: Arc<Notify>,
     gate: Mutex<()>,
@@ -427,16 +634,23 @@ impl OnlineReceiver {
         let target_dir = receive_directory(&manifest, target_dir)?;
         std::fs::create_dir_all(&target_dir).map_err(|e| format!("create receive directory: {e}"))?;
         let target_path = target_dir.join(&manifest.name);
-        let temp_path = target_dir.join(format!(".{}.part", manifest.id));
+        // Single .tmp in the target directory, unique per transfer id.
+        // A pre-existing final file does NOT fail creation here: the
+        // rename step resolves the conflict with a sequence suffix.
+        let temp_path = target_dir.join(format!(".{}.tmp", manifest.id));
         let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp_path)
             .map_err(|e| format!("create receive temp: {e}"))?;
+        let total_chunks = manifest.total_chunks as usize;
         Ok(Self {
             manifest,
-            chunks: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            received_map: Mutex::new(vec![false; total_chunks]),
+            received_count: Mutex::new(0),
             next_seq: Mutex::new(0),
             received_bytes: Mutex::new(0),
             hasher: Mutex::new(Sha256::new()),
             target_path,
+            final_path: std::sync::RwLock::new(None),
             temp_path,
             file: Mutex::new(Some(file)),
             complete_notify: Arc::new(Notify::new()),
@@ -451,13 +665,17 @@ impl OnlineReceiver {
         &self.manifest
     }
 
-    /// Append bytes to the temp file through the persistent handle.
-    async fn append_bytes(&self, bytes: &[u8]) -> Result<(), String> {
-        use std::io::Write;
+    /// Seek-write `bytes` for chunk `seq` into the .tmp file through the
+    /// persistent handle. `bytes` must already be validated to be exactly
+    /// this chunk's length. The handle position is set explicitly, so
+    /// out-of-order chunks land at the right offset immediately instead
+    /// of waiting in a RAM reassembly buffer.
+    async fn write_chunk_at(&self, seq: u32, bytes: &[u8]) -> Result<(), String> {
+        let offset = u64::from(seq) * u64::from(self.manifest.chunk_size);
         let mut guard = self.file.lock().await;
-        guard.as_mut().ok_or("receive handle closed")?
-            .write_all(bytes)
-            .map_err(|e| format!("write temp file: {e}"))?;
+        let file = guard.as_mut().ok_or("receive handle closed")?;
+        file.seek(SeekFrom::Start(offset)).map_err(|e| format!("seek receive temp: {e}"))?;
+        file.write_all(bytes).map_err(|e| format!("write temp file: {e}"))?;
         Ok(())
     }
 
@@ -505,9 +723,26 @@ impl OnlineReceiver {
             return Err("FLNG frame contains trailing payload bytes".to_string());
         }
 
-        // Append to the temp file (persistent handle, opened once).
-        self.append_bytes(&frame.payload[..offset]).await?;
+        // Seek-write the whole batch to the .tmp file (one write for the
+        // 128 KiB frame, not one per chunk) and hash it in order — P2P
+        // frames are contiguous by the check above, so the incremental
+        // hash stays in file order with no buffering.
+        {
+            let batch_seq = *self.next_seq.lock().await;
+            let mut guard = self.file.lock().await;
+            let file = guard.as_mut().ok_or("receive handle closed")?;
+            let batch_offset = u64::from(batch_seq) * u64::from(self.manifest.chunk_size);
+            file.seek(SeekFrom::Start(batch_offset)).map_err(|e| format!("seek receive temp: {e}"))?;
+            file.write_all(&frame.payload[..offset]).map_err(|e| format!("write temp file: {e}"))?;
+        }
         self.hasher.lock().await.update(&frame.payload[..offset]);
+        {
+            let mut map = self.received_map.lock().await;
+            for i in 0..count as usize {
+                if let Some(slot) = map.get_mut(next as usize + i) { *slot = true; }
+            }
+        }
+        *self.received_count.lock().await += count as u32;
         *self.received_bytes.lock().await += offset as u64;
         next += count as u32;
         *self.next_seq.lock().await = next;
@@ -515,42 +750,68 @@ impl OnlineReceiver {
     }
 
     /// Handle one base64 `file-chunk` from the relay path.
+    ///
+    /// Seek-write first, hash second, in file order: an out-of-order
+    /// chunk is written to its .tmp offset immediately (so disk I/O is
+    /// not gated on contiguity), but it is only hashed once every chunk
+    /// before it has been hashed — its bytes are held in `pending` until
+    /// then, bounded by the sender window. ACK geometry is unchanged:
+    /// `next_seq`/`received_bytes` still count only the contiguous
+    /// prefix, which is what the sender's window and
+    /// `valid_ack_geometry` expect.
     pub async fn on_relay_chunk(&self, seq: u32, b64data: &str) -> Result<u32, String> {
         let _gate = self.gate.lock().await;
         if self.cancelled.load(Ordering::Acquire) || self.committed.load(Ordering::Acquire) { return Err("receive is terminal".into()); }
         let next = *self.next_seq.lock().await;
         if seq < next { return Ok(next); }
         if seq >= self.manifest.total_chunks || seq.saturating_sub(next) >= SENDER_WINDOW_CHUNKS { return Err("relay sequence outside receive window".into()); }
-        let expected = self.manifest.size.saturating_sub(u64::from(seq) * u64::from(self.manifest.chunk_size)).min(u64::from(self.manifest.chunk_size)) as usize;
+        let expected = chunk_len(&self.manifest, seq) as usize;
         let data = B64
             .decode(b64data)
             .map_err(|e| format!("decode relay chunk: {e}"))?;
         if data.len() != expected { return Err("relay chunk length mismatch".into()); }
-        let mut chunks = self.chunks.lock().await;
-        let mut next: u32 = *self.next_seq.lock().await;
-        let mut received: u64 = *self.received_bytes.lock().await;
+        {
+            let map = self.received_map.lock().await;
+            if map.get(seq as usize).copied().unwrap_or(false) { return Ok(next); }
+        }
+        // Disk first, at the chunk's own offset.
+        self.write_chunk_at(seq, &data).await?;
+        {
+            let mut map = self.received_map.lock().await;
+            if let Some(slot) = map.get_mut(seq as usize) { *slot = true; }
+        }
+        *self.received_count.lock().await += 1;
+        // Hash only in file order.
+        let mut next = next;
+        let mut received = *self.received_bytes.lock().await;
         let mut hasher = self.hasher.lock().await;
-
-        chunks.insert(seq, data);
-        // Drain contiguous chunks in order, then append once.
-        let mut pending: Vec<u8> = Vec::new();
-        while let Some(data) = chunks.remove(&next) {
+        if seq == next {
             hasher.update(&data);
             received += data.len() as u64;
             next += 1;
-            pending.extend_from_slice(&data);
+            // Drain any already-written chunks that are now contiguous.
+            loop {
+                let pending_data = {
+                    let mut pending = self.pending.lock().await;
+                    pending.remove(&next)
+                };
+                let Some(pending_data) = pending_data else { break; };
+                let len = chunk_len(&self.manifest, next);
+                hasher.update(&pending_data);
+                received += len;
+                next += 1;
+            }
+        } else {
+            self.pending.lock().await.insert(seq, data);
         }
-        if !pending.is_empty() {
-            drop(hasher);
-            self.append_bytes(&pending).await?;
-        }
+        drop(hasher);
         *self.next_seq.lock().await = next;
         *self.received_bytes.lock().await = received;
         Ok(next)
     }
 
     /// Check whether the transfer is complete; if so, verify the hash and
-    /// move the temp file into place. Returns true when done.
+    /// rename the .tmp file into place. Returns true when done.
     #[cfg(test)]
     pub async fn check_complete(&self) -> Result<bool, String> {
         self.check_complete_observed(|_| {}).await
@@ -563,12 +824,23 @@ impl OnlineReceiver {
         if self.committed.load(Ordering::Acquire) { return Ok(true); }
         let next = *self.next_seq.lock().await;
         let received = *self.received_bytes.lock().await;
-        if next != self.manifest.total_chunks || received != self.manifest.size {
+        let count = *self.received_count.lock().await;
+        if next != self.manifest.total_chunks || count != self.manifest.total_chunks || received != self.manifest.size {
             return Ok(false);
         }
-        // Durability before integrity check and atomic publication. No final ACK
-        // is possible until this method succeeds. Read back the actual disk file.
-        use std::io::Write;
+        // Durability before integrity check and publication. No final ACK
+        // is possible until this method succeeds.
+        // SPEED CHANGE (deliberate trade-off, documented): the hash is
+        // the incremental hash accumulated as chunks were written, NOT a
+        // second full read of the .tmp file. That removes one whole-file
+        // disk read per transfer (the old code re-read the file here).
+        // It means an external modification of the .tmp file after a
+        // chunk was written — e.g. another process editing it, or disk
+        // corruption that the OS does not report on write — is NOT
+        // detected here. The LAN store (ReceivedFileStore) already used
+        // exactly this incremental-hash rule, so the online path is now
+        // consistent with it. Wire bytes themselves are still verified:
+        // a chunk whose bytes differ from the manifest fails this check.
         {
             let mut guard = self.file.lock().await;
             let file = guard.as_mut().ok_or("receive handle closed")?;
@@ -577,30 +849,52 @@ impl OnlineReceiver {
             *guard = None;
         }
         observe(Phase::DiskSynced);
-        let mut disk = File::open(&self.temp_path).map_err(|e| format!("open for SHA verification: {e}"))?;
-        let mut hasher = Sha256::new();
-        let mut buffer = vec![0; 128 * 1024];
-        loop {
-            let n = disk.read(&mut buffer).map_err(|e| format!("verify SHA: {e}"))?;
-            if n == 0 { break; }
-            hasher.update(&buffer[..n]);
+        let digest = {
+            let hasher = self.hasher.lock().await;
+            format!("{:x}", hasher.clone().finalize())
+        };
+        if digest != self.manifest.sha256 {
+            // Hash failure: delete the .tmp, mark cancelled so a later
+            // check_complete cannot succeed on the same receiver, and let
+            // the session's fail path (abort) clean up the rest.
+            self.cancelled.store(true, Ordering::Release);
+            let _ = std::fs::remove_file(&self.temp_path);
+            return Err("sha256 mismatch after receive".into());
         }
-        drop(disk);
-        let digest = format!("{:x}", hasher.finalize());
-        if digest != self.manifest.sha256 { return Err("sha256 mismatch after receive".into()); }
         observe(Phase::HashVerified);
-        // Same-directory hard-link is atomic and never overwrites an existing file.
-        // Existing names fail explicitly; the owner can rename/remove and retry.
-        std::fs::hard_link(&self.temp_path, &self.target_path)
-            .map_err(|e| format!("atomic no-overwrite commit: {e}"))?;
+        // One same-directory rename, with a sequence suffix if the
+        // intended name is taken or the rename fails. No hard link, no
+        // copy: the .tmp file IS the only written copy.
+        let target_dir = self.target_path.parent().ok_or("receive target has no parent")?.to_path_buf();
+        let final_path = match rename_with_sequence(&self.temp_path, &target_dir, &self.manifest.name) {
+            Ok(path) => path,
+            Err(e) => {
+                let _ = std::fs::remove_file(&self.temp_path);
+                return Err(e);
+            }
+        };
+        if let Ok(mut slot) = self.final_path.write() {
+            *slot = Some(final_path);
+        }
         self.committed.store(true, Ordering::Release);
         observe(Phase::AtomicCommit);
-        let _ = std::fs::remove_file(&self.temp_path);
         self.complete_notify.notify_waiters();
         Ok(true)
     }
 
-    pub fn target_path(&self) -> &Path { &self.target_path }
+    /// Actual final path: the renamed path after commit, otherwise the
+    /// intended (manifest-name) path. UI/saved-path callers must use this
+    /// after commit, because a conflict may have renamed the file to
+    /// `name(1).ext` etc.
+    pub fn target_path(&self) -> PathBuf {
+        if let Ok(slot) = self.final_path.read() {
+            if let Some(path) = slot.as_ref() {
+                return path.clone();
+            }
+        }
+        self.target_path.clone()
+    }
+
     pub fn is_committed(&self) -> bool { self.committed.load(Ordering::Acquire) }
     /// A verified clipboard image is applied to the OS clipboard once before
     /// the durable completion ACK is sent.
@@ -614,7 +908,10 @@ impl OnlineReceiver {
         if self.committed.load(Ordering::Acquire) { return; }
         self.cancelled.store(true, Ordering::Release);
         *self.file.lock().await = None;
-        self.chunks.lock().await.clear();
+        self.pending.lock().await.clear();
+        // Only the .tmp is removed: no final file exists yet (rename is
+        // the only publication step, and it has not happened), so there
+        // is no half-finished final file to clean up.
         let _ = std::fs::remove_file(&self.temp_path);
     }
 

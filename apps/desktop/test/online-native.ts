@@ -31,15 +31,25 @@ assert.doesNotMatch(nativeBranch, /sendFile\(|buildManifest|arrayBuffer|slice\(|
 const sourceSend = /async sendNativeSource[\s\S]*?\n  \}/.exec(bridge)?.[0] ?? '';
 assert.match(sourceSend, /online_send_source/);
 assert.doesNotMatch(sourceSend, /path|blob|Uint8Array|ensureFilePath/);
-assert.match(bridge, /Legacy Blob compatibility[\s\S]*?NOT Rust-only/);
+// WebView-owned Blob bytes are staged in Rust memory only: the old
+// fling-online disk spill (online_temp_begin/append + online_send_file)
+// is gone, and the bridge must not reference it anywhere.
+assert.match(bridge, /online_memory_begin[\s\S]*?online_send_memory/);
+// Command names and the old spill helper must not appear as code (a
+// historical mention in a comment explaining the removal is fine).
+assert.doesNotMatch(bridge, /invoke\('online_temp_begin'|invoke\('online_temp_append'|invoke\('online_send_file'|function ensureFilePath/);
 assert.match(main, /async fn online_pick_source[\s\S]*?spawn_blocking[\s\S]*?blocking_pick_file/);
 assert.match(source, /source.owner != owner/);
 assert.match(source, /source.expires <= Instant::now\(\)/);
-assert.ok(source.replace(/\s+/g, '').includes('source.file.try_clone()'));
+assert.ok(source.replace(/\s+/g, '').includes('file.try_clone()'), 'disk sources are acquired by cloning the open handle, never by re-reading a path');
 const commit = /pub async fn check_complete[\s\S]*?pub fn target_path/.exec(transfer)?.[0] ?? '';
+// Durable commit order: flush, sync, incremental-hash check, then ONE
+// same-directory rename (sequence suffix on conflict). No hard link, no
+// copy, and no second full disk read for verification.
 assert.ok(commit.indexOf('file.flush()') < commit.indexOf('file.sync_all()'));
-assert.ok(commit.indexOf('file.sync_all()') < commit.indexOf('disk.read'));
-assert.ok(commit.indexOf('digest != self.manifest.sha256') < commit.indexOf('std::fs::hard_link'));
+assert.ok(commit.indexOf('file.sync_all()') < commit.indexOf('digest != self.manifest.sha256'));
+assert.ok(commit.indexOf('digest != self.manifest.sha256') < commit.indexOf('rename_with_sequence'));
+assert.doesNotMatch(commit, /hard_link|disk\.read|std::fs::copy/);
 const ack = /async fn maybe_ack[\s\S]*?async fn current_fence/.exec(session)?.[0] ?? '';
 const completeCheck = ack.indexOf('receiver.check_complete_observed(');
 const finalAck = ack.indexOf('self.fenced_ack(receiver, next_seq, received_bytes, true)');
@@ -66,6 +76,6 @@ assert.ok(progressAck.indexOf('return Ok(false)') < progressAck.indexOf('publish
 assert.ok(progressAck.indexOf('publish.await?') < progressAck.indexOf('last_acks.lock().await.insert'));
 assert.match(session, /native_single_file != Some\(true\)/);
 assert.match(read('../src/taskcard.ts'), /activityBytes > 0 && idleMs > 15000/);
-console.log('ok - sourceId-only high-level UI boundary, legacy isolation, durable commit/ACK order and pre-progress UI guards (static)');
+console.log('ok - sourceId-only high-level UI boundary, memory-only Blob staging, durable commit/ACK order and pre-progress UI guards (static)');
 console.log('ok - production ACK cursor advances only after publish; skipped frames accumulate toward threshold (static)');
 console.log('These mocks/contracts are not native picker GUI or two-machine Windows validation.');

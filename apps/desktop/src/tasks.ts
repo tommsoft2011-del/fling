@@ -108,6 +108,10 @@ export interface ItemState {
 }
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** Basename of a saved path, for display after a conflict rename. The
+ * item uid stays unchanged; only the displayed name follows the actual
+ * on-disk filename (e.g. report(1).pdf instead of report.pdf). */
+const savedBasename = (p: string): string => p.split(/[\\/]/).pop() || p;
 const TEXT_CHUNK_CHARS = 15000;
 const OFFER_REANNOUNCE_MS = 5000;
 const WAIT_PEER_TIMEOUT_MS = 5 * 60 * 1000;
@@ -722,7 +726,7 @@ export class SendTask {
               : await this.room!.sendFile(file!, onFileProgress, src.kind);
             st.sha256 = manifest.sha256;
             st.mimeType = manifest.mimeType;
-            // online_send_file returns only after the receiver's complete ACK.
+            // The Rust send returns only after the receiver's complete ACK.
             this.peerDoneBytes = Math.max(this.peerDoneBytes, peerTarget);
             this.peerSavedBytes = Math.max(this.peerSavedBytes, peerTarget);
           }
@@ -1422,6 +1426,9 @@ export class RecvTask {
     item.doneBytes = status.localBytes;
     item.saveBytes = status.stage === 'done' ? status.totalBytes : status.localBytes;
     item.savedPath = status.savedPath;
+    // Conflict rename: the on-disk name may differ from the manifest
+    // name (e.g. report(1).pdf). Show the actual saved filename.
+    if (status.savedPath) item.name = savedBasename(status.savedPath);
     item.sha256 = status.sha256;
     item.status = status.stage === 'done' ? 'done' : ['error', 'cancelled'].includes(status.stage) ? 'error' : 'active';
     item.error = status.error?.startsWith('CONNECTION_FAILED:')
@@ -1636,9 +1643,12 @@ export class RecvTask {
     this.reportProgress();
   }
 
-  /** Rust transfer-done: file already persisted by Rust (SHA verified).
-   * Mark the item done so UI leaves 0%. */
-  private onTransferDone(transferId: string): void {
+  /** Rust transfer-done: file already persisted by Rust (SHA verified,
+   * renamed to its final name). Mark the item done so UI leaves 0%.
+   * savedPath, when present, is the actual on-disk path: on a name
+   * conflict it carries the (n) suffix, and the displayed name follows
+   * it instead of the pre-conflict manifest name. */
+  private onTransferDone(transferId: string, savedPath?: string): void {
     const item = this.manifestToItem.get(transferId);
     if (!item) {
       log('xfer', 'transfer-done for unknown item', { taskId: this.taskId, transferId: transferId.slice(0, 8) });
@@ -1647,6 +1657,10 @@ export class RecvTask {
     item.doneBytes = item.totalBytes;
     item.saveBytes = item.totalBytes;
     item.status = 'done';
+    if (savedPath) {
+      item.savedPath = savedPath;
+      item.name = savedBasename(savedPath);
+    }
     // Rust persists the file itself; settle the pending counter here,
     // or finish() stalls 30s in waitForPendingFiles.
     this.settlePendingFile(transferId);

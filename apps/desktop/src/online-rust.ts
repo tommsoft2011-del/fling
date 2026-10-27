@@ -2,7 +2,8 @@
 // plane live in Rust (online_session.rs); the WebView only renders state.
 //
 // Native disk-file tasks only pass opaque sourceId + display metadata.
-// Legacy Blob compatibility below still spills WebView-owned bytes; it is NOT Rust-only.
+// WebView-owned Blob bytes are staged in Rust memory only (never a disk
+// temp file) and streamed from RAM by the Rust sender.
 // This class implements the subset of the
 // FlingRoom interface used by tasks.ts, delegating to Tauri commands.
 
@@ -38,39 +39,40 @@ interface OnlineUiEvent {
   };
 }
 
-/** Write in-memory file bytes to a temp file so Rust can stream it. */
-async function ensureFilePath(file: FileLike): Promise<string> {
-  // Legacy memory-Blob compatibility ONLY. Ordinary disk files must use sourceId.
-  // Spill WebView-owned memory in bounded 4 MiB chunks; this is NOT Rust-owned sourcing.
-  const tmp = (await invoke('online_temp_begin', { name: file.name })) as string;
-  const pathBytes = new TextEncoder().encode(tmp);
-  const header = new Uint8Array(4 + pathBytes.length);
-  new DataView(header.buffer).setUint32(0, pathBytes.length, true);
-  header.set(pathBytes, 4);
+/** Stage WebView-owned Blob bytes in Rust memory so the Rust sender can
+ * stream them. Ordinary disk files must NOT use this: they use sourceId.
+ * Bytes cross IPC once, as raw 4 MiB frames, and are held only in RAM;
+ * no file is written anywhere (the old fling-online disk spill is gone). */
+async function ensureMemorySource(file: FileLike, kind: FileKind): Promise<string> {
+  const memoryId = (await invoke('online_memory_begin', { name: file.name, kind })) as string;
+  const idBytes = new TextEncoder().encode(memoryId);
+  const header = new Uint8Array(4 + idBytes.length);
+  new DataView(header.buffer).setUint32(0, idBytes.length, true);
+  header.set(idBytes, 4);
   const CHUNK = 4 * 1024 * 1024;
   try {
-    let lastSpillLogFrac = 0;
+    let lastLogFrac = 0;
     for (let off = 0; off < file.size; off += CHUNK) {
       const bytes = await file.slice(off, Math.min(off + CHUNK, file.size));
       const frame = new Uint8Array(header.length + bytes.length);
       frame.set(header);
       frame.set(bytes, header.length);
-      await invoke('online_temp_append', frame);
+      await invoke('online_memory_append', frame);
       const frac = (off + bytes.length) / file.size;
-      if (frac - lastSpillLogFrac >= 0.25 || frac >= 1) {
-        lastSpillLogFrac = frac;
-        log('p2p', 'temp spill progress', {
-          spilledBytes: off + bytes.length,
+      if (frac - lastLogFrac >= 0.25 || frac >= 1) {
+        lastLogFrac = frac;
+        log('p2p', 'memory staging progress', {
+          stagedBytes: off + bytes.length,
           fileSize: file.size,
         });
       }
     }
   } catch (e) {
-    log('p2p', 'temp spill failed', { fileSize: file.size, errMsg: String(e) });
+    log('p2p', 'memory staging failed', { fileSize: file.size, errMsg: String(e) });
     throw e;
   }
-  log('p2p', 'temp spill complete', { fileSize: file.size });
-  return tmp;
+  log('p2p', 'memory staging complete', { fileSize: file.size });
+  return memoryId;
 }
 
 export class RustFlingRoom {
@@ -205,9 +207,11 @@ export class RustFlingRoom {
             // bytes, then let it mark done. We don't have total_bytes in
             // TransferDone, so use a dedicated handler if available.
             const tid = ev.transfer_id as string;
-            // Try the file-complete path first (receiver side).
+            // Try the file-complete path first (receiver side), passing
+            // the actual saved path so the UI shows the real filename
+            // (which may carry a (n) suffix after a name conflict).
             if ((events as any).onTransferDone) {
-              (events as any).onTransferDone(tid);
+              (events as any).onTransferDone(tid, ev.saved_path as string | undefined);
             } else {
               // Fallback: mark progress as complete via onFileProgress.
               // The task layer will resolve total from its item mapping.
@@ -320,20 +324,20 @@ export class RustFlingRoom {
     onProgress?: (sentBytes: number, totalBytes: number, receiverSaved?: boolean) => void,
     kind: FileKind = 'file',
   ): Promise<FileManifest> {
-    const path = await ensureFilePath(file);
+    // WebView-owned Blob only: stage it in Rust memory (no disk file),
+    // then let the Rust sender stream it from RAM.
+    const memoryId = await ensureMemorySource(file, kind);
     // Progress arrives via fling://online/event DURING the transfer, but
-    // `online_send_file` only returns after the receiver's complete ACK —
+    // `online_send_memory` only returns after the receiver's complete ACK —
     // so the callback MUST be installed before the invoke starts. (The old
     // code bridged events.onFileProgress after the invoke resolved, which
     // meant the sender UI showed 0 bytes for the whole transfer.)
     this.activeSendProgress = onProgress ? (sent, total) => onProgress(sent, total) : null;
     let transferId: string;
     try {
-      transferId = (await invoke('online_send_file', {
+      transferId = (await invoke('online_send_memory', {
         sessionId: this.requireSession(),
-        path,
-        name: file.name,
-        kind,
+        memoryId,
       })) as string;
     } finally {
       this.activeSendProgress = null;
