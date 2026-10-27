@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>跨网 WebRTC 直连测试（无 TURN）</title>
+<style>
+body{font:16px system-ui,sans-serif;max-width:1000px;margin:24px auto;padding:0 16px;color:#202124}
+button{padding:9px 13px;margin:4px;cursor:pointer}button:disabled{cursor:not-allowed;opacity:.55}
+textarea{width:100%;min-height:170px;box-sizing:border-box;font:12px ui-monospace,monospace}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f1f3f4;padding:14px;border-radius:8px;min-height:110px}
+.note{background:#fff6d8;padding:12px;border-radius:8px}.ok{color:#087443;font-weight:700}.bad{color:#b3261e;font-weight:700}
+</style>
+</head>
+<body>
+<h1>跨网 WebRTC 直连测试</h1>
+<p class="note"><b>本页不配置 TURN。</b>只用 STUN 收集候选；如果两端 ICE 连通且 DataChannel 探测消息往返成功，说明这两台电脑当前网络可以建立浏览器 WebRTC 直连。建议用没有启用 WebRTC Leak Prevent 的 Chrome/Edge 干净配置测试。浏览器扩展可能改变浏览器自己的结果。</p>
+<p>双方各自打开本页。甲创建 Offer，把“本机 SDP”通过你信任的私密渠道发给乙；乙粘贴到“对端 SDP”并创建 Answer，再把 Answer 发回甲；甲粘贴 Answer 并应用。SDP 含临时 ICE 凭据和网络候选地址，请勿公开粘贴或发送诊断日志里的 SDP。</p>
+
+<div>
+  <button id="offer">甲：创建 Offer</button>
+  <button id="answer">乙：粘贴 Offer 并创建 Answer</button>
+  <button id="apply">甲：应用 Answer</button>
+  <button id="copy">复制本机 SDP</button>
+  <button id="probe" disabled>发送直连探测消息</button>
+  <button id="reset">重置</button>
+</div>
+<p><b>状态：</b><span id="status">等待开始</span></p>
+<label for="remote"><b>对端 SDP（粘贴到这里）</b></label>
+<textarea id="remote" spellcheck="false" autocomplete="off" placeholder="把另一台电脑发来的完整 SDP 粘贴到这里"></textarea>
+<label for="local"><b>本机 SDP（创建后复制，发给另一端）</b></label>
+<textarea id="local" spellcheck="false" autocomplete="off" readonly placeholder="Offer 或 Answer 会显示在这里"></textarea>
+<h2>诊断结果</h2>
+<p>日志只记录候选类型、协议、状态和错误码，不记录 IP、端口、原始候选或 SDP。</p>
+<button id="copylog">复制诊断日志</button>
+<pre id="log">等待测试。</pre>
+
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+const logBox=$('log'), statusBox=$('status'), localBox=$('local'), remoteBox=$('remote');
+let pc=null, channel=null, role=null, pendingProbe=null, connectTimer=null, gatheringTimer=null, probeTimer=null, reportedPair=false;
+const counts={host:0,srflx:0,prflx:0,relay:0,unknown:0};
+const startedAt=performance.now();
+function log(message){logBox.textContent+='['+((performance.now()-startedAt)/1000).toFixed(1)+'s] '+message+'\n';logBox.scrollTop=logBox.scrollHeight;}
+function status(message,kind=''){statusBox.textContent=message;statusBox.className=kind;}
+function parseSdpCandidates(sdp){
+ const c={host:0,srflx:0,prflx:0,relay:0,unknown:0}, protocols={udp:0,tcp:0,unknown:0};
+ for(const line of sdp.split(/\r?\n/)){
+  if(!line.startsWith('a=candidate:'))continue;
+  const t=line.trim().split(/\s+/), typ=t.indexOf('typ');
+  const ct=typ>=0&&Object.hasOwn(c,t[typ+1])?t[typ+1]:'unknown'; c[ct]++;
+  const proto=(t[2]||'').toLowerCase(); protocols[Object.hasOwn(protocols,proto)?proto:'unknown']++;
+ }
+ return {c,protocols};
+}
+function describeCandidates(label,sdp){const x=parseSdpCandidates(sdp);log(label+'候选数量：'+JSON.stringify(x.c)+'；协议数量：'+JSON.stringify(x.protocols));}
+function makePc(newRole){
+ if(pc)throw new Error('已有连接；请先重置');
+ role=newRole;
+ // Deliberately no TURN URLs: a successful selected path cannot be TURN relay.
+ pc=new RTCPeerConnection({iceServers:[
+  {urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302']},
+  {urls:['stun:216.45.58.246:3478']}
+ ],iceTransportPolicy:'all'});
+ for(const k of Object.keys(counts))counts[k]=0;
+ pc.onicecandidate=e=>{
+  if(e.candidate){
+   const type=Object.hasOwn(counts,e.candidate.type)?e.candidate.type:'unknown'; counts[type]++;
+   const protocol=['udp','tcp'].includes(e.candidate.protocol)?e.candidate.protocol:'unknown';
+   log('本机发现候选：type='+type+' protocol='+protocol);
+  }else log('本机 ICE 候选收集完成');
+ };
+ pc.onicecandidateerror=e=>{
+  const code=Number.isSafeInteger(e.errorCode)?e.errorCode:'unknown';
+  log('STUN 候选收集错误码：'+code);
+ };
+ pc.onicegatheringstatechange=()=>log('ICE gathering='+pc.iceGatheringState);
+ pc.oniceconnectionstatechange=()=>{log('ICE connection='+pc.iceConnectionState);checkConnection();};
+ pc.onconnectionstatechange=()=>{log('PeerConnection='+pc.connectionState);checkConnection();};
+ pc.ondatachannel=e=>{log('收到对端 DataChannel');attachChannel(e.channel);};
+ log('开始 '+(newRole==='offer'?'Offer':'Answer')+' 端；本轮未配置 TURN。');
+ return pc;
+}
+function attachChannel(ch){
+ channel=ch;channel.onopen=()=>{log('DataChannel 已打开');$('probe').disabled=false;checkConnection();};
+ channel.onclose=()=>{log('DataChannel 已关闭');$('probe').disabled=true;};
+ channel.onerror=()=>log('DataChannel 报错');
+ channel.onmessage=e=>{
+  if(typeof e.data!=='string'){log('收到非文本探测数据');return;}
+  if(e.data.startsWith('probe:')){
+   channel.send('echo:'+e.data.slice(6));log('收到对端探测消息并已回送');
+  }else if(e.data.startsWith('echo:')){
+   const token=e.data.slice(5);
+   if(token===pendingProbe){pendingProbe=null;clearTimeout(probeTimer);log('探测消息往返成功');status('直连成功：无 TURN 的 DataChannel 探测消息往返正常。','ok');checkConnection();}
+   else log('收到探测回包（与当前探测不匹配）');
+  }else log('收到对端消息');
+ };
+}
+function waitGathering(target,ms=30000){
+ if(target.iceGatheringState==='complete')return Promise.resolve(true);
+ return new Promise(resolve=>{
+  let done=false;
+  const finish=ok=>{if(done)return;done=true;clearTimeout(gatheringTimer);target.removeEventListener('icegatheringstatechange',changed);resolve(ok);};
+  const changed=()=>{if(target.iceGatheringState==='complete')finish(true);};
+  target.addEventListener('icegatheringstatechange',changed);
+  gatheringTimer=setTimeout(()=>finish(false),ms);
+ });
+}
+async function showLocalSdp(target,label){
+ const complete=await waitGathering(target);
+ const sdp=target.localDescription?.sdp||'';localBox.value=sdp;
+ if(complete)log(label+' SDP 已包含本机收集到的候选');
+ else log(label+' 候选收集超过 30 秒；当前 SDP 可能不完整，结果可能不确定');
+ describeCandidates('本机',sdp);
+ status(label+' 已生成；请复制本机 SDP 发给对端');
+}
+function startConnectDeadline(){
+ clearTimeout(connectTimer);
+ connectTimer=setTimeout(()=>{
+  if(!pc||pc.iceConnectionState==='connected'||pc.connectionState==='connected')return;
+  status('未在 30 秒内建立 ICE 直连；查看日志。', 'bad');
+  log('连接检查超过 30 秒仍未连接。');
+ },30000);
+}
+async function selectedPairSummary(){
+ if(!pc)return null;
+ try{
+  const stats=await pc.getStats();let pair=null;
+  for(const s of stats.values())if(s.type==='transport'&&s.selectedCandidatePairId){pair=stats.get(s.selectedCandidatePairId);if(pair)break;}
+  if(!pair)for(const s of stats.values())if(s.type==='candidate-pair'&&s.state==='succeeded'&&(s.selected||s.nominated)){pair=s;break;}
+  if(!pair)return null;
+  const l=stats.get(pair.localCandidateId),r=stats.get(pair.remoteCandidateId);
+  return {state:pair.state||'unknown',localType:l?.candidateType||'unknown',remoteType:r?.candidateType||'unknown',localProtocol:l?.protocol||'unknown',remoteProtocol:r?.protocol||'unknown'};
+ }catch{return null;}
+}
+async function checkConnection(){
+ if(!pc)return;
+ const connected=pc.iceConnectionState==='connected'||pc.iceConnectionState==='completed'||pc.connectionState==='connected';
+ if(!connected||reportedPair)return;
+ reportedPair=true;
+ clearTimeout(connectTimer);
+ const pair=await selectedPairSummary();
+ if(pair){
+  log('选中候选对：'+JSON.stringify(pair));
+  if(pair.localType==='relay'||pair.remoteType==='relay')status('选中 relay 路径；本页未配置 TURN，需检查浏览器/环境是否注入了其他 ICE 配置。','bad');
+  else status('ICE 已连接，选中非 relay 候选对；请点击探测按钮验证数据往返。','ok');
+ }else status('ICE 已连接；浏览器未提供可识别的候选对统计，请点击探测按钮。','ok');
+}
+function validSdp(){const s=remoteBox.value.trim();if(!s.includes('v=0')||!s.includes('a=ice-ufrag:')||!s.includes('a=ice-pwd:'))throw new Error('SDP 不完整；请粘贴完整的 Offer/Answer（不要只复制候选行）');return s;}
+$('offer').onclick=async()=>{
+ try{
+  const p=makePc('offer');attachChannel(p.createDataChannel('fling-direct-test',{ordered:true}));
+  await p.setLocalDescription(await p.createOffer());status('正在收集 Offer 候选…');await showLocalSdp(p,'Offer');
+ }catch(e){status(e.message||'创建 Offer 失败','bad');log('操作失败：'+(e.message||'unknown'));}
+};
+$('answer').onclick=async()=>{
+ try{
+  const sdp=validSdp(),p=makePc('answer');describeCandidates('对端 Offer',sdp);
+  await p.setRemoteDescription({type:'offer',sdp});
+  await p.setLocalDescription(await p.createAnswer());status('正在收集 Answer 候选…');await showLocalSdp(p,'Answer');startConnectDeadline();
+ }catch(e){status(e.message||'创建 Answer 失败','bad');log('操作失败：'+(e.message||'unknown'));}
+};
+$('apply').onclick=async()=>{
+ try{
+  if(!pc||role!=='offer')throw new Error('请先在甲电脑创建 Offer');
+  const sdp=validSdp();describeCandidates('对端 Answer',sdp);
+  await pc.setRemoteDescription({type:'answer',sdp});status('Answer 已应用，正在检查 ICE 直连…');log('Answer 已应用，开始 ICE 连通性检查');startConnectDeadline();
+ }catch(e){status(e.message||'应用 Answer 失败','bad');log('操作失败：'+(e.message||'unknown'));}
+};
+$('copy').onclick=async()=>{
+ if(!localBox.value){status('还没有本机 SDP','bad');return;}
+ try{await navigator.clipboard.writeText(localBox.value);status('本机 SDP 已复制，请私下发给对端');}
+ catch{localBox.focus();localBox.select();status('自动复制失败，已选中本机 SDP；请手动复制并私下发送');}
+};
+$('probe').onclick=()=>{
+ if(!channel||channel.readyState!=='open'){status('DataChannel 尚未打开','bad');return;}
+ const a=new Uint8Array(12);crypto.getRandomValues(a);pendingProbe=Array.from(a,x=>x.toString(16).padStart(2,'0')).join('');
+ const token=pendingProbe;channel.send('probe:'+token);log('已发送探测消息，等待对端回包…');
+ clearTimeout(probeTimer);probeTimer=setTimeout(()=>{if(pendingProbe===token){pendingProbe=null;status('ICE 已连接，但探测消息未在 10 秒内往返。','bad');log('探测消息等待超时');}},10000);
+};
+$('reset').onclick=()=>{clearTimeout(connectTimer);clearTimeout(gatheringTimer);clearTimeout(probeTimer);if(pc)pc.close();pc=null;channel=null;role=null;pendingProbe=null;reportedPair=false;remoteBox.value='';localBox.value='';$('probe').disabled=true;logBox.textContent='等待测试。';status('等待开始');};
+$('copylog').onclick=async()=>{try{await navigator.clipboard.writeText(logBox.textContent);status('诊断日志已复制；其中不含 SDP 或地址');}catch{logBox.focus();status('请手动复制诊断日志；不要复制 SDP 文本框内容');}};
+</script>
+</body>
+</html>
