@@ -147,7 +147,17 @@ async function checkConnection(){
   else status('ICE 已连接，选中非 relay 候选对；请点击探测按钮验证数据往返。','ok');
  }else status('ICE 已连接；浏览器未提供可识别的候选对统计，请点击探测按钮。','ok');
 }
-function validSdp(){const s=remoteBox.value.trim();if(!s.includes('v=0')||!s.includes('a=ice-ufrag:')||!s.includes('a=ice-pwd:'))throw new Error('SDP 不完整；请粘贴完整的 Offer/Answer（不要只复制候选行）');return s;}
+function validSdp(){
+ const raw=remoteBox.value.trim();
+ if(!raw.includes('v=0')||!raw.includes('a=ice-ufrag:')||!raw.includes('a=ice-pwd:'))throw new Error('SDP 不完整；请粘贴完整的 Offer/Answer（不要只复制候选行）');
+ // Textareas normalize copied SDP to LF. Normalize it back to RFC SDP CRLF.
+ // a=max-message-size is optional; older WebRTC parsers reject it, while the
+ // small text probes in this page work with the SDP default message limit.
+ const lines=raw.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n');
+ const filtered=lines.filter(line=>!/^a=max-message-size\s*:/i.test(line.trim()));
+ if(filtered.length!==lines.length)log('为兼容旧版 WebRTC，解析时忽略可选 max-message-size 字段（探测消息很小）');
+ return filtered.join('\r\n').replace(/\r\n+$/,'')+'\r\n';
+}
 $('offer').onclick=async()=>{
  try{
   const p=makePc('offer');attachChannel(p.createDataChannel('fling-direct-test',{ordered:true}));
